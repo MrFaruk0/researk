@@ -1,21 +1,14 @@
 import { randomUUID } from "node:crypto";
 import {
-  ModelCapabilitiesSchema,
-  ModelDescriptorSchema,
   type ModelSelection,
-  ProviderDescriptorSchema,
   type ReasoningIntent,
   type RunEvent,
   RunRequestSchema,
   splitCanonicalModelId,
 } from "@researk/contracts";
-import {
-  type CredentialResolver,
-  FakeProviderAdapter,
-  Harness,
-  ProviderRegistry,
-} from "@researk/harness";
+import { type CredentialResolver, Harness, ProviderRegistry } from "@researk/harness";
 import { OpenAiCompatibleAdapter } from "@researk/provider-openai-compatible";
+import { OpenRouterAdapter } from "@researk/provider-openrouter";
 import { type CliArguments, parseArguments } from "./args.js";
 import { HELP, VERSION } from "./help.js";
 import { processIo, readAll, write } from "./io.js";
@@ -35,21 +28,6 @@ import type {
   HarnessRunOptions,
   ProviderEnvironmentReference,
 } from "./types.js";
-
-const FAKE_CAPABILITIES = ModelCapabilitiesSchema.parse({
-  streaming: true,
-  toolCalls: false,
-  structuredOutput: false,
-  vision: false,
-  files: false,
-  contextWindowTokens: 32_768,
-  maxOutputTokens: 4_096,
-  reasoning: {
-    supported: true,
-    intents: ["auto", "off", "minimal", "low", "medium", "high", "xhigh"],
-    nativeOverride: false,
-  },
-});
 
 export interface ChatExecutionResult {
   readonly exitCode: number;
@@ -236,7 +214,7 @@ async function renderEvent(
     await write(options.io.stderr, `Error: ${redact(event.error.message, secrets)}\n`);
     return 1;
   } else if (event.type === "cancelled") {
-    if (!options.raw) await write(options.io.stderr, "Cancelled.\n");
+    await write(options.io.stderr, "Cancelled.\n");
     return 130;
   }
   if (event.type === "error") return 1;
@@ -252,10 +230,7 @@ export async function resolveHarness(
 ): Promise<CliHarness | number> {
   if (dependencies.harness !== undefined) return dependencies.harness;
   const model = args.model === undefined ? undefined : splitCanonicalModelId(args.model);
-  const providerId =
-    args.providerId ??
-    model?.providerId ??
-    (env.RESEARK_FAKE_PROVIDER === "1" ? "fake" : undefined);
+  const providerId = args.providerId ?? model?.providerId;
   if (providerId === undefined) {
     await write(
       io.stderr,
@@ -268,6 +243,7 @@ export async function resolveHarness(
     ...(model === undefined ? {} : { modelId: model.modelId }),
     ...(args.baseUrl === undefined ? {} : { baseUrl: args.baseUrl }),
     apiKeyEnvironmentVariable: args.apiKeyEnvironmentVariable,
+    kind: providerId === "openrouter" ? "openrouter" : "compatible",
   };
   try {
     return dependencies.createHarness === undefined
@@ -298,44 +274,26 @@ export function createInProcessHarness(
     },
   };
 
-  if (configuration.providerId === "fake") {
-    const modelId = configuration.modelId ?? "research-fake";
-    const descriptor = ProviderDescriptorSchema.parse({
-      providerId: configuration.providerId,
-      displayName: "Offline fake provider",
-      kind: "local",
-    });
-    const model = ModelDescriptorSchema.parse({
-      providerId: configuration.providerId,
-      modelId,
-      canonicalId: `${configuration.providerId}:${modelId}`,
-      displayName: modelId,
-      capabilities: FAKE_CAPABILITIES,
-      status: "available",
-      catalogSource: "configured",
-    });
+  if (configuration.providerId === "openrouter") {
     registry.register(
-      new FakeProviderAdapter({
-        descriptor,
-        models: [model],
-        events: [
-          { type: "text_delta", delta: "Offline fake provider response." },
-          { type: "completed", finishReason: "stop" },
-        ],
+      new OpenRouterAdapter({
+        apiKeyReference: configuration.apiKeyEnvironmentVariable,
+        ...(configuration.baseUrl === undefined ? {} : { baseUrl: configuration.baseUrl }),
       }),
     );
+  } else if (configuration.baseUrl === undefined) {
+    throw new Error(
+      "Custom OpenAI-compatible providers require --base-url or RESEARK_OPENAI_BASE_URL.",
+    );
   } else {
-    if (configuration.baseUrl === undefined) {
-      throw new Error("OpenAI-compatible providers require --base-url or RESEARK_OPENAI_BASE_URL.");
-    }
+    validateProviderBaseUrl(configuration.baseUrl);
     registry.register(
       new OpenAiCompatibleAdapter({
         providerId: configuration.providerId,
         displayName: configuration.providerId,
         baseUrl: configuration.baseUrl,
-        ...(env[configuration.apiKeyEnvironmentVariable] === undefined
-          ? {}
-          : { apiKeyReference: configuration.apiKeyEnvironmentVariable }),
+        apiKeyReference: configuration.apiKeyEnvironmentVariable,
+        kind: "custom",
       }),
     );
   }
@@ -351,6 +309,26 @@ export function createInProcessHarness(
   };
 }
 
+function validateProviderBaseUrl(value: string): void {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Provider base URLs must be valid absolute URLs.");
+  }
+  if (
+    url.username.length > 0 ||
+    url.password.length > 0 ||
+    url.search.length > 0 ||
+    url.hash.length > 0
+  ) {
+    throw new Error("Provider base URLs cannot contain credentials, query strings, or fragments.");
+  }
+  const local = url.hostname === "localhost" || url.hostname === "127.0.0.1";
+  if (url.protocol !== "https:" && !local) {
+    throw new Error("Provider base URLs must use HTTPS unless they are local loopback endpoints.");
+  }
+}
 async function listModels(
   harness: CliHarness,
   args: CliArguments,

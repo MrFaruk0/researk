@@ -1,9 +1,17 @@
 {
   "name": "@researk/research",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0-alpha.1",
   "description": "Bounded scientific workflow metadata for Researk",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MrFaruk0/researk.git",
+    "directory": "packages/research"
+  },
+  "bugs": {
+    "url": "https://github.com/MrFaruk0/researk/issues"
+  },
+  "homepage": "https://github.com/MrFaruk0/researk#readme",
   "type": "module",
   "exports": {
     ".": {
@@ -14,6 +22,9 @@
   "files": [
     "dist"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "clean": "tsc -b --clean",
     "build": "tsc -b",
@@ -21,6 +32,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@researk/contracts": "0.0.0"
+    "@researk/contracts": "0.1.0-alpha.1"
   }
 }

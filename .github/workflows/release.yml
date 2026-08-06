@@ -1,0 +1,82 @@
+name: GitHub Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify release versions
+        run: npm run release:verify-version -- --tag "$GITHUB_REF_NAME"
+
+      - name: Run release gates
+        run: |
+          npm run clean
+          npm run build
+          npm run typecheck
+          npm test
+          npm run lint
+          npm run format-check
+          git diff --check
+
+      - name: Build public npm and standalone GitHub assets
+        run: npm run release:artifacts -- --output release-artifacts
+
+      - name: Prove the single standalone tarball installs offline
+        run: |
+          release_version="$(node -p "require('./package.json').version")"
+          npm run smoke:standalone -- --artifact "release-artifacts/standalone/researk-${release_version}.tgz" --root "$RUNNER_TEMP/researk-standalone-smoke"
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          find release-artifacts -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > release-artifacts/SHA256SUMS
+
+      - name: Attest release assets
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            release-artifacts/standalone/*.tgz
+            release-artifacts/standalone/*.spdx.json
+            release-artifacts/npm/*.tgz
+            release-artifacts/sbom/*.spdx.json
+            release-artifacts/SHA256SUMS
+
+      - name: Preserve release assets for inspection
+        uses: actions/upload-artifact@v5
+        with:
+          name: researk-${{ github.ref_name }}
+          path: release-artifacts
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release-artifacts/standalone/* \
+            release-artifacts/npm/* \
+            release-artifacts/sbom/* \
+            release-artifacts/SHA256SUMS \
+            --generate-notes \
+            --verify-tag

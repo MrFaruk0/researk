@@ -1,0 +1,93 @@
+name: Feature request
+description: Propose a focused improvement to the local-first Researk harness or CLI.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the research problem before the solution. Significant public contracts, trust boundaries, or architectural changes should be developed as an RFC under `GOVERNANCE.md`.
+
+        Researk is a downloadable local-first project, not a hosted service. Do not include private research material or credentials.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions for this request.
+          required: true
+        - label: This request serves a scientific research, academic writing, or paper reproduction workflow.
+          required: true
+        - label: I removed or replaced all secrets and sensitive research data.
+          required: true
+
+  - type: dropdown
+    id: workflow
+    attributes:
+      label: Primary workflow
+      options:
+        - Scientific writing or revision
+        - Literature review
+        - Reviewer response
+        - LaTeX authoring
+        - APA 7 or IEEE formatting
+        - Research planning
+        - Paper reproduction
+        - CLI or developer experience
+        - Cross-cutting architecture
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Who encounters the problem, and what prevents them from completing their work today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior and success criteria without assuming an implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Explain your suggested interface or workflow, if you have one.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include current workarounds and why they are insufficient.
+
+  - type: textarea
+    id: local_first
+    attributes:
+      label: Local-first, security, and privacy impact
+      description: Identify network access, credentials, tool execution, sensitive data, dependencies, or permission changes. Use "None" when not applicable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and maintenance impact
+      description: Note effects on public APIs, configuration, sessions, providers, platforms, documentation, and long-term maintenance.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add public references, mockups, examples, or related discussions. Do not upload sensitive research material.
+

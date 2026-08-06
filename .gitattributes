@@ -1,2 +1,16 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Normalize repository text to LF for reproducible cross-platform diffs.
+* text=auto eol=lf
+
+# Windows command scripts require CRLF in some environments.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Common binary formats must not be line-ending normalized.
+*.gif binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.pdf binary
+*.png binary
+*.webp binary
+*.zip binary

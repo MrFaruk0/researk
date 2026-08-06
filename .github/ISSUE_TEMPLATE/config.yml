@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and community support
+    url: https://github.com/MrFaruk0/researk/discussions
+    about: Ask setup questions, discuss workflows, and explore ideas with the community.
+  - name: Security vulnerability report
+    url: https://github.com/MrFaruk0/researk/security/policy
+    about: Follow the private reporting policy instead of opening a public issue.
+  - name: Code of Conduct report
+    url: https://github.com/MrFaruk0/researk/security/advisories/new
+    about: Privately report a conduct incident to repository maintainers with a title beginning "[Code of Conduct]".

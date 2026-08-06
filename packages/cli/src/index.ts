@@ -6,4 +6,6 @@ export * from "./rendering/renderer.js";
 export * from "./repl.js";
 export * from "./run.js";
 export * from "./safety.js";
+export * from "./theme.js";
 export * from "./types.js";
+export * from "./workspace.js";

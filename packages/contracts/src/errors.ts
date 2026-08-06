@@ -8,6 +8,7 @@ export const ErrorCodeSchema = z.enum([
   "duplicate_provider",
   "provider_not_found",
   "model_not_found",
+  "model_unavailable",
   "model_substitution",
   "capability_missing",
   "credential_unavailable",

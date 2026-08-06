@@ -17,11 +17,14 @@ export interface CliHarness {
   listModels(signal?: AbortSignal): Promise<readonly ModelDescriptor[]>;
 }
 
+export type ProviderConnectionKind = "openrouter" | "compatible";
+
 export interface ProviderEnvironmentReference {
   readonly providerId: string;
   readonly modelId?: string;
   readonly baseUrl?: string;
   readonly apiKeyEnvironmentVariable: string;
+  readonly kind?: ProviderConnectionKind;
 }
 
 export interface CliIo {
@@ -40,4 +43,5 @@ export interface CliDependencies {
   readonly signal?: AbortSignal;
   readonly createRunId?: () => string;
   readonly onApprovalRequest?: (event: ApprovalRequestEvent) => Promise<ApprovalDecision>;
+  readonly cwd?: string;
 }

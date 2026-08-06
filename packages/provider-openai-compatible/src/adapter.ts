@@ -17,6 +17,7 @@ import {
 } from "@researk/contracts";
 import {
   failure,
+  HarnessError,
   normalizeErrorMessage,
   type ProviderAdapter,
   type ProviderContext,
@@ -55,6 +56,17 @@ const CONSERVATIVE_CAPABILITIES = ModelCapabilitiesSchema.parse({
   reasoning: { supported: false, intents: [], nativeOverride: false },
 });
 
+const DEFAULT_TIMEOUT_MS = 120_000;
+const MAX_TIMEOUT_MS = 3_600_000;
+const DEFAULT_MAX_BODY_BYTES = 16_000_000;
+const MAX_BODY_BYTES = 64_000_000;
+
+interface RequestedResponse {
+  readonly response: Response;
+  readonly signal: AbortSignal;
+  readonly timeoutSignal: AbortSignal;
+}
+
 export class OpenAiCompatibleAdapter implements ProviderAdapter {
   readonly descriptor: ProviderDescriptor;
   readonly #baseUrl: URL;
@@ -71,66 +83,76 @@ export class OpenAiCompatibleAdapter implements ProviderAdapter {
       displayName: sanitizeSafeText(options.displayName),
       kind: options.kind ?? "custom",
     });
-    this.#baseUrl = new URL(
-      options.baseUrl.endsWith("/") ? options.baseUrl : `${options.baseUrl}/`,
-    );
-    if (
-      this.#baseUrl.protocol !== "https:" &&
-      this.#baseUrl.hostname !== "localhost" &&
-      this.#baseUrl.hostname !== "127.0.0.1"
-    ) {
-      throw new TypeError("Provider base URL must use HTTPS unless it is local.");
-    }
+    this.#baseUrl = parseBaseUrl(options.baseUrl);
     this.#apiKeyReference = options.apiKeyReference;
     this.#fetch = options.fetch ?? globalThis.fetch;
-    this.#timeoutMs = options.timeoutMs ?? 120_000;
-    this.#maxBodyBytes = options.maxBodyBytes ?? 16_000_000;
+    this.#timeoutMs = boundedPositiveSafeInteger(
+      options.timeoutMs,
+      DEFAULT_TIMEOUT_MS,
+      MAX_TIMEOUT_MS,
+      "timeoutMs",
+    );
+    this.#maxBodyBytes = boundedPositiveSafeInteger(
+      options.maxBodyBytes,
+      DEFAULT_MAX_BODY_BYTES,
+      MAX_BODY_BYTES,
+      "maxBodyBytes",
+    );
     this.#capabilities = options.capabilities ?? {};
     this.#reasoning = options.reasoning ?? {};
   }
 
   async discoverModels(context: ProviderContext) {
     const credential = await this.#credential(context);
-    const response = await this.#request(
+    const requested = await this.#request(
       "models",
       { method: "GET", headers: headers(credential) },
       context,
       credential,
     );
-    const value = await readJson(
-      response,
-      this.#maxBodyBytes,
-      credential === undefined ? [] : [credential],
-    );
-    const rows = isRecord(value) && Array.isArray(value.data) ? value.data : undefined;
-    if (rows === undefined) throw this.#protocol("Model catalog did not contain a data array.");
-    const now = new Date().toISOString();
-    const models: ModelDescriptor[] = [];
-    const seen = new Set<string>();
-    for (const row of rows) {
-      if (!isRecord(row)) continue;
-      const parsedId = ModelIdSchema.safeParse(row.id);
-      if (!parsedId.success || seen.has(parsedId.data)) continue;
-      seen.add(parsedId.data);
-      const capability = this.#capabilities[parsedId.data] ?? CONSERVATIVE_CAPABILITIES;
-      models.push({
-        providerId: this.descriptor.providerId,
-        modelId: parsedId.data,
-        canonicalId: canonicalModelId(this.descriptor.providerId, parsedId.data),
-        displayName: sanitizeSafeText(parsedId.data),
-        capabilities: capability,
-        status: this.#capabilities[parsedId.data] === undefined ? "unknown" : "available",
-        catalogSource: "live",
-        discoveredAt: now,
+    try {
+      const value = await readJson(
+        requested.response,
+        this.#maxBodyBytes,
+        credential === undefined ? [] : [credential],
+        requested.signal,
+      );
+      const rows = isRecord(value) && Array.isArray(value.data) ? value.data : undefined;
+      if (rows === undefined) throw this.#protocol("Model catalog did not contain a data array.");
+      const now = new Date().toISOString();
+      const models: ModelDescriptor[] = [];
+      const seen = new Set<string>();
+      for (const row of rows) {
+        if (!isRecord(row)) continue;
+        const parsedId = ModelIdSchema.safeParse(row.id);
+        if (!parsedId.success) continue;
+        if (seen.has(parsedId.data)) {
+          throw this.#protocol("Model catalog contained a duplicate model ID.");
+        }
+        seen.add(parsedId.data);
+        const capability = this.#capabilities[parsedId.data] ?? CONSERVATIVE_CAPABILITIES;
+        models.push({
+          providerId: this.descriptor.providerId,
+          modelId: parsedId.data,
+          canonicalId: canonicalModelId(this.descriptor.providerId, parsedId.data),
+          displayName: sanitizeSafeText(parsedId.data),
+          revision: null,
+          capabilities: capability,
+          status: this.#capabilities[parsedId.data] === undefined ? "unknown" : "available",
+          catalogSource: "live",
+          discoveredAt: now,
+        });
+      }
+      return ModelCatalogSchema.parse({
+        provider: this.descriptor,
+        models,
+        source: "live",
+        refreshedAt: now,
+        stale: false,
       });
+    } catch (error) {
+      this.#throwBodyFailure(error, context, requested.timeoutSignal, credential);
     }
-    return ModelCatalogSchema.parse({
-      provider: this.descriptor,
-      models,
-      source: "live",
-      refreshedAt: now,
-      stale: false,
-    });
   }
 
   async resolveReasoning(model: ModelDescriptor, request: ReasoningRequest) {
@@ -183,7 +205,7 @@ export class OpenAiCompatibleAdapter implements ProviderAdapter {
     context: ProviderContext,
   ): AsyncIterable<ProviderStreamEvent> {
     const credential = await this.#credential(context);
-    const response = await this.#request(
+    const requested = await this.#request(
       "chat/completions",
       {
         method: "POST",
@@ -198,70 +220,78 @@ export class OpenAiCompatibleAdapter implements ProviderAdapter {
       context,
       credential,
     );
-    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
-    if (contentType.includes("text/event-stream")) {
-      if (response.body === null) throw this.#protocol("Provider returned an empty event stream.");
-      let completed = false;
-      for await (const sse of parseSse(response.body, {
-        signal: context.signal,
-        maxBytes: this.#maxBodyBytes,
-      })) {
-        if (sse.data.trim() === "[DONE]") {
-          if (!completed) yield { type: "completed", finishReason: "stop" };
-          return;
+    try {
+      const response = requested.response;
+      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+      if (contentType.includes("text/event-stream")) {
+        if (response.body === null)
+          throw this.#protocol("Provider returned an empty event stream.");
+        for await (const sse of parseSse(response.body, {
+          signal: requested.signal,
+          maxBytes: this.#maxBodyBytes,
+        })) {
+          if (sse.data.trim() === "[DONE]") {
+            yield { type: "completed", finishReason: "stop" };
+            return;
+          }
+          const chunk = parseJson(sse.data, credential === undefined ? [] : [credential]);
+          const parsed = parseCompletion(chunk, true);
+          if (
+            parsed.modelId !== undefined &&
+            parsed.modelId !== request.resolved.selection.modelId
+          ) {
+            throw failure("model_substitution", "The provider returned a different model.", {
+              providerId: this.descriptor.providerId,
+              modelId: request.resolved.selection.modelId,
+            });
+          }
+          if (parsed.text !== undefined && parsed.text.length > 0) {
+            yield {
+              type: "text_delta",
+              delta: sanitizeUntrustedText(parsed.text, 1_000_000),
+              ...(parsed.modelId === undefined ? {} : { responseModelId: parsed.modelId }),
+            };
+          }
+          if (parsed.finishReason !== undefined) {
+            yield {
+              type: "completed",
+              finishReason: parsed.finishReason,
+              ...(parsed.usage === undefined ? {} : { usage: parsed.usage }),
+              ...(parsed.modelId === undefined ? {} : { responseModelId: parsed.modelId }),
+            };
+            return;
+          }
         }
-        const chunk = parseJson(sse.data, credential === undefined ? [] : [credential]);
-        const parsed = parseCompletion(chunk, true);
-        if (parsed.modelId !== undefined && parsed.modelId !== request.resolved.selection.modelId) {
-          throw failure("model_substitution", "The provider returned a different model.", {
-            providerId: this.descriptor.providerId,
-            modelId: request.resolved.selection.modelId,
-          });
-        }
-        if (parsed.text !== undefined && parsed.text.length > 0) {
-          yield {
-            type: "text_delta",
-            delta: sanitizeUntrustedText(parsed.text, 1_000_000),
-            ...(parsed.modelId === undefined ? {} : { responseModelId: parsed.modelId }),
-          };
-        }
-        if (parsed.finishReason !== undefined) {
-          yield {
-            type: "completed",
-            finishReason: parsed.finishReason,
-            ...(parsed.usage === undefined ? {} : { usage: parsed.usage }),
-            ...(parsed.modelId === undefined ? {} : { responseModelId: parsed.modelId }),
-          };
-          completed = true;
-        }
+        throw this.#protocol("Provider event stream ended before completion.");
       }
-      if (!completed) throw this.#protocol("Provider event stream ended before completion.");
-      return;
-    }
-    const value = await readJson(
-      response,
-      this.#maxBodyBytes,
-      credential === undefined ? [] : [credential],
-    );
-    const parsed = parseCompletion(value, false);
-    if (parsed.modelId !== undefined && parsed.modelId !== request.resolved.selection.modelId) {
-      throw failure("model_substitution", "The provider returned a different model.", {
-        providerId: this.descriptor.providerId,
-        modelId: request.resolved.selection.modelId,
-      });
-    }
-    if (parsed.text !== undefined && parsed.text.length > 0)
+      const value = await readJson(
+        response,
+        this.#maxBodyBytes,
+        credential === undefined ? [] : [credential],
+        requested.signal,
+      );
+      const parsed = parseCompletion(value, false);
+      if (parsed.modelId !== undefined && parsed.modelId !== request.resolved.selection.modelId) {
+        throw failure("model_substitution", "The provider returned a different model.", {
+          providerId: this.descriptor.providerId,
+          modelId: request.resolved.selection.modelId,
+        });
+      }
+      if (parsed.text !== undefined && parsed.text.length > 0)
+        yield {
+          type: "text_delta",
+          delta: sanitizeUntrustedText(parsed.text, 1_000_000),
+          ...(parsed.modelId === undefined ? {} : { responseModelId: parsed.modelId }),
+        };
       yield {
-        type: "text_delta",
-        delta: sanitizeUntrustedText(parsed.text, 1_000_000),
+        type: "completed",
+        finishReason: parsed.finishReason ?? "other",
+        ...(parsed.usage === undefined ? {} : { usage: parsed.usage }),
         ...(parsed.modelId === undefined ? {} : { responseModelId: parsed.modelId }),
       };
-    yield {
-      type: "completed",
-      finishReason: parsed.finishReason ?? "other",
-      ...(parsed.usage === undefined ? {} : { usage: parsed.usage }),
-      ...(parsed.modelId === undefined ? {} : { responseModelId: parsed.modelId }),
-    };
+    } catch (error) {
+      this.#throwBodyFailure(error, context, requested.timeoutSignal, credential);
+    }
   }
 
   async #credential(context: ProviderContext): Promise<string | undefined> {
@@ -269,6 +299,7 @@ export class OpenAiCompatibleAdapter implements ProviderAdapter {
     try {
       return await context.credentials.resolve(this.#apiKeyReference, context.signal);
     } catch (error) {
+      if (context.signal.aborted) throw error;
       throw failure("credential_unavailable", normalizeErrorMessage(error), {
         providerId: this.descriptor.providerId,
       });
@@ -280,13 +311,13 @@ export class OpenAiCompatibleAdapter implements ProviderAdapter {
     init: RequestInit,
     context: ProviderContext,
     credential?: string,
-  ): Promise<Response> {
-    const timeout = AbortSignal.timeout(this.#timeoutMs);
-    const signal = AbortSignal.any([context.signal, timeout]);
+  ): Promise<RequestedResponse> {
+    const timeoutSignal = AbortSignal.timeout(this.#timeoutMs);
+    const signal = AbortSignal.any([context.signal, timeoutSignal]);
     try {
       const response = await this.#fetch(new URL(path, this.#baseUrl), { ...init, signal });
       if (!response.ok) {
-        const body = await readLimitedText(response, Math.min(this.#maxBodyBytes, 65_536));
+        const body = await readLimitedText(response, Math.min(this.#maxBodyBytes, 65_536), signal);
         const safeBody = sanitizeSafeText(
           redactSecrets(body, credential === undefined ? [] : [credential]),
         );
@@ -300,23 +331,48 @@ export class OpenAiCompatibleAdapter implements ProviderAdapter {
           },
         );
       }
-      return response;
+      return { response, signal, timeoutSignal };
     } catch (error) {
-      if (context.signal.aborted) throw error;
-      if (timeout.aborted)
-        throw failure("timeout", "The provider request timed out.", {
-          providerId: this.descriptor.providerId,
-        });
-      if (error instanceof Error && error.name === "HarnessError") throw error;
-      throw failure(
-        "provider_unavailable",
-        normalizeErrorMessage(error, credential === undefined ? [] : [credential]),
-        {
-          providerId: this.descriptor.providerId,
-          retryable: true,
-        },
-      );
+      this.#throwRequestFailure(error, context, timeoutSignal, credential);
     }
+  }
+
+  #throwBodyFailure(
+    error: unknown,
+    context: ProviderContext,
+    timeoutSignal: AbortSignal,
+    credential?: string,
+  ): never {
+    if (context.signal.aborted || timeoutSignal.aborted) {
+      return this.#throwRequestFailure(error, context, timeoutSignal, credential);
+    }
+    if (isBodyLimitError(error)) {
+      throw this.#protocol(error.message);
+    }
+    return this.#throwRequestFailure(error, context, timeoutSignal, credential);
+  }
+
+  #throwRequestFailure(
+    error: unknown,
+    context: ProviderContext,
+    timeoutSignal: AbortSignal,
+    credential?: string,
+  ): never {
+    if (context.signal.aborted) throw error;
+    if (timeoutSignal.aborted) {
+      throw failure("timeout", "The provider request timed out.", {
+        providerId: this.descriptor.providerId,
+      });
+    }
+    if (error instanceof HarnessError) throw error;
+    throw failure(
+      "provider_unavailable",
+      normalizeErrorMessage(error, credential === undefined ? [] : [credential]),
+      {
+        providerId: this.descriptor.providerId,
+        retryable: true,
+      },
+    );
   }
 
   #protocol(message: string) {
@@ -330,22 +386,44 @@ function headers(credential?: string): Record<string, string> {
     : { accept: "application/json", authorization: `Bearer ${credential}` };
 }
 
-async function readLimitedText(response: Response, maxBytes: number): Promise<string> {
+async function readLimitedText(
+  response: Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<string> {
   if (response.body === null) return "";
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let bytes = 0;
   let result = "";
+  let reachedEnd = false;
+  const cancel = () => {
+    void reader.cancel().catch(() => undefined);
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
   try {
     while (true) {
+      signal?.throwIfAborted();
       const { done, value } = await reader.read();
-      if (done) break;
+      signal?.throwIfAborted();
+      if (done) {
+        reachedEnd = true;
+        break;
+      }
       bytes += value.byteLength;
       if (bytes > maxBytes) throw new Error("Provider response exceeded its byte limit.");
       result += decoder.decode(value, { stream: true });
     }
     return result + decoder.decode();
   } finally {
+    signal?.removeEventListener("abort", cancel);
+    if (!reachedEnd) {
+      try {
+        await reader.cancel();
+      } catch {
+        // Preserve the original read or cancellation error.
+      }
+    }
     reader.releaseLock();
   }
 }
@@ -354,8 +432,9 @@ async function readJson(
   response: Response,
   maxBytes: number,
   secrets: readonly string[],
+  signal?: AbortSignal,
 ): Promise<unknown> {
-  return parseJson(await readLimitedText(response, maxBytes), secrets);
+  return parseJson(await readLimitedText(response, maxBytes, signal), secrets);
 }
 
 function parseJson(value: string, secrets: readonly string[]): unknown {
@@ -412,6 +491,57 @@ function normalizeFinishReason(value: unknown) {
   )
     return value;
   return "other" as const;
+}
+
+function parseBaseUrl(value: string): URL {
+  if (typeof value !== "string" || value.length === 0 || value !== value.trim()) {
+    throw new TypeError(
+      "Provider base URL must be a non-empty URL without surrounding whitespace.",
+    );
+  }
+  if (value.includes("?") || value.includes("#")) {
+    throw new TypeError("Provider base URL must not include query parameters or a fragment.");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value.endsWith("/") ? value : `${value}/`);
+  } catch {
+    throw new TypeError("Provider base URL must be a valid absolute URL.");
+  }
+  if (parsed.username.length > 0 || parsed.password.length > 0) {
+    throw new TypeError("Provider base URL must not contain credentials.");
+  }
+  if (parsed.protocol === "https:") return parsed;
+  if (parsed.protocol === "http:" && isLoopbackHost(parsed.hostname)) return parsed;
+  throw new TypeError("Provider base URL must use HTTPS unless it is a loopback endpoint.");
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+}
+
+function boundedPositiveSafeInteger(
+  value: number | undefined,
+  fallback: number,
+  maximum: number,
+  name: string,
+): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved <= 0 || resolved > maximum) {
+    throw new TypeError(`${name} must be a positive safe integer no greater than ${maximum}.`);
+  }
+  return resolved;
+}
+
+function isBodyLimitError(error: unknown): error is Error {
+  return (
+    error instanceof Error &&
+    (error.message === "Provider response exceeded its byte limit." ||
+      error.message === "Provider stream exceeded its byte limit." ||
+      error.message === "Provider stream event exceeded its byte limit." ||
+      error.message === "Provider stream event exceeded its line limit.")
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

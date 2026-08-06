@@ -75,6 +75,7 @@ export class Harness {
           if (providerEvent.delta.length > 0)
             yield event({ type: "text_delta", delta: providerEvent.delta });
         } else {
+          completed = true;
           yield event({ type: "phase", phase: "generation", status: "completed" });
           yield event({
             type: "completed",
@@ -82,7 +83,6 @@ export class Harness {
             finishReason: providerEvent.finishReason,
             ...(providerEvent.usage === undefined ? {} : { usage: providerEvent.usage }),
           });
-          completed = true;
           break;
         }
       }
@@ -97,20 +97,18 @@ export class Harness {
         );
       }
     } catch (error) {
-      if (signal.aborted) {
-        yield event({ type: "cancelled", reason: "The run was cancelled." });
-        return;
-      }
-      if (timeoutSignal?.aborted) {
-        yield event({
-          type: "error",
-          error: failure("timeout", "The run timed out.").normalized,
-        });
-        return;
-      }
-      if (error instanceof DOMException && error.name === "AbortError") {
-        yield event({ type: "cancelled", reason: "The run was cancelled." });
-        return;
+      if (runSignal.aborted) {
+        if (signal.aborted) {
+          yield event({ type: "cancelled", reason: "The run was cancelled." });
+          return;
+        }
+        if (timeoutSignal?.aborted) {
+          yield event({
+            type: "error",
+            error: failure("timeout", "The run timed out.").normalized,
+          });
+          return;
+        }
       }
       const normalized = normalize(error);
       yield event({ type: "error", error: normalized });

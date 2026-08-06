@@ -1,1 +1,55 @@
-docs/
+# Researk local workspace state
+.researk/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# JavaScript artifacts
+node_modules/
+.npm/
+.yarn/cache/
+
+# Build and test output
+build/
+dist/
+out/
+target/
+coverage/
+*.egg-info/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Dependency lockfiles are intentionally not ignored.
+# Research sources and artifacts (.tex, .bib, .pdf, data) are intentionally
+# not ignored; repository owners must decide what they have the right to commit.

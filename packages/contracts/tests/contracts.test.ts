@@ -72,6 +72,24 @@ describe("model identities", () => {
     });
     expect(result.success).toBe(false);
   });
+
+  it("records a missing provider revision explicitly", () => {
+    expect(ModelDescriptorSchema.parse(descriptor).revision).toBeNull();
+  });
+
+  it("rejects contradictory normalized reasoning metadata", () => {
+    expect(
+      ModelCapabilitiesSchema.safeParse({
+        ...capabilities,
+        reasoning: {
+          supported: true,
+          intents: ["off"],
+          nativeOverride: false,
+          mandatory: true,
+        },
+      }).success,
+    ).toBe(false);
+  });
 });
 
 describe("run contracts", () => {

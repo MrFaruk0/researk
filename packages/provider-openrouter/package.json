@@ -1,0 +1,38 @@
+{
+  "name": "@researk/provider-openrouter",
+  "version": "0.1.0-alpha.1",
+  "description": "Native OpenRouter provider adapter for Researk",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MrFaruk0/researk.git",
+    "directory": "packages/provider-openrouter"
+  },
+  "bugs": {
+    "url": "https://github.com/MrFaruk0/researk/issues"
+  },
+  "homepage": "https://github.com/MrFaruk0/researk#readme",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "clean": "tsc -b --clean",
+    "build": "tsc -b",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@researk/contracts": "0.1.0-alpha.1",
+    "@researk/harness": "0.1.0-alpha.1"
+  }
+}

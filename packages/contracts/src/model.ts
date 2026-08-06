@@ -56,6 +56,9 @@ export const ReasoningCapabilitiesSchema = z
     supported: z.boolean(),
     intents: z.array(ReasoningIntentSchema).max(7).readonly(),
     nativeOverride: z.boolean(),
+    defaultIntent: ReasoningIntentSchema.optional(),
+    mandatory: z.boolean().default(false),
+    supportsMaxTokens: z.boolean().default(false),
   })
   .strict()
   .readonly()
@@ -65,6 +68,24 @@ export const ReasoningCapabilitiesSchema = z
     }
     if (new Set(value.intents).size !== value.intents.length) {
       context.addIssue({ code: "custom", message: "Reasoning intents must be unique" });
+    }
+    if (!value.supported && value.defaultIntent !== undefined) {
+      context.addIssue({ code: "custom", message: "Unsupported reasoning cannot have a default" });
+    }
+    if (value.defaultIntent !== undefined && !value.intents.includes(value.defaultIntent)) {
+      context.addIssue({ code: "custom", message: "Reasoning default must be an accepted intent" });
+    }
+    if (value.mandatory && !value.supported) {
+      context.addIssue({ code: "custom", message: "Mandatory reasoning must be supported" });
+    }
+    if (value.mandatory && value.intents.includes("off")) {
+      context.addIssue({ code: "custom", message: "Mandatory reasoning cannot accept off" });
+    }
+    if (value.supportsMaxTokens && !value.supported) {
+      context.addIssue({
+        code: "custom",
+        message: "Reasoning max-token controls require reasoning support",
+      });
     }
   });
 
@@ -119,7 +140,7 @@ export const ModelDescriptorSchema = z
     modelId: ModelIdSchema,
     canonicalId: CanonicalModelIdSchema,
     displayName: SafeTextSchema,
-    revision: SafeTextSchema.optional(),
+    revision: SafeTextSchema.nullable().default(null),
     capabilities: ModelCapabilitiesSchema,
     status: z.enum(["available", "unavailable", "unknown"]),
     catalogSource: z.enum(["live", "cache", "configured"]),
@@ -204,7 +225,7 @@ export const ModelSelectionSchema = z
     providerId: ProviderIdSchema,
     modelId: ModelIdSchema,
     canonicalId: CanonicalModelIdSchema,
-    revision: SafeTextSchema.optional(),
+    revision: SafeTextSchema.nullable().default(null),
     capabilities: ModelCapabilitiesSchema,
     reasoning: EffectiveReasoningSchema,
   })

@@ -1,9 +1,17 @@
 {
   "name": "@researk/cli",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0-alpha.1",
   "description": "Terminal client for the Researk Harness",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MrFaruk0/researk.git",
+    "directory": "packages/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/MrFaruk0/researk/issues"
+  },
+  "homepage": "https://github.com/MrFaruk0/researk#readme",
   "type": "module",
   "bin": {
     "researk": "./dist/bin.js"
@@ -17,6 +25,9 @@
   "files": [
     "dist"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "clean": "tsc -b --clean",
     "build": "tsc -b",
@@ -24,9 +35,10 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@researk/contracts": "0.0.0",
-    "@researk/harness": "0.0.0",
-    "@researk/provider-openai-compatible": "0.0.0",
-    "@researk/research": "0.0.0"
+    "@researk/contracts": "0.1.0-alpha.1",
+    "@researk/harness": "0.1.0-alpha.1",
+    "@researk/provider-openai-compatible": "0.1.0-alpha.1",
+    "@researk/provider-openrouter": "0.1.0-alpha.1",
+    "@researk/research": "0.1.0-alpha.1"
   }
 }

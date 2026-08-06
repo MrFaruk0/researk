@@ -21,7 +21,7 @@ import {
   type ProviderContext,
   type ResolvedProviderSelection,
 } from "./provider.js";
-import { sanitizeSafeText } from "./security.js";
+import { sanitizeSafeText, sanitizeUntrustedText } from "./security.js";
 
 export class ProviderRegistry {
   readonly #adapters = new Map<string, ProviderAdapter>();
@@ -74,13 +74,24 @@ export class ProviderRegistry {
         },
       );
     }
+    if (model.status === "unavailable") {
+      throw failure(
+        "model_unavailable",
+        `Model '${requested.modelId}' is currently unavailable for provider '${requested.providerId}'.`,
+        {
+          providerId: requested.providerId,
+          modelId: requested.modelId,
+          retryable: true,
+        },
+      );
+    }
     assertCapabilities(model, requirements);
     const resolvedReasoning = await adapter.resolveReasoning(model, requested.reasoning);
     const selection = ModelSelectionSchema.parse({
       providerId: requested.providerId,
       modelId: requested.modelId,
       canonicalId: canonicalModelId(requested.providerId, requested.modelId),
-      ...(model.revision === undefined ? {} : { revision: model.revision }),
+      revision: model.revision,
       capabilities: model.capabilities,
       reasoning: resolvedReasoning.reasoning,
     });
@@ -94,16 +105,35 @@ export class ProviderRegistry {
 function sanitizeCatalog(catalog: ModelCatalog, adapter: ProviderAdapter): ModelCatalog {
   const parsedProvider = ProviderDescriptorSchema.parse(adapter.descriptor);
   const raw = catalog as unknown as Record<string, unknown>;
-  const rawModels = Array.isArray(raw.models) ? raw.models : [];
+  if (!Array.isArray(raw.models)) {
+    throw failure("provider_protocol_error", "Model catalog did not contain a models array.", {
+      providerId: parsedProvider.providerId,
+    });
+  }
+  const rawModels = raw.models;
   const seen = new Set<string>();
   const models: ModelDescriptor[] = [];
 
   for (const item of rawModels) {
-    if (typeof item !== "object" || item === null) continue;
+    if (typeof item !== "object" || item === null) {
+      throw failure("provider_protocol_error", "Model catalog contained a malformed model.", {
+        providerId: parsedProvider.providerId,
+      });
+    }
     const candidate = item as Record<string, unknown>;
     const modelId = ModelIdSchema.safeParse(candidate.modelId);
     const capabilities = ModelCapabilitiesSchema.safeParse(candidate.capabilities);
-    if (!modelId.success || !capabilities.success || seen.has(modelId.data)) continue;
+    if (!modelId.success || !capabilities.success) {
+      throw failure("provider_protocol_error", "Model catalog contained an invalid model.", {
+        providerId: parsedProvider.providerId,
+      });
+    }
+    if (seen.has(modelId.data)) {
+      throw failure("provider_protocol_error", "Model catalog contained a duplicate model ID.", {
+        providerId: parsedProvider.providerId,
+        modelId: modelId.data,
+      });
+    }
     const suppliedProvider = ProviderIdSchema.safeParse(candidate.providerId);
     const suppliedCanonical = CanonicalModelIdSchema.safeParse(candidate.canonicalId);
     const expectedCanonical = canonicalModelId(parsedProvider.providerId, modelId.data);
@@ -120,14 +150,13 @@ function sanitizeCatalog(catalog: ModelCatalog, adapter: ProviderAdapter): Model
     }
     seen.add(modelId.data);
     const displayName = SafeTextSchema.safeParse(candidate.displayName);
-    const revision =
-      typeof candidate.revision === "string" ? sanitizeSafeText(candidate.revision) : undefined;
+    const revision = sanitizeOptionalSafeText(candidate.revision);
     models.push({
       providerId: parsedProvider.providerId,
       modelId: modelId.data,
       canonicalId: expectedCanonical,
       displayName: displayName.success ? displayName.data : sanitizeSafeText(modelId.data),
-      ...(revision === undefined ? {} : { revision }),
+      revision,
       capabilities: capabilities.data,
       status:
         candidate.status === "available" || candidate.status === "unavailable"
@@ -150,6 +179,12 @@ function sanitizeCatalog(catalog: ModelCatalog, adapter: ProviderAdapter): Model
     refreshedAt: raw.refreshedAt,
     stale: raw.stale === true,
   });
+}
+
+function sanitizeOptionalSafeText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const sanitized = sanitizeUntrustedText(value).replace(/\s+/gu, " ").trim();
+  return SafeTextSchema.safeParse(sanitized).success ? sanitized : null;
 }
 
 function assertCapabilities(model: ModelDescriptor, required: CapabilityRequirements): void {

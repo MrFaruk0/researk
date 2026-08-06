@@ -1,0 +1,52 @@
+name: Publish public npm packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing Researk tag to publish, such as v0.1.0-alpha.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify tagged source and release gates
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          npm run release:verify-version -- --tag "$RELEASE_TAG"
+          npm run clean
+          npm run build
+          npm run typecheck
+          npm test
+          npm run lint
+          npm run format-check
+          git diff --check
+
+      - name: Publish every public workspace through npm Trusted Publishing
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          npm_tag=latest
+          if [[ "$RELEASE_TAG" == *-* ]]; then npm_tag=next; fi
+          npm run release:publish-npm -- --tag "$npm_tag"

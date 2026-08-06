@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use Researk in your work, please cite the software using this metadata."
+title: "Researk"
+type: software
+authors:
+  - name: "Researk contributors"
+abstract: >-
+  A local-first, open-source harness and command-line interface for specialized
+  scientific research, academic writing, analysis, revision, and paper
+  reproduction workflows with provider- and model-agnostic language models.
+license: Apache-2.0
+repository-code: "https://github.com/MrFaruk0/researk"
+url: "https://github.com/MrFaruk0/researk"
+keywords:
+  - scientific research
+  - academic writing
+  - command-line interface
+  - research harness
+  - large language models
+  - LaTeX
+

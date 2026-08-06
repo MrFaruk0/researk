@@ -1,9 +1,17 @@
 {
   "name": "researk",
-  "version": "0.0.0",
+  "version": "0.1.0-alpha.1",
   "private": true,
   "description": "Local-first scientific research harness and CLI",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MrFaruk0/researk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MrFaruk0/researk/issues"
+  },
+  "homepage": "https://github.com/MrFaruk0/researk#readme",
   "type": "module",
   "engines": {
     "node": ">=24.0.0"
@@ -19,7 +27,14 @@
     "test": "npm run test --workspaces --if-present",
     "lint": "biome lint .",
     "format": "biome format . --write",
-    "format-check": "biome format ."
+    "format-check": "biome format .",
+    "verify": "npm run clean && npm run build && npm run typecheck && npm test && npm run lint && npm run format-check",
+    "pack:dry-run": "npm pack --workspaces --dry-run --json --ignore-scripts",
+    "pack:standalone": "node scripts/build-standalone-cli.mjs",
+    "smoke:standalone": "node scripts/smoke-standalone-cli.mjs",
+    "release:artifacts": "node scripts/build-release-artifacts.mjs",
+    "release:verify-version": "node scripts/verify-release-version.mjs",
+    "release:publish-npm": "node scripts/publish-public-workspaces.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.2.0",

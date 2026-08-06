@@ -9,6 +9,7 @@
     { "path": "../contracts" },
     { "path": "../harness" },
     { "path": "../provider-openai-compatible" },
+    { "path": "../provider-openrouter" },
     { "path": "../research" }
   ],
   "include": ["src/**/*.ts"]

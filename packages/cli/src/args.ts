@@ -1,5 +1,6 @@
 import {
   type CanonicalModelId,
+  ProviderIdSchema,
   type ReasoningIntent,
   ReasoningIntentSchema,
   splitCanonicalModelId,
@@ -32,7 +33,7 @@ export function parseArguments(
   let reasoningValue = env.RESEARK_REASONING ?? "auto";
   let providerId = env.RESEARK_PROVIDER_ID;
   let baseUrl = env.RESEARK_OPENAI_BASE_URL;
-  let apiKeyEnvironmentVariable = env.RESEARK_OPENAI_API_KEY_ENV ?? "OPENAI_API_KEY";
+  let apiKeyEnvironmentVariable: string | undefined;
   const prompt: string[] = [];
   let optionsEnded = false;
 
@@ -71,6 +72,9 @@ export function parseArguments(
 
   const reasoning = ReasoningIntentSchema.parse(reasoningValue);
   const model = modelValue === undefined ? undefined : parseModelIdentity(modelValue);
+  const inferredProviderId =
+    providerId ?? (model === undefined ? undefined : splitCanonicalModelId(model).providerId);
+  if (inferredProviderId !== undefined) ProviderIdSchema.parse(inferredProviderId);
   if (json && raw) throw new Error("--json and --raw cannot be used together");
   if (command !== undefined && command !== "chat" && prompt.length > 0) {
     throw new Error(`${command} does not accept positional arguments`);
@@ -83,6 +87,11 @@ export function parseArguments(
     throw new Error("--provider-id must match the provider in --model provider:model");
   }
 
+  const credentialReference = resolveCredentialReference(
+    apiKeyEnvironmentVariable,
+    inferredProviderId,
+    env,
+  );
   return {
     ...(command === undefined ? {} : { command }),
     help,
@@ -93,7 +102,7 @@ export function parseArguments(
     reasoning,
     ...(providerId === undefined ? {} : { providerId }),
     ...(baseUrl === undefined ? {} : { baseUrl }),
-    apiKeyEnvironmentVariable,
+    apiKeyEnvironmentVariable: credentialReference,
     prompt: prompt.join(" "),
   };
 }
@@ -106,6 +115,27 @@ export function parseModelIdentity(value: string): CanonicalModelId {
   const parsed = value as CanonicalModelId;
   splitCanonicalModelId(parsed);
   return parsed;
+}
+
+export function validateEnvironmentReference(value: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(value)) {
+    throw new Error(
+      "Credential environment-variable names must use letters, digits, and underscores.",
+    );
+  }
+  return value;
+}
+
+function resolveCredentialReference(
+  explicit: string | undefined,
+  providerId: string | undefined,
+  env: Readonly<Record<string, string | undefined>>,
+): string {
+  if (explicit !== undefined) return validateEnvironmentReference(explicit);
+  if (providerId === "openrouter") {
+    return validateEnvironmentReference(env.RESEARK_OPENROUTER_API_KEY_ENV ?? "OPENROUTER_API_KEY");
+  }
+  return validateEnvironmentReference(env.RESEARK_OPENAI_API_KEY_ENV ?? "OPENAI_API_KEY");
 }
 
 function requireValue(argv: readonly string[], index: number, option: string): string {
