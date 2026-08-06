@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
+  },
+  "references": [
+    { "path": "../contracts" },
+    { "path": "../harness" },
+    { "path": "../provider-openai-compatible" },
+    { "path": "../research" }
+  ],
+  "include": ["src/**/*.ts"]
+}

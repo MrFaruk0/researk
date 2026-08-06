@@ -1,0 +1,27 @@
+{
+  "name": "@researk/provider-openai-compatible",
+  "version": "0.0.0",
+  "private": true,
+  "description": "OpenAI-compatible provider adapter for Researk",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "clean": "tsc -b --clean",
+    "build": "tsc -b",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@researk/contracts": "0.0.0",
+    "@researk/harness": "0.0.0"
+  }
+}
