@@ -321,7 +321,7 @@ async function writeStandalonePackage(packageDirectory, rootPackage, dependencie
   );
   await writeFile(
     join(packageDirectory, "bin", "researk.js"),
-    '#!/usr/bin/env node\nimport "@researk/cli/dist/bin.js";\n',
+    '#!/usr/bin/env node\nimport "@researk/cli/bin";\n',
     "utf8",
   );
   await copyFile(join(repositoryRoot, "LICENSE"), join(packageDirectory, "LICENSE"));
