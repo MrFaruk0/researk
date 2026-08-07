@@ -1,384 +1,563 @@
 import { Buffer } from "node:buffer";
-import { liteAdaptor } from "@mathjax/src/js/adaptors/liteAdaptor.js";
-import { RegisterHTMLHandler } from "@mathjax/src/js/handlers/html.js";
-import { TeX } from "@mathjax/src/js/input/tex.js";
-import { mathjax } from "@mathjax/src/js/mathjax.js";
-import { SVG } from "@mathjax/src/js/output/svg.js";
+import { Worker } from "node:worker_threads";
+import {
+  latexSvgRendererLimits as coreLimits,
+  type LatexSvgRenderErrorCode,
+  type LatexSvgRenderRequest,
+  type LatexSvgRenderResult,
+} from "./core.js";
+import {
+  isWorkerReadyMessage,
+  maximumRequestId,
+  parseWorkerResponse,
+  type WorkerErrorCode,
+  type WorkerRenderRequest,
+} from "./protocol.js";
 
-const maximumInputBytes = 16 * 1024;
-const maximumOutputBytes = 1024 * 1024;
-const maximumBraceNesting = 128;
-const maximumViewBoxDimension = 32_768;
-
-const safeElementNames = new Set(["svg", "g", "path", "rect", "text"]);
-const safeAttributeNames = new Set([
-  "d",
-  "data-mjx-error",
-  "aria-hidden",
-  "aria-label",
-  "class",
-  "data-c",
-  "data-latex",
-  "data-mml-node",
-  "dx",
-  "dy",
-  "fill",
-  "focusable",
-  "font-family",
-  "font-size",
-  "height",
-  "role",
-  "stroke",
-  "stroke-width",
-  "style",
-  "text-anchor",
-  "transform",
-  "viewBox",
-  "width",
-  "x",
-  "xml:space",
-  "xmlns",
-  "y",
-]);
-
-export const latexSvgRendererLimits = Object.freeze({
-  maximumBraceNesting,
-  maximumInputBytes,
-  maximumOutputBytes,
-  maximumViewBoxDimension,
-});
-
-export type LatexSvgRenderErrorCode =
-  | "invalid_input"
-  | "input_limit"
-  | "output_limit"
-  | "render_failed"
-  | "unsafe_svg";
-
-export class LatexSvgRenderError extends Error {
-  public readonly code: LatexSvgRenderErrorCode;
-
-  public constructor(code: LatexSvgRenderErrorCode, message: string, options?: ErrorOptions) {
-    super(message, options);
-    this.name = "LatexSvgRenderError";
-    this.code = code;
-  }
-}
-
-export interface LatexSvgRenderRequest {
-  readonly display?: boolean;
-  readonly tex: string;
-}
-
-export interface LatexSvgRenderResult {
-  readonly display: boolean;
-  readonly renderer: "mathjax-4.1.3";
-  readonly svg: string;
-  readonly tex: string;
-}
-
-interface Renderer {
-  readonly adaptor: ReturnType<typeof liteAdaptor>;
-  readonly document: ReturnType<typeof mathjax.document>;
-}
-
-let renderer: Renderer | undefined;
+const maximumExpressionsPerResponse = 256;
+const maximumCumulativeRenderMs = 5_000;
+const maximumConcurrentJobs = 2;
+const renderTimeoutMs = 1_000;
+const initializationTimeoutMs = 5_000;
 
 /**
- * Renders one restricted TeX expression to a validated SVG string in memory.
- *
- * This intentionally loads only MathJax's base TeX package. It does not execute
- * system TeX, invoke a shell, load external resources, rasterize output, or write files.
+ * A slot re-warms itself after a failure, but a slot that cannot start a worker at all must not
+ * spawn forever. After this many consecutive failed warm-ups the slot stops retrying on its own and
+ * only fails the jobs actually addressed to it.
  */
-export function renderTexToSvg(request: LatexSvgRenderRequest): LatexSvgRenderResult {
-  validateTex(request.tex);
+const maximumWarmRetries = 3;
 
-  const display = request.display ?? true;
+export { LatexSvgRenderError } from "./core.js";
+export type {
+  LatexSvgRenderErrorCode,
+  LatexSvgRenderRequest,
+  LatexSvgRenderResult,
+} from "./core.js";
 
-  try {
-    const activeRenderer = getRenderer();
-    const node = activeRenderer.document.convert(request.tex, { display });
-    const svgNode = activeRenderer.adaptor.tags(node, "svg")[0];
+export const latexSvgRendererLimits = Object.freeze({
+  ...coreLimits,
+  initializationTimeoutMs,
+  maximumConcurrentJobs,
+  maximumCumulativeRenderMs,
+  maximumExpressionsPerResponse,
+  maximumWarmRetries,
+  renderTimeoutMs,
+  workerMemoryMiB: 128,
+});
 
-    if (svgNode === undefined) {
-      throw new LatexSvgRenderError("render_failed", "MathJax did not produce an SVG element.");
-    }
+export type ManagedLatexRenderErrorCode =
+  | LatexSvgRenderErrorCode
+  | "cancelled"
+  | "expression_limit"
+  | "render_time_limit"
+  | "timeout"
+  | "worker_failed";
 
-    const svg = activeRenderer.adaptor.serializeXML(svgNode);
-    validateSvg(svg);
-
-    return {
-      display,
-      renderer: "mathjax-4.1.3",
-      svg,
-      tex: request.tex,
-    };
-  } catch (error) {
-    if (error instanceof LatexSvgRenderError) {
-      throw error;
-    }
-
-    throw new LatexSvgRenderError("render_failed", "MathJax could not render the expression.", {
-      cause: error,
-    });
+export class ManagedLatexRenderError extends Error {
+  constructor(
+    public readonly code: ManagedLatexRenderErrorCode,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "ManagedLatexRenderError";
   }
 }
 
-function getRenderer(): Renderer {
-  if (renderer !== undefined) {
-    return renderer;
-  }
+/** Per-response accounting. Create exactly one for each canonical assistant response. */
+export class LatexRenderBudget {
+  #expressions = 0;
+  #renderTimeMs = 0;
 
-  const adaptor = liteAdaptor();
-  RegisterHTMLHandler(adaptor);
-
-  const tex = new TeX({ packages: ["base"] });
-  const svg = new SVG({ fontCache: "none" });
-
-  renderer = {
-    adaptor,
-    document: mathjax.document("", {
-      InputJax: tex,
-      OutputJax: svg,
-    }),
-  };
-
-  return renderer;
-}
-
-function validateTex(tex: string): void {
-  if (typeof tex !== "string" || tex.length === 0) {
-    throw new LatexSvgRenderError("invalid_input", "TeX input must be a non-empty string.");
-  }
-
-  if (Buffer.byteLength(tex, "utf8") > maximumInputBytes) {
-    throw new LatexSvgRenderError(
-      "input_limit",
-      `TeX input exceeds the ${maximumInputBytes}-byte limit.`,
-    );
-  }
-
-  let braceDepth = 0;
-  let escaped = false;
-
-  for (const character of tex) {
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-
-    if (character === "\\") {
-      escaped = true;
-      continue;
-    }
-
-    if (character === "{") {
-      braceDepth += 1;
-      if (braceDepth > maximumBraceNesting) {
-        throw new LatexSvgRenderError(
-          "input_limit",
-          `TeX input exceeds the ${maximumBraceNesting}-level brace nesting limit.`,
-        );
-      }
-    } else if (character === "}") {
-      braceDepth -= 1;
-      if (braceDepth < 0) {
-        throw new LatexSvgRenderError("invalid_input", "TeX input has an unmatched closing brace.");
-      }
-    }
-  }
-
-  if (braceDepth !== 0) {
-    throw new LatexSvgRenderError("invalid_input", "TeX input has an unmatched opening brace.");
-  }
-}
-
-function validateSvg(svg: string): void {
-  if (Buffer.byteLength(svg, "utf8") > maximumOutputBytes) {
-    throw new LatexSvgRenderError(
-      "output_limit",
-      `Rendered SVG exceeds the ${maximumOutputBytes}-byte limit.`,
-    );
-  }
-
-  const openElements: string[] = [];
-  let rootSeen = false;
-  let cursor = 0;
-
-  while (cursor < svg.length) {
-    const start = svg.indexOf("<", cursor);
-    if (start === -1) {
-      validateSvgText(svg.slice(cursor));
-      break;
-    }
-
-    validateSvgText(svg.slice(cursor, start));
-
-    const end = findTagEnd(svg, start);
-    if (end === -1) {
-      throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG contains an unterminated tag.");
-    }
-
-    const tag = svg.slice(start, end + 1);
-    if (tag.startsWith("</")) {
-      const closingMatch = /^<\/([A-Za-z][A-Za-z0-9:_-]*)\s*>$/u.exec(tag);
-      const closingName = closingMatch?.[1];
-      if (closingName === undefined || openElements.pop() !== closingName) {
-        throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG has invalid element nesting.");
-      }
-    } else {
-      const parsed = parseStartTag(tag);
-
-      if (!safeElementNames.has(parsed.name)) {
-        throw new LatexSvgRenderError(
-          "unsafe_svg",
-          `Rendered SVG contains disallowed <${parsed.name}> markup.`,
-        );
-      }
-
-      if (!rootSeen) {
-        if (parsed.name !== "svg") {
-          throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG has no SVG root element.");
-        }
-        rootSeen = true;
-      } else if (openElements.length === 0) {
-        throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG has more than one root element.");
-      }
-
-      validateAttributes(parsed.name, parsed.attributes);
-
-      if (!parsed.selfClosing) {
-        openElements.push(parsed.name);
-      }
-    }
-
-    cursor = end + 1;
-  }
-
-  if (!rootSeen || openElements.length !== 0) {
-    throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG has incomplete element nesting.");
-  }
-
-  validateViewBox(svg);
-}
-
-function validateSvgText(text: string): void {
-  if (/[^\t\n\r\u0020-\u{10FFFF}]/u.test(text)) {
-    throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG contains a control character.");
-  }
-}
-
-function findTagEnd(svg: string, start: number): number {
-  let quote: '"' | "'" | undefined;
-
-  for (let index = start + 1; index < svg.length; index += 1) {
-    const character = svg[index];
-
-    if (quote !== undefined) {
-      if (character === quote) {
-        quote = undefined;
-      }
-    } else if (character === '"' || character === "'") {
-      quote = character;
-    } else if (character === ">") {
-      return index;
-    }
-  }
-
-  return -1;
-}
-
-interface ParsedStartTag {
-  readonly attributes: ReadonlyMap<string, string>;
-  readonly name: string;
-  readonly selfClosing: boolean;
-}
-
-function parseStartTag(tag: string): ParsedStartTag {
-  const interior = tag.slice(1, -1).trim();
-  const selfClosing = interior.endsWith("/");
-  const content = (selfClosing ? interior.slice(0, -1) : interior).trim();
-  const nameMatch = /^([A-Za-z][A-Za-z0-9:_-]*)(.*)$/su.exec(content);
-  const name = nameMatch?.[1];
-  let remaining = nameMatch?.[2];
-
-  if (name === undefined || remaining === undefined) {
-    throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG contains invalid markup.");
-  }
-
-  const attributes = new Map<string, string>();
-
-  while (remaining.length > 0) {
-    const attributeMatch = /^\s+([A-Za-z][A-Za-z0-9:._-]*)="([^"]*)"/su.exec(remaining);
-    const attributeName = attributeMatch?.[1];
-    const attributeValue = attributeMatch?.[2];
-    const fullAttribute = attributeMatch?.[0];
-
-    if (
-      attributeName === undefined ||
-      attributeValue === undefined ||
-      fullAttribute === undefined ||
-      attributes.has(attributeName)
-    ) {
-      throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG contains invalid attributes.");
-    }
-
-    attributes.set(attributeName, attributeValue);
-    remaining = remaining.slice(fullAttribute.length);
-  }
-
-  return { attributes, name, selfClosing };
-}
-
-function validateAttributes(elementName: string, attributes: ReadonlyMap<string, string>): void {
-  for (const [name, value] of attributes) {
-    if (!safeAttributeNames.has(name) && !name.startsWith("data-")) {
-      throw new LatexSvgRenderError(
-        "unsafe_svg",
-        `Rendered SVG contains disallowed ${name} attribute.`,
+  claim(): void {
+    this.#expressions += 1;
+    if (this.#expressions > maximumExpressionsPerResponse) {
+      throw new ManagedLatexRenderError(
+        "expression_limit",
+        "The response math-expression limit was reached.",
       );
     }
-
-    if (/^(?:href|xlink:href)$/iu.test(name) || containsUnsafeControlCharacter(value)) {
-      throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG contains an unsafe attribute.");
+    if (this.#renderTimeMs >= maximumCumulativeRenderMs) {
+      throw new ManagedLatexRenderError(
+        "render_time_limit",
+        "The response render-time limit was reached.",
+      );
     }
+  }
 
-    if (name === "style" && /(?:url\s*\(|@import|expression\s*\(|javascript\s*:)/iu.test(value)) {
-      throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG contains unsafe style content.");
-    }
+  record(milliseconds: number): void {
+    this.#renderTimeMs += Math.max(0, milliseconds);
+  }
 
-    if (name === "xmlns" && (elementName !== "svg" || value !== "http://www.w3.org/2000/svg")) {
-      throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG has an unexpected namespace.");
-    }
+  get expressions(): number {
+    return this.#expressions;
+  }
+
+  get renderTimeMs(): number {
+    return this.#renderTimeMs;
   }
 }
 
-function containsUnsafeControlCharacter(value: string): boolean {
-  for (const character of value) {
-    const codePoint = character.codePointAt(0);
-    if (codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f)) {
-      return true;
+export interface ManagedLatexRendererOptions {
+  /** Primarily for protocol/failure tests; production always uses the packaged worker module. */
+  readonly workerUrl?: URL;
+  readonly concurrency?: number;
+  readonly renderTimeoutMs?: number;
+  readonly initializationTimeoutMs?: number;
+  /** Test seam for deterministic worker crash/timeout protocol fixtures. */
+  readonly workerFactory?: () => Worker;
+}
+
+interface Job {
+  readonly request: LatexSvgRenderRequest;
+  readonly format: "svg" | "png";
+  readonly budget: LatexRenderBudget;
+  readonly signal?: AbortSignal;
+  readonly resolve: (result: LatexSvgRenderResult) => void;
+  readonly reject: (error: Error) => void;
+}
+
+interface Slot {
+  worker: Worker;
+  ready: Promise<void>;
+  busy: boolean;
+  generation: number;
+  /** Consecutive failed warm-ups for this slot. Reset by any worker that completes a handshake. */
+  warmFailures: number;
+  /** Set once `warmFailures` reaches the retry cap. A disabled slot never spawns another worker. */
+  disabled: boolean;
+}
+
+/** A bounded, pre-warmed pool. A failed, cancelled, or timed-out worker is never reused. */
+export class ManagedLatexRenderer {
+  readonly #workerUrl: URL;
+  readonly #concurrency: number;
+  readonly #timeout: number;
+  readonly #initializationTimeout: number;
+  readonly #workerFactory: (() => Worker) | undefined;
+  readonly #slots: Slot[] = [];
+  readonly #queue: Job[] = [];
+  /**
+   * Jobs already handed to a slot. A terminated worker is not guaranteed to emit `exit` or `error`,
+   * so `close` settles these explicitly rather than waiting for an event that may never arrive.
+   */
+  readonly #active = new Set<Job>();
+  #nextId = 1;
+  #closed = false;
+
+  constructor(options: ManagedLatexRendererOptions = {}) {
+    this.#workerUrl =
+      options.workerUrl ??
+      new URL(
+        import.meta.url.includes("/src/") ? "../dist/worker.js" : "./worker.js",
+        import.meta.url,
+      );
+    this.#concurrency = Math.max(
+      1,
+      Math.min(maximumConcurrentJobs, options.concurrency ?? maximumConcurrentJobs),
+    );
+    this.#timeout = Math.max(
+      1,
+      Math.min(renderTimeoutMs, options.renderTimeoutMs ?? renderTimeoutMs),
+    );
+    this.#initializationTimeout = Math.max(
+      1,
+      Math.min(initializationTimeoutMs, options.initializationTimeoutMs ?? initializationTimeoutMs),
+    );
+    this.#workerFactory = options.workerFactory;
+    for (let index = 0; index < this.#concurrency; index += 1) this.#slots.push(this.#createSlot());
+  }
+
+  render(
+    request: LatexSvgRenderRequest,
+    budget: LatexRenderBudget,
+    signal?: AbortSignal,
+    format: "svg" | "png" = "svg",
+  ): Promise<LatexSvgRenderResult> {
+    if (this.#closed)
+      return Promise.reject(new ManagedLatexRenderError("worker_failed", "Renderer is closed."));
+    if (signal?.aborted === true) return Promise.reject(cancelledError());
+    // Enforce the byte ceiling before an untrusted payload is copied into worker messaging.
+    if (Buffer.byteLength(request.tex, "utf8") > coreLimits.maximumInputBytes) {
+      return Promise.reject(
+        new ManagedLatexRenderError("input_limit", "TeX input exceeds the renderer limit."),
+      );
+    }
+    try {
+      budget.claim();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return new Promise((resolve, reject) => {
+      const job: Job = {
+        request,
+        format,
+        budget,
+        ...(signal === undefined ? {} : { signal }),
+        resolve,
+        reject,
+      };
+      this.#queue.push(job);
+      const removeQueued = () => {
+        const index = this.#queue.indexOf(job);
+        if (index >= 0) {
+          this.#queue.splice(index, 1);
+          reject(cancelledError());
+        }
+      };
+      signal?.addEventListener("abort", removeQueued, { once: true });
+      this.#dispatch();
+    });
+  }
+
+  async close(): Promise<void> {
+    this.#closed = true;
+    for (const job of this.#queue.splice(0)) job.reject(cancelledError());
+    // An in-flight job is settled here rather than left to a termination event, so no caller is
+    // left awaiting a promise that a terminated worker will never settle.
+    for (const job of [...this.#active]) job.reject(cancelledError());
+    await Promise.all(
+      this.#slots.map(async (slot) => {
+        slot.disabled = true;
+        await slot.worker.terminate().catch(() => undefined);
+      }),
+    );
+    // A replacement may have been created while the terminations above were awaited. The slot's
+    // worker reference is authoritative at this point, so re-terminating it collects any late one.
+    await Promise.all(
+      this.#slots.map(async (slot) => void (await slot.worker.terminate().catch(() => undefined))),
+    );
+  }
+
+  #createSlot(): Slot {
+    const worker =
+      this.#workerFactory?.() ??
+      // `execArgv` is deliberately empty. Inheriting `process.execArgv` propagates host flags that
+      // are invalid for a file-URL worker entry, most notably `--input-type=module`, which fails
+      // worker construction with ERR_INPUT_TYPE_NOT_ALLOWED. The worker needs no host flags.
+      new Worker(this.#workerUrl, {
+        execArgv: [],
+        resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 16 },
+      });
+    // A renderer worker must never hold a one-shot CLI process open. The pool refs a worker only
+    // while a job is actually in flight, and unrefs it again as soon as the slot goes idle.
+    unref(worker);
+    let resolveReady!: () => void;
+    let rejectReady!: (error: Error) => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    // An idle pool must not delay process exit, and an unobserved initialization failure must not
+    // surface as an unhandled rejection that changes a one-shot exit code.
+    void ready.catch(() => undefined);
+    // Exactly one of these listeners decides the handshake. Whichever fires first releases the
+    // timer and the other two, so a settled slot holds no timer and no listener on a dead worker.
+    const settle = (error?: Error) => {
+      clearTimeout(timer);
+      worker.off("message", onMessage);
+      worker.off("error", onError);
+      worker.off("exit", onExit);
+      if (error === undefined) resolveReady();
+      else rejectReady(error);
+    };
+    const onMessage = (message: unknown) => {
+      if (isWorkerReadyMessage(message)) {
+        settle();
+      } else {
+        // A worker whose first message is not an exact ready handshake never becomes usable.
+        settle(new ManagedLatexRenderError("worker_failed", "Renderer worker protocol failed."));
+        void worker.terminate();
+      }
+    };
+    const onError = (error: Error) => {
+      settle(
+        new ManagedLatexRenderError("worker_failed", "Renderer worker failed to initialize.", {
+          cause: error,
+        }),
+      );
+    };
+    // A worker can exit before it ever emits `message` or `error`. Without this the handshake would
+    // stay pending until the unreferenced init timer fired, which a one-shot host may never reach.
+    const onExit = () => {
+      settle(
+        new ManagedLatexRenderError("worker_failed", "Renderer worker exited before it was ready."),
+      );
+    };
+    const timer = setTimeout(() => {
+      settle(
+        new ManagedLatexRenderError("worker_failed", "Renderer worker initialization timed out."),
+      );
+      void worker.terminate();
+    }, this.#initializationTimeout);
+    timer.unref?.();
+    worker.on("message", onMessage);
+    worker.once("error", onError);
+    worker.once("exit", onExit);
+    return { worker, ready, busy: false, generation: 0, warmFailures: 0, disabled: false };
+  }
+
+  #dispatch(): void {
+    if (this.#closed) return;
+    for (const slot of this.#slots) {
+      if (slot.busy) continue;
+      const job = this.#queue.shift();
+      if (job === undefined) return;
+      if (job.signal?.aborted === true) {
+        job.reject(cancelledError());
+        continue;
+      }
+      slot.busy = true;
+      this.#active.add(job);
+      void this.#run(slot, job);
     }
   }
 
-  return false;
-}
-
-function validateViewBox(svg: string): void {
-  const rootMatch = /^<svg\b[^>]*\bviewBox="([^"]+)"[^>]*>/u.exec(svg);
-  const rawViewBox = rootMatch?.[1];
-
-  if (rawViewBox === undefined) {
-    throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG has no viewBox.");
+  async #run(slot: Slot, job: Job): Promise<void> {
+    let started: number | undefined;
+    const generation = ++slot.generation;
+    let replace = false;
+    // Hold the event loop open only for the duration of this job, including worker startup, so an
+    // in-flight render cannot be dropped by process exit and an idle pool cannot delay it.
+    const refed = slot.worker;
+    ref(refed);
+    try {
+      await slot.ready;
+      // A completed handshake proves the slot can start a worker, so the retry budget is restored.
+      slot.warmFailures = 0;
+      if (job.signal?.aborted === true) throw cancelledError();
+      started = performance.now();
+      const id = this.#nextId;
+      // A bounded, wrapping counter keeps every id an exact small integer the validator can check.
+      this.#nextId = id >= maximumRequestId ? 1 : id + 1;
+      const display = job.request.display ?? true;
+      const result = await new Promise<LatexSvgRenderResult>((resolve, reject) => {
+        const finish = (error?: Error, value?: LatexSvgRenderResult) => {
+          clearTimeout(timer);
+          job.signal?.removeEventListener("abort", onAbort);
+          slot.worker.off("message", onMessage);
+          slot.worker.off("error", onError);
+          slot.worker.off("exit", onExit);
+          if (error !== undefined) reject(error);
+          else if (value !== undefined) resolve(value);
+        };
+        const onMessage = (message: unknown) => {
+          // Every field is validated against this exact in-flight request before it is used. A
+          // malformed message is a worker failure, never a render failure, and never reflected.
+          const response = parseWorkerResponse(message, {
+            id,
+            format: job.format,
+            tex: job.request.tex,
+            display,
+          });
+          if (response === undefined) {
+            replace = true;
+            finish(
+              new ManagedLatexRenderError("worker_failed", "Renderer worker protocol failed."),
+            );
+          } else if (response.type === "error") {
+            replace = true;
+            // The code is validated against the closed set; the sentence is pool-authored so no
+            // worker-supplied text can reach a caller or a log.
+            finish(new ManagedLatexRenderError(response.code, describeWorkerError(response.code)));
+          } else {
+            finish(undefined, response.result);
+          }
+        };
+        const onError = (error: Error) => {
+          replace = true;
+          finish(
+            new ManagedLatexRenderError("worker_failed", "Renderer worker crashed.", {
+              cause: error,
+            }),
+          );
+        };
+        const onExit = () => {
+          replace = true;
+          finish(new ManagedLatexRenderError("worker_failed", "Renderer worker exited."));
+        };
+        const onAbort = () => {
+          replace = true;
+          finish(cancelledError());
+        };
+        const timer = setTimeout(() => {
+          replace = true;
+          finish(new ManagedLatexRenderError("timeout", "LaTeX rendering timed out."));
+        }, this.#timeout);
+        timer.unref?.();
+        slot.worker.on("message", onMessage);
+        slot.worker.once("error", onError);
+        slot.worker.once("exit", onExit);
+        job.signal?.addEventListener("abort", onAbort, { once: true });
+        const message: WorkerRenderRequest = {
+          type: "render",
+          id,
+          tex: job.request.tex,
+          display,
+          format: job.format,
+        };
+        slot.worker.postMessage(message);
+      });
+      if (Buffer.byteLength(result.svg, "utf8") > coreLimits.maximumOutputBytes) {
+        replace = true;
+        throw new ManagedLatexRenderError("output_limit", "Renderer output exceeds the SVG limit.");
+      }
+      if (result.png !== undefined && result.png.byteLength > 8 * 1024 * 1024) {
+        replace = true;
+        throw new ManagedLatexRenderError(
+          "output_limit",
+          "Renderer payload exceeds the image limit.",
+        );
+      }
+      job.resolve(result);
+    } catch (error) {
+      // Initialization failure also poisons the slot; no expression follows a failed worker.
+      replace = true;
+      job.reject(
+        error instanceof Error
+          ? error
+          : new ManagedLatexRenderError("worker_failed", "Renderer failed."),
+      );
+    } finally {
+      this.#active.delete(job);
+      if (started !== undefined) job.budget.record(performance.now() - started);
+      unref(refed);
+      // A replacement failure must never wedge the slot. `#replace` is already total, but this
+      // guard keeps the two statements below reachable even if it is changed later.
+      if (replace && !this.#closed && slot.generation === generation) {
+        await this.#replace(slot).catch(() => undefined);
+      }
+      slot.busy = false;
+      this.#dispatch();
+    }
   }
 
-  const dimensions = rawViewBox.trim().split(/\s+/u).map(Number);
-  if (
-    dimensions.length !== 4 ||
-    dimensions.some((dimension) => !Number.isFinite(dimension)) ||
-    Math.abs(dimensions[2] ?? Number.POSITIVE_INFINITY) > maximumViewBoxDimension ||
-    Math.abs(dimensions[3] ?? Number.POSITIVE_INFINITY) > maximumViewBoxDimension
-  ) {
-    throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG has an unsafe viewBox.");
+  /**
+   * Retires a poisoned worker and warms a fresh one. Total by construction: a spawn failure is
+   * recorded against the slot's retry budget and surfaced to the next job through `ready`, never
+   * thrown at the caller of this method.
+   */
+  async #replace(slot: Slot): Promise<void> {
+    await slot.worker.terminate().catch(() => undefined);
+    // `close` can complete while the termination above is awaited. Spawning here would leak a
+    // thread that nothing terminates, so the closed state is re-checked at the last moment.
+    if (this.#closed || slot.disabled) return;
+    let replacement: Slot;
+    try {
+      replacement = this.#createSlot();
+    } catch (error) {
+      // The slot cannot start a worker at all. Fail the jobs addressed to it deterministically
+      // instead of spawning forever, and stop retrying once the cap is reached.
+      slot.warmFailures += 1;
+      if (slot.warmFailures >= maximumWarmRetries) slot.disabled = true;
+      const failure = new ManagedLatexRenderError(
+        "worker_failed",
+        "Renderer worker could not be started.",
+        { cause: error instanceof Error ? error : undefined },
+      );
+      slot.ready = Promise.reject(failure);
+      void slot.ready.catch(() => undefined);
+      return;
+    }
+    // A replacement created concurrently with `close` is terminated rather than installed.
+    if (this.#closed) {
+      void replacement.worker.terminate().catch(() => undefined);
+      return;
+    }
+    slot.worker = replacement.worker;
+    slot.ready = replacement.ready;
+  }
+}
+
+let sharedRenderer: ManagedLatexRenderer | undefined;
+
+export function getManagedLatexRenderer(): ManagedLatexRenderer {
+  sharedRenderer ??= new ManagedLatexRenderer();
+  return sharedRenderer;
+}
+
+/**
+ * Deterministically tears down the shared pool. Idle workers are already unreferenced, so a
+ * one-shot process exits without this call; a long-lived host uses it to release threads eagerly.
+ */
+export async function closeManagedLatexRenderer(): Promise<void> {
+  const renderer = sharedRenderer;
+  sharedRenderer = undefined;
+  await renderer?.close();
+}
+
+export async function renderTexToSvg(
+  request: LatexSvgRenderRequest,
+  options: { readonly budget?: LatexRenderBudget; readonly signal?: AbortSignal } = {},
+): Promise<LatexSvgRenderResult> {
+  return getManagedLatexRenderer().render(
+    request,
+    options.budget ?? new LatexRenderBudget(),
+    options.signal,
+  );
+}
+
+export interface LatexPngRenderResult extends LatexSvgRenderResult {
+  readonly png: Uint8Array;
+  readonly width: number;
+  readonly height: number;
+}
+
+export async function renderTexToPng(
+  request: LatexSvgRenderRequest,
+  options: { readonly budget?: LatexRenderBudget; readonly signal?: AbortSignal } = {},
+): Promise<LatexPngRenderResult> {
+  const result = await getManagedLatexRenderer().render(
+    request,
+    options.budget ?? new LatexRenderBudget(),
+    options.signal,
+    "png",
+  );
+  if (result.png === undefined || result.width === undefined || result.height === undefined) {
+    throw new ManagedLatexRenderError("worker_failed", "Renderer returned an incomplete image.");
+  }
+  return result as LatexPngRenderResult;
+}
+
+/**
+ * `ref`/`unref` are optional on a `Worker`-shaped test double and a terminated worker, so both are
+ * applied defensively. Losing a ref must never fail a render.
+ */
+function ref(worker: Worker): void {
+  try {
+    worker.ref?.();
+  } catch {
+    // A terminated or replaced worker cannot be referenced; the job outcome is unaffected.
+  }
+}
+
+function unref(worker: Worker): void {
+  try {
+    worker.unref?.();
+  } catch {
+    // As above: an already-terminated worker holds no handle to release.
+  }
+}
+
+function cancelledError(): ManagedLatexRenderError {
+  return new ManagedLatexRenderError("cancelled", "LaTeX rendering was cancelled.");
+}
+
+/**
+ * Maps a validated worker error code to a fixed local sentence. Worker-supplied text is never used,
+ * so untrusted TeX, MathJax internals, and host paths cannot reach a caller through an error.
+ */
+function describeWorkerError(code: WorkerErrorCode): string {
+  switch (code) {
+    case "invalid_input":
+      return "The LaTeX expression is not valid input for the renderer.";
+    case "input_limit":
+      return "The LaTeX expression exceeds a renderer input limit.";
+    case "output_limit":
+      return "The rendered output exceeds a renderer output limit.";
+    case "unsafe_svg":
+      return "The rendered output failed renderer safety validation.";
+    case "render_failed":
+      return "The isolated LaTeX renderer could not render the expression.";
   }
 }

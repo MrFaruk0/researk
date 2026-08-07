@@ -12,6 +12,7 @@ export interface CliArguments {
   readonly version: boolean;
   readonly json: boolean;
   readonly raw: boolean;
+  readonly accessible: boolean;
   readonly model?: CanonicalModelId;
   readonly reasoning: ReasoningIntent;
   readonly providerId?: string;
@@ -29,6 +30,7 @@ export function parseArguments(
   let version = false;
   let json = false;
   let raw = false;
+  let accessible = false;
   let modelValue = env.RESEARK_MODEL;
   let reasoningValue = env.RESEARK_REASONING ?? "auto";
   let providerId = env.RESEARK_PROVIDER_ID;
@@ -53,6 +55,8 @@ export function parseArguments(
       json = true;
     } else if (argument === "--raw") {
       raw = true;
+    } else if (argument === "--accessible") {
+      accessible = true;
     } else if (argument === "--model") {
       modelValue = requireValue(argv, ++index, "--model");
     } else if (argument === "--reasoning") {
@@ -98,6 +102,7 @@ export function parseArguments(
     version,
     json,
     raw,
+    accessible,
     ...(model === undefined ? {} : { model }),
     reasoning,
     ...(providerId === undefined ? {} : { providerId }),

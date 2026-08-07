@@ -33,13 +33,18 @@ npm run typecheck --workspace @researk/cli
 npm test --workspace @researk/cli
 ```
 
-After `npm run build`, use the offline fake provider for an executable smoke test. PowerShell:
+After `npm run build`, smoke-test CLI commands that do not require a configured provider.
+PowerShell:
 
 ```powershell
-$env:RESEARK_FAKE_PROVIDER = "1"
-node packages/cli/dist/bin.js models
-node packages/cli/dist/bin.js chat --model fake:paper --raw "Test prompt"
+node packages/cli/dist/bin.js help
+node packages/cli/dist/bin.js version
+node packages/cli/dist/bin.js doctor --json
 ```
+
+The offline fake adapter is for Harness-level tests; the CLI does not support
+`RESEARK_FAKE_PROVIDER` or `fake:paper`. Test `models` and `chat` only against a configured endpoint
+you control.
 
 ## Pull requests
 

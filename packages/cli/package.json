@@ -38,6 +38,7 @@
   "dependencies": {
     "@researk/contracts": "0.1.0-alpha.1",
     "@researk/harness": "0.1.0-alpha.1",
+    "@researk/latex-renderer": "0.1.0-alpha.1",
     "@researk/provider-openai-compatible": "0.1.0-alpha.1",
     "@researk/provider-openrouter": "0.1.0-alpha.1",
     "@researk/research": "0.1.0-alpha.1"

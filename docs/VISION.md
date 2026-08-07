@@ -77,9 +77,12 @@ Researk succeeds when its released behavior can be demonstrated, not merely clai
 
 ## Current status
 
-Researk is pre-alpha. A runnable source build provides the Harness, a CLI, an offline fake
-provider, an experimental generic OpenAI-compatible adapter, and publication-profile metadata.
-There is no installable GitHub Release, native packaging, persistent state, graphical math
-backend, CSL processor, scholarly web tooling, reproduction runner, or verified native provider
-support yet. The remaining product description is a target until each capability exists and is
-tested.
+Researk is pre-alpha. A runnable source build provides the Harness, a CLI, a Harness-level offline
+fake provider, an experimental generic OpenAI-compatible adapter, and publication-profile metadata.
+The fake adapter is not exposed through `RESEARK_FAKE_PROVIDER`, `fake:paper`, or any other CLI fake
+mode. Interactive display math can use a bounded local MathJax SVG backend, in-memory resvg
+rasterization, and the iTerm2 inline-image protocol only when iTerm2 support is positively detected;
+exact source is used everywhere else, and Kitty and Sixel are unsupported. There is no installable
+GitHub Release, native packaging, persistent state, CSL processor, scholarly web tooling,
+reproduction runner, or verified native provider support yet. The remaining product description is
+a target until each capability exists and is tested.

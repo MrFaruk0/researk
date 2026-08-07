@@ -2,7 +2,12 @@
 
 ## Status
 
-This document defines the normative rendering contract for the Researk CLI.
+This document defines the normative rendering contract for the Researk CLI. The current pre-alpha
+implementation includes local MathJax SVG generation, in-memory resvg rasterization, and display
+math emission in positively detected iTerm2 TTYs. Exact source is used everywhere else. Kitty and
+Sixel are currently unsupported. Sections that explicitly describe planned command-line or
+configuration options are future contract requirements, not claims that those options are accepted
+by the current CLI.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** describe requirements for implementations of the official CLI and compatible clients.
 
@@ -91,7 +96,7 @@ The runtime owns the canonical response stream. The Research Domain may validate
 
 Sessions MUST persist the canonical source and relevant runtime diagnostics. They MUST NOT persist terminal escape sequences or rendered SVG and raster artifacts. A rendering cache is disposable and MUST NOT become session state.
 
-When a graphic is shown in place of a math span, the CLI MUST retain a direct, documented way to reveal and copy that span's exact source without OCR or reverse conversion. `--math source`, Markdown output, and JSON output MUST always provide the source directly. An interactive source-view or copy action MAY provide additional convenience, but MUST copy the canonical event source rather than text extracted from the rendered image.
+When a graphic is shown in place of a math span, the CLI MUST retain a direct, documented way to reveal and copy that span's exact source without OCR or reverse conversion. The current interactive implementation provides `/source`; raw, accessible, Markdown, and JSON output provide exact source directly. The planned `--math source` mode MUST do the same when that option is implemented. Any interactive source-view or copy action MUST copy the canonical event source rather than text extracted from the rendered image.
 
 ---
 
@@ -247,7 +252,9 @@ Dependency versions, licenses, notices, and the software bill of materials MUST 
 
 ## 7.1 Automatic behavior
 
-The default output mode is `auto` and the default math mode is `auto`.
+The current CLI automatically selects terminal presentation only for an interactive TTY and uses
+automatic math capability detection. The named `auto` values below describe the planned explicit
+output and math option contract.
 
 When standard output is an interactive TTY, the CLI SHOULD use terminal presentation and SHOULD render math graphically only when a supported graphics protocol has been positively detected.
 
@@ -255,9 +262,9 @@ When standard output is not an interactive TTY, the CLI MUST emit Markdown with 
 
 Uncertainty MUST resolve to source, not graphics.
 
-## 7.2 Math modes
+## 7.2 Planned math modes
 
-The CLI supports:
+The following options define planned contract behavior. They are not accepted by the current CLI:
 
 ```text
 --math auto
@@ -273,9 +280,10 @@ Their meanings are:
 
 The CLI MUST NOT use approximate Unicode substitutions as an automatic fallback. Fractions, matrices, indices, accents, and operators can be changed or made ambiguous by partial character substitution. The exact LaTeX source is the only required fallback.
 
-## 7.3 Output formats
+## 7.3 Planned output-format option
 
-The CLI supports:
+The current CLI exposes `--raw` and `--json`, rather than `--output`. The following `--output`
+values define planned contract behavior and are not accepted by the current CLI:
 
 ```text
 --output auto
@@ -289,9 +297,9 @@ The CLI supports:
 - `markdown` emits the canonical Markdown and LaTeX representation without terminal control sequences.
 - `json` emits the machine-readable contract in Section 10.
 
-## 7.4 Fallback and theme
+## 7.4 Planned fallback and theme options
 
-The CLI supports:
+The following options define planned contract behavior. They are not accepted by the current CLI:
 
 ```text
 --math-fallback source
@@ -305,9 +313,9 @@ The CLI supports:
 
 Raster output SHOULD use a transparent background. `auto` theme selection may use a trusted terminal foreground query or known terminal metadata. If color cannot be determined safely, the renderer MUST use the configured fallback theme and MUST retain sufficient contrast.
 
-## 7.5 Persistent configuration
+## 7.5 Planned persistent configuration
 
-The persistent equivalents are:
+Persistent configuration is not currently implemented. Its planned equivalents are:
 
 ```toml
 [output]
@@ -318,22 +326,31 @@ math_theme = "auto"
 accessible = false
 ```
 
-Command-line flags override workspace configuration, which overrides user configuration, which overrides built-in defaults.
+When persistent configuration and the corresponding command-line flags are implemented,
+command-line flags MUST override workspace configuration, which MUST override user configuration,
+which MUST override built-in defaults.
 
 ---
 
 # 8. Terminal Graphics
 
-The first supported graphics protocols are:
+The currently supported graphics protocol is:
 
-1. Kitty graphics protocol
-2. iTerm2 inline-image protocol
+1. iTerm2 inline-image protocol
 
-Sixel support is planned but MUST be reported as unsupported until its encoder, capability detection, layout, and cleanup behavior pass the same conformance tests as the first two backends.
+Kitty and Sixel support are planned but MUST be reported as unsupported until their emitters,
+capability detection, layout, and cleanup behavior pass the required conformance tests. The current
+implementation performs no Kitty or Sixel capability probe.
 
 The CLI MUST emit protocol bytes directly from its trusted terminal backend. It MUST NOT depend on helper executables.
 
 Display math SHOULD be rendered graphically when a backend is available. Inline math may be rendered graphically only when the layout engine can reserve the required cell rectangle, preserve the surrounding text order, and reflow or redraw it correctly. If it cannot do so, that inline expression MUST fall back to exact source even when display math uses graphics.
+
+When the interactive REPL successfully presents display math graphically, it MUST omit the
+corresponding raw LaTeX from normal visible output to avoid duplicate content. The exact canonical
+response remains available through the `/source` REPL command, which writes the latest assistant
+response as source text for direct inspection or copying. Unsupported terminals and graphics
+failures MUST continue to show the exact source inline.
 
 ## 8.1 Capability detection
 
@@ -346,7 +363,7 @@ Capability detection proceeds in this order:
 5. Verify multiplexer passthrough when a multiplexer is present.
 6. Cache the result for the process.
 
-Kitty support MUST be established with its graphics query and a terminal device-attributes response, not solely with environment variables. The query wait MUST be bounded to 100 milliseconds. A missing, malformed, or late response means unsupported for that process.
+Future Kitty support MUST be established with its graphics query and a terminal device-attributes response, not solely with environment variables. The query wait MUST be bounded to 100 milliseconds. A missing, malformed, or late response means unsupported for that process. Until that bounded query/reply broker is implemented and tested, Kitty MUST remain unsupported.
 
 iTerm2 support may use its documented terminal identity and version metadata. Inside `tmux`, `screen`, or another multiplexer, it MUST remain disabled until passthrough is explicitly recognized and covered by integration tests.
 
@@ -386,7 +403,8 @@ Accessible mode MUST:
 - preserve a stable linear reading order,
 - keep diagnostics separate from response content.
 
-Accessible mode takes precedence over `--math auto` and `--math graphics`.
+Accessible mode takes precedence over automatic graphical rendering now and MUST take precedence
+over the planned `--math auto` and `--math graphics` options when they are implemented.
 
 `NO_COLOR` controls color only. It MUST NOT be treated as an accessibility setting, a non-TTY signal, or a request to discard Markdown structure.
 
@@ -587,7 +605,8 @@ The renderer MUST have:
 
 Terminal tests MUST cover:
 
-- Kitty query success, rejection, malformed reply, and timeout,
+- future Kitty query success, rejection, malformed reply, and timeout before Kitty support is
+  enabled,
 - iTerm2 positive and negative identification,
 - redirected stdout and stderr,
 - `TERM=dumb`, CI, SSH, `tmux`, and `screen`,
@@ -596,7 +615,7 @@ Terminal tests MUST cover:
 - user keystrokes arriving during a capability probe,
 - inline fallback when correct cell layout is impossible.
 
-Until Sixel passes the equivalent suite, it MUST remain planned rather than supported.
+Until Kitty or Sixel passes its equivalent suite, it MUST remain planned rather than supported.
 
 ## 15.4 Output and accessibility tests
 
@@ -625,7 +644,10 @@ CLI rendering is complete for its initial release only when all of the following
 - Every graphically rendered expression has a documented exact-source reveal or copy path that does not use OCR or reverse conversion.
 - Parser results are independent of streaming chunk boundaries.
 - Supported display math renders through the bundled MathJax-to-SVG and resvg pipeline while offline.
-- Kitty and iTerm2 render representative equations without corrupting the prompt, cursor, resize behavior, or scrollback.
+- iTerm2 renders representative display equations without corrupting the prompt, cursor, resize
+  behavior, or scrollback.
+- Kitty and Sixel remain unsupported until each satisfies the corresponding protocol, capability,
+  layout, and lifecycle criteria.
 - Unsupported terminals receive exact source automatically and without installation steps.
 - Redirected output contains no terminal control or graphics protocol bytes.
 - Accessible mode provides stable, linear, exact-source math output.

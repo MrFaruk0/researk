@@ -7,9 +7,10 @@ import {
   ReasoningIntentSchema,
   splitCanonicalModelId,
 } from "@researk/contracts";
-import { parseModelIdentity, validateEnvironmentReference, type CliArguments } from "./args.js";
+import { closeManagedLatexRenderer } from "@researk/latex-renderer";
+import { type CliArguments, parseModelIdentity, validateEnvironmentReference } from "./args.js";
 import { REPL_HELP } from "./help.js";
-import { write } from "./io.js";
+import { readMaskedInput, selectFromPalette, write } from "./io.js";
 import { executeChat, resolveHarness } from "./run.js";
 import { configuredSecretValues, safeErrorMessage, safeTerminalText } from "./safety.js";
 import { createTheme, isThemeName, THEME_NAMES, type ThemeName } from "./theme.js";
@@ -47,50 +48,47 @@ export async function startRepl(
   try {
     workspace = await openWorkspace(dependencies.cwd ?? process.cwd());
   } catch (error) {
-    await write(io.stderr, safeErrorMessage(error) + "\n");
+    await write(io.stderr, `${safeErrorMessage(error)}\n`);
     return 1;
   }
 
   // The process must be interactive to enter the REPL, while the output stream itself decides
   // whether readline may use terminal cursor control (important for embedders and piped captures).
   const terminal = io.isTTY && (io.stdout as { isTTY?: boolean }).isTTY !== false;
-  const readline = createInterface({ input: io.stdin, output: io.stdout, terminal });
   let themeName: ThemeName = "system";
   let theme = createTheme(themeName, {
     isTTY: io.isTTY,
     env,
-    plain: initial.raw || initial.json,
+    plain: initial.raw || initial.json || initial.accessible,
   });
   let connection = connectionFromInitial(initial);
+  let credentialValues: Readonly<Record<string, string>> = dependencies.credentialValues ?? {};
   let harness = dependencies.harness;
   let model = initial.model;
   let reasoning: ReasoningIntent = initial.reasoning;
   let catalog: readonly ModelDescriptor[] = [];
   let stagedDocuments: WorkspaceDocument[] = [];
   const messages: ChatMessage[] = [];
+  let latestAssistantSource: string | undefined;
   let active: AbortController | undefined;
 
   const currentSecrets = (): readonly string[] =>
     configuredSecretValues(
       env,
       connection?.apiKeyEnvironmentVariable ?? initial.apiKeyEnvironmentVariable,
+      credentialValues,
     );
   const writeError = async (error: unknown): Promise<void> => {
     await write(
       io.stderr,
-      theme.error("Error:") + " " + safeErrorMessage(error, currentSecrets()) + "\n",
+      `${theme.error("Error:")} ${safeErrorMessage(error, currentSecrets())}\n`,
     );
   };
   const writeNotice = async (value: string): Promise<void> => {
-    await write(io.stdout, safeTerminalText(value, currentSecrets()) + "\n");
+    await write(io.stdout, `${safeTerminalText(value, currentSecrets())}\n`);
   };
 
-  const onSigint = () => {
-    active?.abort();
-  };
-  readline.on("SIGINT", onSigint);
-
-  await write(io.stdout, theme.heading("Researk workspace REPL") + "\n");
+  await write(io.stdout, `${theme.heading("Researk workspace REPL")}\n`);
   await write(
     io.stdout,
     "Workspace: " +
@@ -106,7 +104,7 @@ export async function startRepl(
     while (true) {
       let line: string;
       try {
-        line = await readline.question(theme.prompt());
+        line = await askLine(theme.prompt());
       } catch {
         break;
       }
@@ -129,8 +127,9 @@ export async function startRepl(
     }
   } finally {
     active?.abort();
-    readline.off("SIGINT", onSigint);
-    readline.close();
+    // A long-lived session may have warmed the renderer pool; release the threads at session end
+    // rather than relying on process teardown.
+    await closeManagedLatexRenderer();
   }
   return 0;
 
@@ -167,6 +166,10 @@ export async function startRepl(
         return false;
       case "/theme":
         await setTheme(argument);
+        return false;
+      case "/source":
+        if (argument.length > 0) throw new Error("/source does not accept arguments.");
+        await revealLatestSource();
         return false;
       default:
         throw new Error("Unknown slash command. Use /help.");
@@ -208,17 +211,51 @@ export async function startRepl(
     );
   }
 
+  async function revealLatestSource(): Promise<void> {
+    if (latestAssistantSource === undefined) {
+      await writeNotice("No assistant source is available yet.");
+      return;
+    }
+    await write(io.stdout, `${safeTerminalText(latestAssistantSource, currentSecrets())}\n`);
+  }
+
   async function handleProvider(argument: string): Promise<void> {
     if (argument.length === 0) {
-      const current =
-        connection === undefined
-          ? "No provider is connected."
-          : "Connected provider: " + describeConnection(connection) + ".";
-      await write(
-        io.stdout,
-        safeTerminalText(current, currentSecrets()) +
-          "\nUse /provider openrouter [ENV] [URL] or /provider compatible ID URL [ENV].\n",
+      const profile = await selectFromPalette(
+        io,
+        "Provider profile  (↑/↓ or j/k, Enter, Esc to cancel)\n",
+        [
+          { value: "openrouter", label: "OpenRouter", hint: "hosted model catalog" },
+          { value: "compatible", label: "OpenAI-compatible", hint: "custom or local endpoint" },
+        ],
+        (value) => write(io.stdout, value),
       );
+      if (profile === undefined) {
+        const current =
+          connection === undefined
+            ? "No provider is connected."
+            : `Connected provider: ${describeConnection(connection)}.`;
+        await writeNotice(
+          current +
+            " Use /provider openrouter [ENV] [URL] or /provider compatible ID URL [ENV] in scripted mode.",
+        );
+        return;
+      }
+      const providerId = profile === "openrouter" ? "openrouter" : await askLine("Provider ID: ");
+      const baseUrl = await askLine(
+        profile === "openrouter" ? "Base URL (Enter for default): " : "Base URL: ",
+      );
+      const reference = profile === "openrouter" ? "OPENROUTER_API_KEY" : "OPENAI_API_KEY";
+      const key = await readMaskedInput(io, `${reference} (masked): `, (value) =>
+        write(io.stdout, value),
+      );
+      if (key === undefined) return;
+      credentialValues = { ...credentialValues, [reference]: key };
+      const guided =
+        profile === "openrouter"
+          ? `openrouter ${reference}${baseUrl.trim().length === 0 ? "" : ` ${baseUrl.trim()}`}`
+          : `compatible ${providerId.trim()} ${baseUrl.trim()} ${reference}`;
+      await handleProvider(guided);
       return;
     }
 
@@ -228,11 +265,16 @@ export async function startRepl(
       "[external] Connecting to " +
         safeTerminalText(
           describeConnection(next),
-          configuredSecretValues(env, next.apiKeyEnvironmentVariable),
+          configuredSecretValues(env, next.apiKeyEnvironmentVariable, credentialValues),
         ) +
         " and retrieving its model catalog. This may use the configured credential; no workspace documents are sent.\n",
     );
-    const candidate = await resolveHarness(argumentsForConnection(next), dependencies, env, io);
+    const candidate = await resolveHarness(
+      argumentsForConnection(next),
+      { ...dependencies, credentialValues },
+      env,
+      io,
+    );
     if (typeof candidate === "number") return;
 
     let nextCatalog: readonly ModelDescriptor[];
@@ -278,8 +320,25 @@ export async function startRepl(
   }
 
   async function selectModel(argument: string): Promise<void> {
-    if (argument.length === 0)
-      throw new Error("/model requires an explicit provider:model identity.");
+    if (argument.length === 0) {
+      const models = await refreshCatalog("Refreshing");
+      if (models === undefined || models.length === 0)
+        throw new Error("No models are available. Connect a provider first with /provider.");
+      const selected = await selectFromPalette(
+        io,
+        "Select model  (↑/↓ or j/k, Enter, Esc to cancel)\n",
+        models
+          .filter((item) => item.status !== "unavailable")
+          .map((item) => ({
+            value: item.canonicalId,
+            label: item.canonicalId,
+            hint: item.status,
+          })),
+        (value) => write(io.stdout, value),
+      );
+      if (selected === undefined) return;
+      argument = selected;
+    }
     const selected = parseModelIdentity(argument);
     const selectedParts = splitCanonicalModelId(selected);
     if (connection === undefined) throw new Error("Connect a provider first with /provider.");
@@ -304,7 +363,7 @@ export async function startRepl(
         "The selected model does not advertise the prior reasoning intent; reset to auto.",
       );
     }
-    await writeNotice("Selected " + model + ". Advertised reasoning: " + allowed.join(", ") + ".");
+    await writeNotice(`Selected ${model}. Advertised reasoning: ${allowed.join(", ")}.`);
   }
 
   async function setReasoning(argument: string): Promise<void> {
@@ -314,24 +373,25 @@ export async function startRepl(
     }
     const allowed = advertisedReasoningIntents(descriptor);
     if (argument.length === 0) {
-      await writeNotice(
-        allowed.length === 1
-          ? "This model advertises no adjustable reasoning intent; auto is the no-override default."
-          : "Allowed reasoning intents: " + allowed.join(", ") + ".",
+      const selected = await selectFromPalette(
+        io,
+        "Reasoning intent  (↑/↓ or j/k, Enter, Esc to cancel)\n",
+        allowed.map((item) => ({ value: item, label: item })),
+        (value) => write(io.stdout, value),
       );
-      return;
+      if (selected === undefined) return;
+      argument = selected;
     }
     const parsed = ReasoningIntentSchema.safeParse(argument);
     if (!parsed.success || !allowed.includes(parsed.data)) {
-      throw new Error(
-        "Unsupported reasoning intent. This model allows: " + allowed.join(", ") + ".",
-      );
+      throw new Error(`Unsupported reasoning intent. This model allows: ${allowed.join(", ")}.`);
     }
     reasoning = parsed.data;
-    await writeNotice("Reasoning set to " + reasoning + ".");
+    await writeNotice(`Reasoning set to ${reasoning}.`);
   }
 
   async function stageDocument(argument: string): Promise<void> {
+    if (argument.length === 0 && terminal) argument = await askLine("Relative document path: ");
     const document = await readWorkspaceDocument(workspace, argument);
     const withoutExisting = stagedDocuments.filter(
       (item) => item.relativePath !== document.relativePath,
@@ -340,7 +400,7 @@ export async function startRepl(
       withoutExisting.reduce((total, item) => total + item.byteLength, 0) + document.byteLength;
     if (withoutExisting.length >= MAX_STAGED_WORKSPACE_DOCUMENTS) {
       throw new Error(
-        "At most " + MAX_STAGED_WORKSPACE_DOCUMENTS + " documents can be staged for one prompt.",
+        `At most ${MAX_STAGED_WORKSPACE_DOCUMENTS} documents can be staged for one prompt.`,
       );
     }
     if (nextBytes > MAX_STAGED_WORKSPACE_BYTES) {
@@ -362,23 +422,31 @@ export async function startRepl(
 
   async function setTheme(argument: string): Promise<void> {
     if (argument.length === 0) {
-      await writeNotice(
-        "Themes: " + THEME_NAMES.join(", ") + ". Current theme: " + theme.name + ".",
+      const selected = await selectFromPalette(
+        io,
+        "Theme  (↑/↓ or j/k, Enter, Esc to cancel)\n",
+        THEME_NAMES.map((item) => ({
+          value: item,
+          label: item,
+          ...(item === theme.name ? { hint: "current" } : {}),
+        })),
+        (value) => write(io.stdout, value),
       );
-      return;
+      if (selected === undefined) return;
+      argument = selected;
     }
     if (!isThemeName(argument)) {
-      throw new Error("Unknown theme. Choose one of: " + THEME_NAMES.join(", ") + ".");
+      throw new Error(`Unknown theme. Choose one of: ${THEME_NAMES.join(", ")}.`);
     }
     themeName = argument;
     theme = createTheme(themeName, {
       isTTY: io.isTTY,
       env,
-      plain: initial.raw || initial.json,
+      plain: initial.raw || initial.json || initial.accessible,
     });
     await write(
       io.stdout,
-      theme.heading("Theme set to " + theme.name + ".") +
+      theme.heading(`Theme set to ${theme.name}.`) +
         (theme.colorEnabled ? "" : " Color is disabled by output mode, NO_COLOR, or TERM=dumb.") +
         "\n",
     );
@@ -402,7 +470,7 @@ export async function startRepl(
     const documentSummary =
       documentsForRun.length === 0
         ? "your prompt"
-        : "your prompt and " + documentsForRun.length + " staged workspace document(s)";
+        : `your prompt and ${documentsForRun.length} staged workspace document(s)`;
     await write(
       io.stderr,
       "[external] Sending " +
@@ -426,7 +494,10 @@ export async function startRepl(
         raw: false,
         env,
         apiKeyEnvironmentVariable: connection.apiKeyEnvironmentVariable,
+        credentialValues,
         signal: controller.signal,
+        theme,
+        accessible: initial.accessible,
         ...(dependencies.createRunId === undefined
           ? {}
           : { createRunId: dependencies.createRunId }),
@@ -452,6 +523,22 @@ export async function startRepl(
       return;
     }
     messages.push({ role: "user", content: line }, { role: "assistant", content: result.text });
+    latestAssistantSource = result.text;
+  }
+
+  async function askLine(prompt: string): Promise<string> {
+    const input = createInterface({ input: io.stdin, output: io.stdout, terminal });
+    const onSigint = () => {
+      active?.abort();
+      input.close();
+    };
+    input.on("SIGINT", onSigint);
+    try {
+      return await input.question(prompt);
+    } finally {
+      input.off("SIGINT", onSigint);
+      input.close();
+    }
   }
 
   async function selectedModelDescriptor(): Promise<ModelDescriptor | undefined> {
@@ -476,7 +563,7 @@ export async function startRepl(
     }
     const resolved = await resolveHarness(
       argumentsForConnection(connection),
-      dependencies,
+      { ...dependencies, credentialValues },
       env,
       io,
     );
@@ -512,10 +599,10 @@ export async function startRepl(
   ): Promise<void> {
     await write(
       io.stderr,
-      theme.error("Error:") +
-        " " +
-        safeErrorMessage(error, configuredSecretValues(env, candidate.apiKeyEnvironmentVariable)) +
-        "\n",
+      `${theme.error("Error:")} ${safeErrorMessage(
+        error,
+        configuredSecretValues(env, candidate.apiKeyEnvironmentVariable, credentialValues),
+      )}\n`,
     );
   }
 }
@@ -539,6 +626,7 @@ function argumentsForConnection(connection: ReplProviderConnection): CliArgument
     version: false,
     json: false,
     raw: false,
+    accessible: false,
     reasoning: "auto",
     providerId: connection.providerId,
     ...(connection.baseUrl === undefined ? {} : { baseUrl: connection.baseUrl }),
@@ -622,7 +710,7 @@ function describeConnection(connection: ReplProviderConnection): string {
   if (rawUrl === undefined) return profile;
   try {
     const url = new URL(rawUrl);
-    return profile + " (" + url.protocol + "//" + url.host + ")";
+    return `${profile} (${url.protocol}//${url.host})`;
   } catch {
     return profile;
   }

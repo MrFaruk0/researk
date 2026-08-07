@@ -37,11 +37,16 @@ export interface CliIo {
 
 export interface CliDependencies {
   readonly harness?: CliHarness;
-  readonly createHarness?: (configuration: ProviderEnvironmentReference) => Promise<CliHarness>;
+  readonly createHarness?: (
+    configuration: ProviderEnvironmentReference,
+    credentialValues: Readonly<Record<string, string>>,
+  ) => Promise<CliHarness>;
   readonly io?: CliIo;
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly signal?: AbortSignal;
   readonly createRunId?: () => string;
   readonly onApprovalRequest?: (event: ApprovalRequestEvent) => Promise<ApprovalDecision>;
   readonly cwd?: string;
+  /** Ephemeral credential values supplied by an interactive resolver. Never persisted. */
+  readonly credentialValues?: Readonly<Record<string, string>>;
 }

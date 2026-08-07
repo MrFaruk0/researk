@@ -7,20 +7,22 @@ import {
   splitCanonicalModelId,
 } from "@researk/contracts";
 import { type CredentialResolver, Harness, ProviderRegistry } from "@researk/harness";
+import { LatexRenderBudget } from "@researk/latex-renderer";
 import { OpenAiCompatibleAdapter } from "@researk/provider-openai-compatible";
 import { OpenRouterAdapter } from "@researk/provider-openrouter";
 import { type CliArguments, parseArguments } from "./args.js";
 import { HELP, VERSION } from "./help.js";
 import { processIo, readAll, write } from "./io.js";
 import { IncrementalMarkdownMathParser } from "./rendering/parser.js";
-import { renderExactSource } from "./rendering/renderer.js";
+import { renderInteractiveEvents } from "./rendering/renderer.js";
 import {
   configuredSecretValues,
-  redactSecrets,
+  StreamingSecretRedactor,
   safeErrorMessage,
   safeJson,
   safeTerminalText,
 } from "./safety.js";
+import type { CliTheme } from "./theme.js";
 import type {
   CliDependencies,
   CliHarness,
@@ -72,7 +74,14 @@ export async function runCli(
   if (typeof harnessResult === "number") return harnessResult;
 
   if (args.command === "models") {
-    return listModels(harnessResult, args, io, env, dependencies.signal);
+    return listModels(
+      harnessResult,
+      args,
+      io,
+      env,
+      dependencies.credentialValues,
+      dependencies.signal,
+    );
   }
 
   let prompt = args.prompt;
@@ -94,8 +103,12 @@ export async function runCli(
     io,
     json: args.json,
     raw: args.raw || !io.isTTY,
+    accessible: args.accessible,
     env,
     apiKeyEnvironmentVariable: args.apiKeyEnvironmentVariable,
+    ...(dependencies.credentialValues === undefined
+      ? {}
+      : { credentialValues: dependencies.credentialValues }),
     ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
     ...(dependencies.createRunId === undefined ? {} : { createRunId: dependencies.createRunId }),
     ...(dependencies.onApprovalRequest === undefined
@@ -119,9 +132,13 @@ export async function executeChat(
     raw: boolean;
     env: Readonly<Record<string, string | undefined>>;
     apiKeyEnvironmentVariable: string;
+    /** Ephemeral credentials to redact from every event and returned value. */
+    credentialValues?: Readonly<Record<string, string>>;
     signal?: AbortSignal;
     createRunId?: () => string;
     onApprovalRequest?: HarnessRunOptions["onApprovalRequest"];
+    theme?: CliTheme;
+    accessible?: boolean;
   }>,
 ): Promise<ChatExecutionResult> {
   const parsedModel = splitCanonicalModelId(options.model);
@@ -143,9 +160,16 @@ export async function executeChat(
   if (options.signal?.aborted) controller.abort();
   options.signal?.addEventListener("abort", abort, { once: true });
   const removeInterrupt = options.io.onInterrupt?.(abort);
-  const secrets = configuredSecretValues(options.env, options.apiKeyEnvironmentVariable);
+  const secrets = configuredSecretValues(
+    options.env,
+    options.apiKeyEnvironmentVariable,
+    options.credentialValues,
+  );
   const parser = new IncrementalMarkdownMathParser();
+  const latexRenderBudget = new LatexRenderBudget();
+  const streamRedactor = new StreamingSecretRedactor(secrets);
   let text = "";
+  let pendingTextEvent: Extract<RunEvent, { type: "text_delta" }> | undefined;
   let selection: ModelSelection | undefined;
   let exitCode = 0;
 
@@ -156,14 +180,52 @@ export async function executeChat(
         ? {}
         : { onApprovalRequest: options.onApprovalRequest }),
     })) {
-      if (event.type === "text_delta") text += redactSecrets(event.delta, secrets);
-      if (event.type === "selection") selection = event.selection;
-      const eventCode = await renderEvent(event, options, parser, secrets);
+      if (event.type === "text_delta") {
+        pendingTextEvent = event;
+        const safeDelta = streamRedactor.push(event.delta);
+        if (safeDelta.length === 0) continue;
+        text += safeDelta;
+        const eventCode = await renderEvent(
+          { ...event, delta: safeDelta },
+          options,
+          parser,
+          secrets,
+          latexRenderBudget,
+        );
+        if (eventCode !== undefined) exitCode = eventCode;
+        continue;
+      }
+      if (event.type === "selection") selection = redactSelection(event.selection, secrets);
+      const eventCode = await renderEvent(event, options, parser, secrets, latexRenderBudget);
       if (eventCode !== undefined) exitCode = eventCode;
     }
+    if (pendingTextEvent !== undefined) {
+      const tail = streamRedactor.finish();
+      if (tail.length > 0) {
+        text += tail;
+        await renderEvent(
+          { ...pendingTextEvent, delta: tail },
+          options,
+          parser,
+          secrets,
+          latexRenderBudget,
+        );
+      }
+    }
     if (!options.json && !options.raw) {
-      const tail = await renderExactSource(parser.finish(), undefined, controller.signal);
-      await write(options.io.stdout, safeTerminalText(tail, secrets));
+      // The parser only ever received text already redacted and neutralized by renderEvent, so the
+      // tail events are inert and the renderer's own theme ANSI is written verbatim.
+      const tail = await renderInteractiveEvents(parser.finish(), {
+        interactive: options.io.isTTY && !options.raw,
+        stdout: options.io.stdout,
+        env: options.env,
+        writeText: (value) => write(options.io.stdout, value),
+        ...(options.theme === undefined ? {} : { theme: options.theme }),
+        ...(options.accessible === undefined ? {} : { accessible: options.accessible }),
+        budget: latexRenderBudget,
+        signal: controller.signal,
+      });
+      await write(options.io.stdout, tail);
       if (text.length > 0) await write(options.io.stdout, "\n");
     }
   } finally {
@@ -184,26 +246,43 @@ async function renderEvent(
     json: boolean;
     raw: boolean;
     onApprovalRequest?: HarnessRunOptions["onApprovalRequest"];
+    theme?: CliTheme;
+    accessible?: boolean;
+    env: Readonly<Record<string, string | undefined>>;
   }>,
   parser: IncrementalMarkdownMathParser,
   secrets: readonly string[],
+  latexRenderBudget: LatexRenderBudget,
 ): Promise<number | undefined> {
   if (options.json) {
     await write(options.io.stdout, `${safeJson(event, secrets)}\n`);
   } else if (event.type === "text_delta") {
-    const safeDelta = redactSecrets(event.delta, secrets);
+    // Untrusted model text is redacted and neutralized once, here, before it can reach the parser
+    // or the theme. Escaping is per code point and never spans a chunk boundary, and it preserves
+    // tab, carriage return, and line feed, so incremental Markdown and math parsing is unaffected.
+    const safeDelta = safeTerminalText(event.delta, secrets);
     if (options.raw) {
-      await write(options.io.stdout, safeTerminalText(safeDelta));
+      await write(options.io.stdout, safeDelta);
     } else {
-      const rendered = await renderExactSource(parser.push(safeDelta));
-      await write(options.io.stdout, safeTerminalText(rendered));
+      // The renderer output is trusted: it carries theme ANSI over already-neutralized source, so
+      // it is written verbatim rather than escaped a second time.
+      const rendered = await renderInteractiveEvents(parser.push(safeDelta), {
+        interactive: options.io.isTTY,
+        stdout: options.io.stdout,
+        env: options.env,
+        writeText: (value) => write(options.io.stdout, value),
+        ...(options.theme === undefined ? {} : { theme: options.theme }),
+        ...(options.accessible === undefined ? {} : { accessible: options.accessible }),
+        budget: latexRenderBudget,
+      });
+      await write(options.io.stdout, rendered);
     }
   } else if (event.type === "phase" && !options.raw) {
     await write(options.io.stderr, `[${event.phase}] ${event.status}\n`);
   } else if (event.type === "selection" && !options.raw) {
     await write(
       options.io.stderr,
-      `[model] ${event.selection.canonicalId} reasoning=${event.selection.reasoning.effectiveIntent ?? event.selection.reasoning.requestedIntent}\n`,
+      `[model] ${safeTerminalText(event.selection.canonicalId, secrets)} reasoning=${event.selection.reasoning.effectiveIntent ?? event.selection.reasoning.requestedIntent}\n`,
     );
   } else if (event.type === "diagnostic") {
     await write(options.io.stderr, `${event.level}: ${redact(event.message, secrets)}\n`);
@@ -247,12 +326,15 @@ export async function resolveHarness(
   };
   try {
     return dependencies.createHarness === undefined
-      ? createInProcessHarness(configuration, env)
-      : await dependencies.createHarness(configuration);
+      ? createInProcessHarness(configuration, env, dependencies.credentialValues)
+      : await dependencies.createHarness(configuration, dependencies.credentialValues ?? {});
   } catch (error) {
     await write(
       io.stderr,
-      `Error: ${safeErrorMessage(error, configuredSecretValues(env, args.apiKeyEnvironmentVariable))}\n`,
+      `Error: ${safeErrorMessage(
+        error,
+        configuredSecretValues(env, args.apiKeyEnvironmentVariable, dependencies.credentialValues),
+      )}\n`,
     );
     return 1;
   }
@@ -261,12 +343,13 @@ export async function resolveHarness(
 export function createInProcessHarness(
   configuration: ProviderEnvironmentReference,
   env: Readonly<Record<string, string | undefined>>,
+  credentialValues: Readonly<Record<string, string>> = {},
 ): CliHarness {
   const registry = new ProviderRegistry();
   const credentials: CredentialResolver = {
     async resolve(reference, signal) {
       signal.throwIfAborted();
-      const value = env[reference];
+      const value = credentialValues[reference] ?? env[reference];
       if (value === undefined || value.length === 0) {
         throw new Error(`Credential environment variable '${reference}' is not set.`);
       }
@@ -334,9 +417,10 @@ async function listModels(
   args: CliArguments,
   io: CliIo,
   env: Readonly<Record<string, string | undefined>>,
+  credentialValues: Readonly<Record<string, string>> | undefined,
   signal?: AbortSignal,
 ): Promise<number> {
-  const secrets = configuredSecretValues(env, args.apiKeyEnvironmentVariable);
+  const secrets = configuredSecretValues(env, args.apiKeyEnvironmentVariable, credentialValues);
   try {
     const models = await harness.listModels(signal);
     for (const model of models) {
@@ -378,4 +462,8 @@ async function doctor(
 
 function redact(value: string, secrets: readonly string[]): string {
   return safeTerminalText(value, secrets);
+}
+
+function redactSelection(selection: ModelSelection, secrets: readonly string[]): ModelSelection {
+  return JSON.parse(safeJson(selection, secrets)) as ModelSelection;
 }

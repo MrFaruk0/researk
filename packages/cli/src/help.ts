@@ -17,6 +17,7 @@ Options:
   --base-url URL                  Custom compatible endpoint (or OpenRouter override)
   --api-key-env NAME              Credential environment-variable reference; never printed
   --raw                           Exact-source, undecorated response mode
+  --accessible                    Disable graphics and styling; preserve linear exact source
   --json                          JSON Lines event mode
   --help, -h                      Show this help
   --version, -v                   Show the version
@@ -39,6 +40,7 @@ export const REPL_HELP = `Workspace commands:
   /read <relative-path>             Stage a bounded UTF-8 .txt/.md/.tex/.bib document for one prompt
   /status                           Show workspace, connection, selection, history, and staged data
   /theme [NAME]                     List or select system, dark, light, high-contrast, or mono
+  /source                           Reveal the exact source of the latest assistant response
   /help                             Show this help
   /exit                             Exit the REPL
 

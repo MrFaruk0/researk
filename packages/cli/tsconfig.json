@@ -8,6 +8,7 @@
   "references": [
     { "path": "../contracts" },
     { "path": "../harness" },
+    { "path": "../latex-renderer" },
     { "path": "../provider-openai-compatible" },
     { "path": "../provider-openrouter" },
     { "path": "../research" }

@@ -12,15 +12,18 @@ The current vertical slice provides:
 
 - a TypeScript Researk Harness with validated contracts, exact provider/model selection,
   capability checks, cancellation, typed events, and redaction;
-- a deterministic offline fake provider;
+- a deterministic offline fake provider for Harness-level tests;
 - an experimental generic OpenAI-compatible adapter with model discovery and JSON or SSE chat;
 - a bounded Research Domain with workflow and publication-profile metadata; and
 - a `researk` CLI with `help`, `version`, `doctor`, `models`, and `chat`, including raw and JSON
   output and a TTY chat loop.
 
-The CLI preserves mathematical LaTeX as exact source text. It does not yet have a graphical
-math backend. The Research Domain can describe LaTeX authoring and export workflows, but it does
-not yet provide manuscript export or APA 7 and IEEE citation processors.
+In a positively detected iTerm2 TTY, the interactive CLI can render display math through its local
+MathJax SVG backend, rasterize it in memory with resvg, and emit it with the iTerm2 inline-image
+protocol. Inline math and all unsupported, non-TTY, accessible, raw, JSON, or failed-render paths
+preserve exact LaTeX source. Kitty and Sixel graphics are not supported. The Research Domain can
+describe LaTeX authoring and export workflows, but it does not yet provide manuscript export or APA
+7 and IEEE citation processors.
 
 ## Build and test
 
@@ -40,25 +43,26 @@ npm run lint
 npm run format-check
 ```
 
-Smoke-test the built CLI with the offline fake provider.
+Smoke-test CLI commands that do not require a configured provider.
 
 PowerShell:
 
 ```powershell
 node packages/cli/dist/bin.js help
-$env:RESEARK_FAKE_PROVIDER = "1"
-node packages/cli/dist/bin.js models
-node packages/cli/dist/bin.js chat --model fake:paper --raw "Summarize the test prompt."
+node packages/cli/dist/bin.js version
+node packages/cli/dist/bin.js doctor --json
 ```
 
 POSIX shells:
 
 ```bash
 node packages/cli/dist/bin.js help
-RESEARK_FAKE_PROVIDER=1 node packages/cli/dist/bin.js models
-RESEARK_FAKE_PROVIDER=1 node packages/cli/dist/bin.js chat --model fake:paper --raw \
-  "Summarize the test prompt."
+node packages/cli/dist/bin.js version
+node packages/cli/dist/bin.js doctor --json
 ```
+
+The fake adapter is not a CLI mode: `RESEARK_FAKE_PROVIDER` and `fake:paper` are unsupported.
+The `models` and `chat` commands require a configured, reachable OpenAI-compatible provider.
 
 ## Experimental OpenAI-compatible endpoint
 
@@ -101,14 +105,15 @@ The source build does not yet provide:
 
 - an installable GitHub Release or native packaging;
 - persistent configuration, sessions, cache, migrations, or operating-system keychain access;
-- a graphical math renderer;
+- Kitty, Sixel, or other terminal graphics protocols beyond positively detected iTerm2 display
+  math;
 - CSL-backed APA 7 or IEEE processing and manuscript export;
 - scholarly or general web-research tools;
 - a paper-reproduction runner; or
 - verified native provider support.
 
 No telemetry is implemented. Network traffic occurs only when a user selects and configures the
-experimental generic adapter. The fake provider stays offline.
+experimental generic adapter. The Harness-level fake provider stays offline.
 
 ## Documentation
 

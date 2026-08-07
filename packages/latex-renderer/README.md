@@ -5,9 +5,12 @@ MathJax 4. It is deliberately not a complete TeX engine, document compiler, rast
 protocol emitter, or file writer.
 
 The package accepts only the MathJax `base` TeX package, returns an in-memory SVG artifact, and
-preserves the caller's original TeX separately. It performs no network request, starts no shell or
-system TeX process, and does not read or write workspace files.
+preserves the caller's original TeX separately. A bounded, pre-initialized Node worker pool keeps
+untrusted rendering off the caller/REPL event loop. Timed-out, cancelled, crashed, and failed
+workers are terminated and replaced. It performs no network request, starts no shell or system TeX
+process, invokes no browser or external helper, and does not read or write workspace files.
 
-This is an SVG proof-of-rendering backend. It does not by itself satisfy the CLI graphical-math
-contract in ADR 0006: terminal protocol integration, rasterization, worker isolation, and
-capability detection remain separate, gated work.
+Response-scoped budgets enforce expression-count and cumulative-time ceilings; each job also has
+input, initialization, render-time, memory, SVG-size, and SVG-dimension bounds. The CLI separately
+owns terminal capability detection, bounded rasterization, protocol payload generation, and exact
+source fallback.

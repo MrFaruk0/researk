@@ -7,9 +7,12 @@ import {
 import {
   ExactSourceMathRenderer,
   GRAPHICS_CAPABILITY,
+  MathJaxSvgMathRenderer,
   renderExactSource,
+  renderTerminalPresentation,
 } from "../src/rendering/renderer.js";
 import { escapeUnsafeTerminalControls, hasTerminalEscape } from "../src/safety.js";
+import { createTheme } from "../src/theme.js";
 
 function parseBytes(chunks: readonly Uint8Array[]): readonly MarkdownRenderEvent[] {
   const parser = new IncrementalMarkdownMathParser();
@@ -80,11 +83,42 @@ describe("incremental Markdown and math parser", () => {
       renderExactSource(parseMarkdownMath(source), new ExactSourceMathRenderer()),
     ).resolves.toBe(source);
     expect(GRAPHICS_CAPABILITY).toMatchObject({
-      mathJaxSvg: false,
-      resvg: false,
+      mathJaxSvg: true,
+      resvg: true,
       kitty: false,
-      iterm2: false,
+      iterm2: true,
     });
+  });
+
+  it("offers the local bounded MathJax backend without replacing source fallback", async () => {
+    const event = parseMarkdownMath("\\[\\frac{a}{b}\\]").find(
+      (candidate) => candidate.type === "math",
+    );
+    expect(event?.type).toBe("math");
+    if (event?.type !== "math") return;
+
+    const artifact = await new MathJaxSvgMathRenderer().render(event);
+    expect(artifact.format).toBe("svg");
+    expect(artifact.content).toMatch(/^<svg\b/u);
+    expect(artifact.content).not.toMatch(/<(?:script|foreignObject)\b/iu);
+    await expect(new ExactSourceMathRenderer().render(event)).resolves.toEqual({
+      format: "source",
+      content: event.source,
+    });
+  });
+
+  it("styles Markdown and math only in interactive themed presentation", () => {
+    const source = "# Result\n\n$E=mc^2$\n";
+    const events = parseMarkdownMath(source);
+    const theme = createTheme("dark", { isTTY: true, env: {} });
+    const rendered = renderTerminalPresentation(events, { theme, interactive: true });
+
+    expect(rendered).toContain("\u001b[");
+    expect(rendered).toContain("E=mc^2");
+    expect(renderTerminalPresentation(events, { theme, interactive: false })).toBe(source);
+    expect(renderTerminalPresentation(events, { theme, interactive: true, accessible: true })).toBe(
+      source,
+    );
   });
 });
 
