@@ -105,8 +105,13 @@ async function assertEmptyDirectory(directory) {
   }
 }
 
-function run(command, argumentsList, cwd, env) {
-  const result = spawnSync(command, argumentsList, { cwd, env, stdio: "inherit" });
+function run(command, argumentsList, cwd, env, options = {}) {
+  const result = spawnSync(command, argumentsList, {
+    cwd,
+    env,
+    stdio: "inherit",
+    ...options,
+  });
   if (result.error !== undefined) {
     throw new Error(`Unable to start ${command}: ${result.error.message}`);
   }
@@ -130,8 +135,13 @@ function runReseark(executable, argumentsList, cwd, env) {
       "The Windows standalone smoke-test path contains unsafe command-shell characters.",
     );
   }
-  const command = [`"${executable}"`, ...argumentsList].join(" ");
-  run(process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe", ["/d", "/c", command], cwd, env);
+  run(
+    process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe",
+    ["/d", "/c", `call "${executable}"`, ...argumentsList],
+    cwd,
+    env,
+    { windowsVerbatimArguments: true },
+  );
 }
 
 await main();
