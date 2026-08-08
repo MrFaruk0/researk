@@ -18,6 +18,23 @@ const KEYS = {
   backspace: "\u007f",
 };
 
+/**
+ * These tests drive the real path end to end: a loopback HTTP server, the in-process Harness, the
+ * OpenAI-compatible adapter, and a live Ink render tree. Each simulated keystroke has to settle
+ * real timers before the next one, because Ink commits on the macrotask queue and there is no
+ * fake-timer mode that keeps the adapter's real `fetch` working.
+ *
+ * The cost is dominated by scheduling rather than by any single slow operation: several dozen
+ * keystrokes per test, each with its own timer hops and a full Ink re-render, plus TCP
+ * listen/accept and adapter construction. Timer resolution, timer coalescing, and libuv loop
+ * latency all differ by platform and by CI load, which is why this file previously ran near the
+ * 5s Vitest default on one runner and past it on another. That is a budget and scheduling limit,
+ * not a hang, so the suite carries one explicit generous timeout rather than a global one that
+ * would also mask genuine hangs in the fast unit suites. Every wait on asynchronous work is
+ * condition-based, so the headroom is only ever consumed by a real failure.
+ */
+const PROVIDER_SUITE_TIMEOUT_MS = 30_000;
+
 const cleanupPaths: string[] = [];
 
 afterEach(async () => {
@@ -119,20 +136,40 @@ async function mount(
     }),
   );
 
+  /**
+   * Lets Ink flush the render it scheduled for the keystroke just written. Four macrotask hops are
+   * enough for a synchronous reducer update plus its commit; anything that awaits the Harness is
+   * covered by `waitFor` instead, so this no longer has to be padded to cover network latency.
+   */
   const settle = async (): Promise<void> => {
-    for (let index = 0; index < 8; index += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 12));
+    for (let index = 0; index < 4; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
     }
   };
   const type = async (value: string): Promise<void> => {
     instance.stdin.write(value);
     await settle();
   };
+  /**
+   * Waits for a rendered condition instead of assuming a fixed number of settle rounds is enough.
+   * Keystroke handling is synchronous in Ink, but anything that awaits the Harness - connecting,
+   * loading the catalog, streaming a response - completes on its own schedule, and a fixed sleep
+   * either wastes time or is too short on a loaded runner. Polling keeps the fast path fast and
+   * still bounds the wait, and the caller's own assertion is left untouched: on timeout this
+   * returns normally so the real `expect` reports the actual frame.
+   */
+  const waitFor = async (predicate: () => boolean, budgetMs = 10_000): Promise<void> => {
+    const deadline = Date.now() + budgetMs;
+    while (!predicate() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 12));
+    }
+  };
   await settle();
   return {
     ...instance,
     settle,
     type,
+    waitFor,
     workspaceRoot: workspace.root,
     frame: () => instance.lastFrame() ?? "",
   };
@@ -153,7 +190,9 @@ async function connect(
   await app.type(baseUrl);
   await app.type(KEYS.tab);
   if (key.envReference !== undefined) {
-    // The reference field is prefilled with OPENAI_API_KEY, so clear it before typing.
+    // The reference field is prefilled with OPENAI_API_KEY, so clear it before typing. Each
+    // backspace must be written separately: Ink delivers one stdin write as a single `input`
+    // string, so a batched burst would be handled as one keypress and delete one character.
     for (let index = 0; index < "OPENAI_API_KEY".length; index += 1) {
       await app.type(KEYS.backspace);
     }
@@ -164,121 +203,172 @@ async function connect(
     await app.type(key.secret);
   }
   await app.type(KEYS.enter);
+  // Submitting the form performs the real catalog request against the loopback server. The footer
+  // is the durable signal that the connection landed: notices are capped and truncated for display,
+  // so matching their text would be brittle.
+  await app.waitFor(() => /provider\s+compatible/u.test(app.frame()));
 }
 
 async function selectFirstModel(app: Awaited<ReturnType<typeof mount>>): Promise<void> {
   await app.type("/model");
   await app.type(KEYS.enter);
+  // The overlay opens before the catalog is loaded, so wait for a selectable row to exist rather
+  // than pressing Enter into an empty list.
+  await app.waitFor(() => app.frame().includes("science"));
   await app.type(KEYS.enter);
+  // The footer shows the selected model once the overlay has committed the choice.
+  await app.waitFor(() => /model\s+compatible:science/u.test(app.frame()));
 }
 
 describe("TUI over the actual provider path", () => {
-  it("stages a workspace document and sends it as untrusted content with the prompt", async () => {
-    const provider = await startProvider({ output: "A safe answer" });
-    try {
-      const app = await mount({
-        files: { "paper.tex": "\\section{Methods}\n$E=mc^2$" },
-        env: { TEST_KEY: "test-secret" },
-      });
-      await connect(app, provider.baseUrl, { envReference: "TEST_KEY" });
-      await selectFirstModel(app);
-      await app.type("/read paper.tex");
-      await app.type(KEYS.enter);
-      expect(app.frame()).toContain("paper.tex");
+  it(
+    "stages a workspace document and sends it as untrusted content with the prompt",
+    async () => {
+      const provider = await startProvider({ output: "A safe answer" });
+      let app: Awaited<ReturnType<typeof mount>> | undefined;
+      try {
+        app = await mount({
+          files: { "paper.tex": "\\section{Methods}\n$E=mc^2$" },
+          env: { TEST_KEY: "test-secret" },
+        });
+        await connect(app, provider.baseUrl, { envReference: "TEST_KEY" });
+        await selectFirstModel(app);
+        await app.type("/read paper.tex");
+        await app.type(KEYS.enter);
+        // Staging reads the file from disk, so the confirmation is awaited rather than assumed.
+        const staged = app;
+        await staged.waitFor(() => staged.frame().includes("paper.tex"));
+        expect(app.frame()).toContain("paper.tex");
 
-      await app.type("Explain the formula");
-      await app.type(KEYS.enter);
-      await app.settle();
+        await app.type("Explain the formula");
+        await app.type(KEYS.enter);
+        await app.waitFor(() => provider.chatRequests.length > 0);
 
-      expect(provider.chatRequests).toHaveLength(1);
-      const request = provider.chatRequests[0] as { messages: Array<{ content: string }> };
-      const content = request.messages.at(-1)?.content ?? "";
-      expect(content).toContain("BEGIN UNTRUSTED WORKSPACE DOCUMENT: paper.tex");
-      expect(content).toContain("\\section{Methods}");
-      expect(content).toContain("Explain the formula");
-      app.unmount();
-    } finally {
-      await provider.close();
-    }
-  });
+        expect(provider.chatRequests).toHaveLength(1);
+        const request = provider.chatRequests[0] as { messages: Array<{ content: string }> };
+        const content = request.messages.at(-1)?.content ?? "";
+        expect(content).toContain("BEGIN UNTRUSTED WORKSPACE DOCUMENT: paper.tex");
+        expect(content).toContain("\\section{Methods}");
+        expect(content).toContain("Explain the formula");
+      } finally {
+        // Unmounting in `finally` keeps a failed assertion from leaving a live Ink instance and its
+        // stdin listener attached for the remainder of the file.
+        app?.unmount();
+        await provider.close();
+      }
+    },
+    PROVIDER_SUITE_TIMEOUT_MS,
+  );
 
-  it("streams provider text into the assistant message across chunk boundaries", async () => {
-    const provider = await startProvider({ output: "Streamed provider answer" });
-    try {
-      const app = await mount({ env: { TEST_KEY: "test-secret" } });
-      await connect(app, provider.baseUrl, { envReference: "TEST_KEY" });
-      await selectFirstModel(app);
-      await app.type("Explain");
-      await app.type(KEYS.enter);
-      await app.settle();
+  it(
+    "streams provider text into the assistant message across chunk boundaries",
+    async () => {
+      const provider = await startProvider({ output: "Streamed provider answer" });
+      let app: Awaited<ReturnType<typeof mount>> | undefined;
+      try {
+        app = await mount({ env: { TEST_KEY: "test-secret" } });
+        await connect(app, provider.baseUrl, { envReference: "TEST_KEY" });
+        await selectFirstModel(app);
+        await app.type("Explain");
+        await app.type(KEYS.enter);
+        const rendered = app;
+        await rendered.waitFor(() => rendered.frame().includes("Streamed provider answer"));
 
-      expect(app.frame()).toContain("Streamed provider answer");
-      expect(app.frame()).toMatch(/ready/u);
-      app.unmount();
-    } finally {
-      await provider.close();
-    }
-  });
+        expect(app.frame()).toContain("Streamed provider answer");
+        expect(app.frame()).toMatch(/ready/u);
+      } finally {
+        app?.unmount();
+        await provider.close();
+      }
+    },
+    PROVIDER_SUITE_TIMEOUT_MS,
+  );
 
-  it("preserves canonical LaTeX from the provider in the retained source", async () => {
-    const source = String.raw`Answer: \[E = mc^2\]`;
-    const provider = await startProvider({ output: source });
-    try {
-      const app = await mount({ env: { TEST_KEY: "test-secret" } });
-      await connect(app, provider.baseUrl, { envReference: "TEST_KEY" });
-      await selectFirstModel(app);
-      await app.type("Show the result");
-      await app.type(KEYS.enter);
-      await app.settle();
+  it(
+    "preserves canonical LaTeX from the provider in the retained source",
+    async () => {
+      const source = String.raw`Answer: \[E = mc^2\]`;
+      const provider = await startProvider({ output: source });
+      let app: Awaited<ReturnType<typeof mount>> | undefined;
+      try {
+        app = await mount({ env: { TEST_KEY: "test-secret" } });
+        await connect(app, provider.baseUrl, { envReference: "TEST_KEY" });
+        await selectFirstModel(app);
+        await app.type("Show the result");
+        await app.type(KEYS.enter);
+        const rendered = app;
+        // The run has to finish before `/source` can reveal the retained canonical text.
+        await rendered.waitFor(() => rendered.frame().includes("E = mc^2"));
 
-      await app.type("/source");
-      await app.type(KEYS.enter);
-      // The overlay shows the byte-exact canonical source, delimiters included.
-      expect(app.frame()).toContain(String.raw`\[E = mc^2\]`);
-      app.unmount();
-    } finally {
-      await provider.close();
-    }
-  });
+        await app.type("/source");
+        await app.type(KEYS.enter);
+        const overlay = app;
+        await overlay.waitFor(() => overlay.frame().includes(String.raw`\[E = mc^2\]`));
+        // The overlay shows the byte-exact canonical source, delimiters included.
+        expect(app.frame()).toContain(String.raw`\[E = mc^2\]`);
+      } finally {
+        app?.unmount();
+        await provider.close();
+      }
+    },
+    PROVIDER_SUITE_TIMEOUT_MS,
+  );
 
-  it("never renders an ephemeral pasted credential echoed by the provider", async () => {
-    const secret = "synthetic-pasted-guided-key-5da8";
-    const provider = await startProvider({ output: `Provider echoed ${secret}` });
-    try {
-      const app = await mount();
-      await connect(app, provider.baseUrl, {
-        envReference: "OPENAI_API_KEY",
-        secret,
-      });
-      await selectFirstModel(app);
-      await app.type("Explain the result");
-      await app.type(KEYS.enter);
-      await app.settle();
+  it(
+    "never renders an ephemeral pasted credential echoed by the provider",
+    async () => {
+      const secret = "synthetic-pasted-guided-key-5da8";
+      const provider = await startProvider({ output: `Provider echoed ${secret}` });
+      let app: Awaited<ReturnType<typeof mount>> | undefined;
+      try {
+        app = await mount();
+        await connect(app, provider.baseUrl, {
+          envReference: "OPENAI_API_KEY",
+          secret,
+        });
+        await selectFirstModel(app);
+        await app.type("Explain the result");
+        await app.type(KEYS.enter);
+        const rendered = app;
+        // Wait on the redacted marker, never on the secret, which must not appear in any frame.
+        await rendered.waitFor(() => rendered.frame().includes("[REDACTED]"));
 
-      const frame = app.frame();
-      expect(frame).not.toContain(secret);
-      expect(frame).toContain("[REDACTED]");
-      // The entered credential is never written back to the environment.
-      expect(process.env.OPENAI_API_KEY).toBeUndefined();
-      app.unmount();
-    } finally {
-      await provider.close();
-    }
-  });
+        const frame = app.frame();
+        expect(frame).not.toContain(secret);
+        expect(frame).toContain("[REDACTED]");
+        // The entered credential is never written back to the environment.
+        expect(process.env.OPENAI_API_KEY).toBeUndefined();
+      } finally {
+        app?.unmount();
+        await provider.close();
+      }
+    },
+    PROVIDER_SUITE_TIMEOUT_MS,
+  );
 
-  it("rejects workspace traversal before any provider request", async () => {
-    const provider = await startProvider();
-    try {
-      const app = await mount({ env: { TEST_KEY: "test-secret" } });
-      await connect(app, provider.baseUrl, { envReference: "TEST_KEY" });
-      await app.type("/read ../outside.md");
-      await app.type(KEYS.enter);
+  it(
+    "rejects workspace traversal before any provider request",
+    async () => {
+      const provider = await startProvider();
+      let app: Awaited<ReturnType<typeof mount>> | undefined;
+      try {
+        app = await mount({ env: { TEST_KEY: "test-secret" } });
+        await connect(app, provider.baseUrl, { envReference: "TEST_KEY" });
+        await app.type("/read ../outside.md");
+        await app.type(KEYS.enter);
+        // Rejection happens in the same async staging path, so wait for the error to be rendered.
+        const rejected = app;
+        await rejected.waitFor(() =>
+          rejected.frame().includes("Parent-directory traversal is not allowed"),
+        );
 
-      expect(app.frame()).toContain("Parent-directory traversal is not allowed");
-      expect(provider.chatRequests).toHaveLength(0);
-      app.unmount();
-    } finally {
-      await provider.close();
-    }
-  });
+        expect(app.frame()).toContain("Parent-directory traversal is not allowed");
+        expect(provider.chatRequests).toHaveLength(0);
+      } finally {
+        app?.unmount();
+        await provider.close();
+      }
+    },
+    PROVIDER_SUITE_TIMEOUT_MS,
+  );
 });

@@ -2,7 +2,121 @@
 
 **Last update:** 2026-08-08
 
-## Current milestone: macOS terminal-graphics CI failure fixed, with a corrected font policy
+## Current milestone: macOS TUI provider-integration timeouts fixed as a budget problem, not a hang
+
+The macOS CI job reported exactly two failures in
+`packages/cli/test/tui-provider-integration.test.tsx`, both hitting Vitest's default 5000 ms
+timeout at exactly 5.0 s: the staging-document test and the ephemeral-credential-redaction test.
+The other three tests in the same file passed.
+
+### Diagnosis: scheduling budget, confirmed by measurement
+
+This was **not** a hang, and the two named tests were not special. Run against this tree on Windows
+before any change, all five tests *passed* but sat just under the limit:
+
+| Test | Baseline | Margin under 5000 ms |
+| --- | --- | --- |
+| stages a workspace document | 4696 ms | 304 ms |
+| streams provider text across chunk boundaries | 4364 ms | 636 ms |
+| preserves canonical LaTeX | 4661 ms | 339 ms |
+| never renders an ephemeral pasted credential | 4558 ms | 442 ms |
+| rejects workspace traversal | 3791 ms | 1209 ms |
+
+The whole file was within 6-25% of the ceiling, so it was a coin flip per runner. The two that
+failed on macOS are the two with the most keystrokes: the staging test adds `/read paper.tex`, and
+the redaction test adds an extra Tab plus a 32-character pasted secret. Both reached ~160 `settle`
+rounds against ~144 for the cheapest passing test.
+
+The mechanism was the fixed sleep in the test helper, not product code. `settle()` awaited eight
+*sequential* `setTimeout(..., 12)` calls, so every simulated keystroke cost at least 96 ms of pure
+scheduling, and `connect()` ran a full settle per character of the base URL and per one of fourteen
+backspaces. Real HTTP listen/accept, Harness and adapter construction, and a full Ink re-render per
+keypress sat on top of a floor of roughly 1.7-1.9 s per test. Timer resolution and coalescing differ
+by platform and CI load, which is what moved macOS across the line.
+
+### Fix
+
+Test-only. No production code, provider behavior, assertion, or security boundary was changed.
+
+- **Explicit suite timeout.** `PROVIDER_SUITE_TIMEOUT_MS = 30_000` is applied per test in this
+  describe, with a comment explaining the real HTTP, Harness, adapter, and Ink rendering overhead
+  and why cross-platform timer behavior makes the 5 s default wrong here. A global `testTimeout`
+  was deliberately avoided: it would also mask genuine hangs in the fast unit suites. This matches
+  the precedent already in `test/tui-app.test.tsx:587`, which uses `}, 20_000)` for a *stub*-harness
+  test doing strictly less work than these real-provider tests.
+- **Condition-based waits replace fixed sleeps.** A bounded `waitFor(predicate, budgetMs = 10_000)`
+  polls instead of assuming a fixed settle count. Every asynchronous boundary now waits on a real
+  rendered signal: connection and model selection wait on the **footer** (`provider compatible`,
+  `model compatible:science`), document staging and traversal rejection wait on their rendered
+  result, and each streaming assertion waits on its own expected text. `waitFor` returns normally on
+  timeout so the caller's original `expect` still reports the actual frame.
+- **Per-keystroke settle reduced** from 8x12 ms to 4x1 ms, which is safe only because every awaited
+  operation is now covered by `waitFor` rather than by padding.
+- **Leak-proof cleanup.** Each test declares `let app` and calls `app?.unmount()` in `finally`, so a
+  failed assertion can no longer leave a mounted Ink instance and its stdin listener attached for
+  the rest of the file. Previously `app.unmount()` was the last statement before `finally` and was
+  skipped entirely on failure.
+
+### Result
+
+Per-test time fell about 2.6x, from ~3.8-4.7 s to ~1.6-2.0 s, and the file went from ~23.5 s to
+~10.8 s. The slowest test now has roughly 15x headroom against the 30 s budget instead of 6%.
+
+| Test | Before | After |
+| --- | --- | --- |
+| stages a workspace document | 4696 ms | 1752 ms |
+| streams provider text across chunk boundaries | 4364 ms | 1815 ms |
+| preserves canonical LaTeX | 4661 ms | 1971 ms |
+| never renders an ephemeral pasted credential | 4558 ms | 1966 ms |
+| rejects workspace traversal | 3791 ms | 1671 ms |
+
+Three consecutive focused runs were stable at 10.77 s, 10.90 s, and 10.86 s.
+
+### Verification of the fix itself
+
+Two intermediate mistakes were caught by the suite rather than shipped, and both are recorded
+because each pins a real constraint:
+
+- Batching the fourteen backspaces into one `stdin.write` broke four tests with
+  `Credential environment variable 'OPENAI_API_KETEST_KEY' is not set`. Ink delivers a single stdin
+  write as **one** `input` string, so a burst is handled as one keypress and deletes one character.
+  The per-keystroke loop is required and now carries a comment saying so.
+- Reducing `settle()` before covering every awaited boundary failed the staging assertion, because
+  `/read` performs a real filesystem read through `stageDocument`. That is what drove adding
+  `waitFor` at the staging and traversal boundaries instead of lengthening the sleep.
+
+The leak fix was verified directly: forcing one assertion to fail produced exactly
+`1 failed | 4 passed` with the run still terminating cleanly in 10.80 s, confirming the failed
+test's Ink instance was unmounted and did not strand the remaining tests.
+
+### Gates
+
+```text
+npm test --workspace @researk/cli -- tui-provider-integration.test.tsx   # passed: 5 tests, 10.80s
+npm run build --workspace @researk/cli                                   # passed: exit 0
+npm run typecheck --workspace @researk/cli                               # passed: exit 0
+npm run lint                                                             # passed: 101 files
+npm run format-check                                                     # passed: 101 files
+npm test                                                                 # passed: 312 tests in 19 files
+```
+
+`npm run format-check` failed once after the edit, because Biome reflows an `it(...)` call that
+gains a timeout argument; `npx biome format --write` on the single file resolved it and lint plus
+the focused suite were re-run green afterward. Repository totals are unchanged at 312 tests in 19
+files, with `@researk/cli` still 180 in 11 files: this work changed timing and cleanup only, and
+added no tests. Environment: Node.js `v24.14.1`, npm `11.11.0`, Windows.
+
+The macOS runner was not available to this session, so the platform-specific failure was reproduced
+by measurement of the shared cost rather than observed directly. The margin table above is the
+evidence: the fix removes the cause on every platform by cutting the fixed scheduling floor and
+adding headroom, rather than by raising a timeout alone.
+
+### Files changed
+
+- `packages/cli/test/tui-provider-integration.test.tsx`
+- `docs/HANDOFF.md`
+
+## Previous milestone: macOS terminal-graphics CI failure fixed, with a corrected font policy
 
 `packages/cli/test/terminal.test.ts` failed only on the macOS CI job while Linux and Windows passed.
 The tests were not flaky: the CLI really did fall back to exact LaTeX on that host, through the
