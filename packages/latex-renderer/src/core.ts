@@ -80,6 +80,31 @@ export interface LatexSvgRenderResult {
   readonly height?: number;
 }
 
+/**
+ * Structural facts about a validated SVG, produced by the same single parse that validates it.
+ *
+ * These are properties of *parsed markup*, never of the serialized string. A `data-latex` attribute
+ * echoes the caller's own TeX verbatim, so `x_{font-family}` and `\mbox{font-family: serif}` put the
+ * literal bytes `font-family` and even `font-family:` into an otherwise pure-path SVG. A substring
+ * test over the serialization cannot tell that apart from a real glyph run and refuses valid math.
+ */
+export interface LatexSvgStructure {
+  /** True only when at least one `<text>` element was actually parsed. */
+  readonly hasTextElement: boolean;
+  /**
+   * True only when a real `font-family` presentation attribute was parsed on some element, or a
+   * real `font-family:` CSS declaration was parsed inside a real `style` attribute. An attribute
+   * *value* that merely contains the characters `font-family` does not set this.
+   */
+  readonly hasFontFamily: boolean;
+}
+
+/** A validated SVG together with the structural facts observed while validating it. */
+export interface ValidatedSvg {
+  readonly structure: LatexSvgStructure;
+  readonly svg: string;
+}
+
 interface Renderer {
   readonly adaptor: ReturnType<typeof liteAdaptor>;
   readonly document: ReturnType<typeof mathjax.document>;
@@ -94,6 +119,21 @@ let renderer: Renderer | undefined;
  * system TeX, invoke a shell, load external resources, rasterize output, or write files.
  */
 export function renderTexToSvgInWorker(request: LatexSvgRenderRequest): LatexSvgRenderResult {
+  return renderTexToValidatedSvgInWorker(request).result;
+}
+
+/**
+ * The same render, additionally returning the structural facts observed during SVG validation.
+ *
+ * The worker needs to know whether the output contains a real glyph run before it rasterizes.
+ * That question is answered here, by the parser that already walks every tag and attribute, rather
+ * than by a second regex pass over the serialization that cannot distinguish markup from a
+ * `data-latex` source echo. The `result` field is the unchanged public render result.
+ */
+export function renderTexToValidatedSvgInWorker(request: LatexSvgRenderRequest): {
+  readonly result: LatexSvgRenderResult;
+  readonly structure: LatexSvgStructure;
+} {
   validateTex(request.tex);
 
   const display = request.display ?? true;
@@ -107,14 +147,17 @@ export function renderTexToSvgInWorker(request: LatexSvgRenderRequest): LatexSvg
       throw new LatexSvgRenderError("render_failed", "MathJax did not produce an SVG element.");
     }
 
-    const svg = activeRenderer.adaptor.serializeXML(svgNode);
-    validateSvg(svg);
+    const serialized = activeRenderer.adaptor.serializeXML(svgNode);
+    const validated = validateSvg(serialized);
 
     return {
-      display,
-      renderer: "mathjax-4.1.3",
-      svg,
-      tex: request.tex,
+      result: {
+        display,
+        renderer: "mathjax-4.1.3",
+        svg: validated.svg,
+        tex: request.tex,
+      },
+      structure: validated.structure,
     };
   } catch (error) {
     if (error instanceof LatexSvgRenderError) {
@@ -196,7 +239,7 @@ function validateTex(tex: string): void {
   }
 }
 
-function validateSvg(svg: string): void {
+function validateSvg(svg: string): ValidatedSvg {
   if (Buffer.byteLength(svg, "utf8") > maximumOutputBytes) {
     throw new LatexSvgRenderError(
       "output_limit",
@@ -207,6 +250,9 @@ function validateSvg(svg: string): void {
   const openElements: string[] = [];
   let rootSeen = false;
   let cursor = 0;
+  // Accumulated from parsed markup only, in the same pass that enforces the allowlists below.
+  let hasTextElement = false;
+  let hasFontFamily = false;
 
   while (cursor < svg.length) {
     const start = svg.indexOf("<", cursor);
@@ -250,6 +296,13 @@ function validateSvg(svg: string): void {
 
       validateAttributes(parsed.name, parsed.attributes);
 
+      // An element name, not a substring of the serialization.
+      if (parsed.name === "text") hasTextElement = true;
+      // A real presentation attribute, or a real declaration inside a real `style` attribute.
+      if (parsed.attributes.has("font-family")) hasFontFamily = true;
+      const style = parsed.attributes.get("style");
+      if (style !== undefined && declaresFontFamily(style)) hasFontFamily = true;
+
       if (!parsed.selfClosing) {
         openElements.push(parsed.name);
       }
@@ -263,6 +316,25 @@ function validateSvg(svg: string): void {
   }
 
   validateViewBox(svg);
+
+  return { structure: { hasTextElement, hasFontFamily }, svg };
+}
+
+/**
+ * Detects a real `font-family` CSS declaration in a `style` attribute value.
+ *
+ * The property name must start a declaration — at the beginning of the value or immediately after a
+ * `;` — and must be followed by a `:`. This ignores `font-family` appearing inside a declaration
+ * *value*, which is where an echoed TeX source string would land.
+ */
+function declaresFontFamily(style: string): boolean {
+  for (const declaration of style.split(";")) {
+    const separator = declaration.indexOf(":");
+    if (separator === -1) continue;
+    if (declaration.slice(0, separator).trim().toLowerCase() === "font-family") return true;
+  }
+
+  return false;
 }
 
 function validateSvgText(text: string): void {

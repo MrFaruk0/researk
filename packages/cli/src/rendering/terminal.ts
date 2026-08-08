@@ -40,16 +40,37 @@ export function reconstructCanonicalSource(events: readonly MarkdownRenderEvent[
   return events.map((event) => event.source).join("");
 }
 
+/**
+ * The rasterization step, injectable for tests.
+ *
+ * Production always uses the packaged isolated-worker renderer. Tests use this seam to drive the
+ * ADR 0006 fallback deterministically, without depending on native bindings or on which
+ * expressions the renderer happens to accept for rasterization on a given host.
+ */
+export type TerminalMathImageRenderer = (
+  request: { readonly tex: string; readonly display: boolean },
+  options: { readonly budget?: LatexRenderBudget; readonly signal?: AbortSignal },
+) => Promise<{ readonly png: Uint8Array }>;
+
+/**
+ * Emits display math as an inline image, or reports `false` so the caller presents exact source.
+ *
+ * Every failure path is a `false`, never a throw and never a partial image: an unsupported
+ * protocol, a renderer that declines the expression (the worker fails closed on anything needing
+ * font-backed text, such as CJK, emoji, or a MathJax error marker), a budget or timeout rejection,
+ * or an oversized payload. This is the ADR 0006 contract: no graphic unless it is known correct.
+ */
 export async function renderTerminalMath(
   event: MathRenderEvent,
   capability: TerminalCapability,
   stdout: Writable,
   budget?: LatexRenderBudget,
   signal?: AbortSignal,
+  renderImage: TerminalMathImageRenderer = renderTexToPng,
 ): Promise<boolean> {
   if (event.kind !== "display" || capability.protocol !== "iterm2") return false;
   try {
-    const image = await renderTexToPng(
+    const image = await renderImage(
       { tex: event.tex, display: true },
       {
         ...(budget === undefined ? {} : { budget }),

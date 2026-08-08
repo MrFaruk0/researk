@@ -2,11 +2,167 @@
 
 **Last update:** 2026-08-08
 
-## Current verified state: full gate set green after the carriage-return display fix
+## Current milestone: macOS terminal-graphics CI failure fixed, with a corrected font policy
+
+`packages/cli/test/terminal.test.ts` failed only on the macOS CI job while Linux and Windows passed.
+The tests were not flaky: the CLI really did fall back to exact LaTeX on that host, through the
+correct ADR 0006 path. The defect was in the renderer's rasterization step.
+
+### Retraction of the earlier claim in this file
+
+An earlier version of this section stated that **every** validated MathJax SVG is pure `<path>`
+geometry, that font enumeration therefore could not affect any image, and that macOS system-font
+enumeration "can consult network-backed font providers" and so violated ADR 0006's no-network rule.
+**Both claims were wrong and are retracted.** They were generalized from a five-expression sample of
+ordinary math and were never tested against text-bearing output, and the network claim was asserted
+without evidence. The unconditional `loadSystemFonts: false` that shipped on that reasoning was
+unsafe on its own, and has been replaced by the policy below.
+
+Measured directly against this tree, MathJax with `fontCache: "none"` emits a real glyph run —
+`<text ...>` inside an `<mtext style="font-family: serif">` — for at least:
+
+| Expression | `<text>` | `font-family` | PNG identical with fonts on vs. off |
+| --- | --- | --- | --- |
+| `E = mc^2` | no | no | yes, byte-identical (sha `3f003fbb…`) |
+| `\mbox{hello world}` | no | no | yes |
+| `x = 中文` | yes | yes | **no**: 13244 B vs 6156 B |
+| `x = 😀` | yes | yes | **no**: 18249 B vs 9653 B |
+| `\frac{1}` (`merror`) | yes | yes | same bytes, but the text is invisible either way |
+| `\notarealmacro{x}` (`merror`) | yes | yes | as above |
+
+So the unconditional flag silently dropped CJK and emoji glyphs, and `merror` markers rasterize to a
+solid `data-background` rectangle with no readable message regardless of the flag. Wrong and
+incomplete graphics are exactly what ADR 0006 forbids.
+
+### Root cause
+
+`@resvg/resvg-js` defaults to loading system fonts, which is unbounded, host-dependent work charged
+to the 1000 ms per-render ceiling. Measured on Windows with 537 installed fonts it cost ~430 ms of a
+render whose actual rasterization is ~7 ms. A macOS runner carries far more font faces, so the first
+PNG render crossed the ceiling, `render` rejected with `timeout`, `renderTerminalMath` returned
+`false`, and the CLI emitted exact source, failing the graphics assertions on that job only. The
+macOS runner was not available to this session, so the platform-specific timing was inferred from
+this measured cost and reproduced locally by constraining the same production code path.
+
+### Fix: a conditional, fail-closed font policy
+
+`packages/latex-renderer/src/worker.ts` now branches before rasterizing, in the PNG path only:
+
+- **Path-only SVG** (no `<text>`, no `font-family`): rasterize with `font: { loadSystemFonts: false }`.
+  This is lossless — PNG output is byte-identical with enumeration on and off — and it removes the
+  host-font enumeration entirely, which is the deterministic fix for the macOS timing.
+- **Font-backed SVG** (any `<text>` element **or** any `font-family` reference): refuse. It does not
+  load host fonts, and it does not emit a partial image. It throws `LatexSvgRenderError` with the
+  in-contract `render_failed` code, so `renderTexToPng` rejects, `renderTerminalMath` returns
+  `false`, and the CLI presents exact canonical LaTeX.
+
+`font-family` is tested independently of `<text>` so a future MathJax revision that paints a
+font-backed glyph through a different element still fails closed rather than rendering silently
+incomplete output. The SVG path is untouched: `renderTexToSvg` still returns these expressions
+normally, and only rasterization is refused.
+
+No contract change was required. `render_failed` is already in `workerErrorCodes`, already maps to a
+fixed pool-authored sentence in `describeWorkerError`, and the worker still replaces its own message
+with the same redacted sentence, so no TeX, MathJax internal, or host path can reach a caller. The
+protocol validator was not loosened and no allowed SVG content was broadened.
+
+### Regression coverage: deterministic, not wall-clock
+
+The previous two threshold assertions (`budget.renderTimeMs < renderTimeoutMs / 2`) were removed.
+They asserted a host-speed property, would flake on a slow or loaded runner, and did not actually
+test the policy. They are replaced by behavioral tests, all driving the real packaged renderer:
+
+- `latex-renderer`: a PNG is produced only from an SVG containing `<path>` and no `<text>` or
+  `font-family` — the invariant that makes disabling system fonts lossless.
+- `latex-renderer`, 4 cases: `x = 中文`, `x = 😀`, `\frac{1}`, and `\notarealmacro{x}` each still
+  render as SVG with font-backed text, and each rejects with `render_failed` from `renderTexToPng`.
+- `latex-renderer`: a refusal does not poison the pool — the next PNG on the same budget succeeds.
+- `latex-renderer`: the refusal message is exactly the redacted sentence and leaks no TeX marker,
+  font, renderer name, or path separator.
+- `cli`, 4 cases: the same four expressions produce exact canonical source with no `\u001b]1337;`
+  sequence, with iTerm2 capability positively supported so this isolates the renderer decision.
+- `cli`: `E = mc^2` still emits a real inline image end-to-end, asserted by decoding the base64
+  payload and checking the PNG magic bytes and a >1 KiB size, so the fix did not disable graphics.
+- `cli`: a failing rasterizer yields exact source; `renderTerminalMath` reports `false` rather than
+  throwing; capability is a pure function of explicit stream and env input.
+
+These were verified to fail as intended: neutering `requiresFontBackedText` to a constant `false`
+fails 7 `latex-renderer` tests and 4 `cli` tests, then passes again when restored. The 7 are the
+4 refusal cases plus the pool-reuse, worker-replacement, and redacted-message tests, all of which
+depend on a refusal actually occurring.
+
+The injectable `renderImage` seam on `renderTerminalMath` and `renderInteractiveEvents` is retained.
+It defaults to the packaged `renderTexToPng`, so production behavior is unchanged when omitted, and
+it lets protocol-shape tests inject a fixed 1x1 PNG without depending on native bindings.
+
+### Worker lifecycle
+
+Unchanged and re-verified, but an earlier version of this section described it incorrectly and that
+description is **retracted**. It claimed the worker is "**not** replaced" on a refusal and that the
+pool-reuse test asserts this. Neither is true. In `ManagedLatexRenderer.#run`, the `onMessage`
+handler sets `replace = true` for **every** `type: "error"` response, so an in-contract
+`render_failed` refusal replaces the slot's worker exactly like a protocol failure does. The
+pool-reuse test asserts only that the pool stays usable — the next PNG on the same budget succeeds —
+which it does *through* the replacement, not by avoiding it.
+
+The corrected statement: a refusal is an ordinary in-contract render error for the *caller* — it
+rejects with `render_failed` rather than `worker_failed`, and the budget and queue are unaffected —
+while the *pool* still discards and re-warms the worker behind it. That is existing pool behavior
+this work did not change and does not depend on; the refusal is raised inside the worker's normal
+`try`/`catch`, so it travels the standard error-response path. The cost is one extra worker spawn
+per refused expression, which is acceptable because a refusal is terminal for that expression: the
+CLI falls back to exact source and does not retry.
+
+Idle workers stay unreferenced and the existing lifecycle suites pass, so no thread outlives its
+pool. The ~90 s `packages/cli` duration is Ink TUI tests, not the renderer; the whole
+`latex-renderer` package runs in ~3.3 s.
+
+### Gates
+
+```text
+npm run clean                                      # passed: 7 workspace packages
+npm run build                                      # passed: 7 workspace packages
+npm run typecheck                                  # passed: 7 workspace packages
+npm test                                           # passed: 312 tests in 19 files
+npm run lint                                       # passed: 101 files
+npm run format-check                               # passed: 101 files
+git diff --check                                   # passed: no whitespace errors
+```
+
+Per-package totals behind the 312: `@researk/cli` 180 in 11 files (was 168 before this work),
+`@researk/latex-renderer` 97 in 3 (was 76), `@researk/provider-openai-compatible` 12,
+`@researk/contracts` 10, `@researk/harness` 7, `@researk/provider-openrouter` 4, and
+`@researk/research` 2. Environment: Node.js `v24.14.1`, npm `11.11.0`, Windows.
+
+The `latex-renderer` count includes the structural-metadata suite: a 9-case table asserting
+`hasTextElement`/`hasFontFamily` straight off the validator, a 3-case table proving
+`x_{font-family}`, `\frac{font-family}{2}`, and `\mbox{font-family: serif}` still rasterize, a
+4-case table proving CJK, emoji, and both `merror` markers are refused, and an explicit worker
+replacement test.
+
+Both directions of the decision were verified by mutation. Forcing `requiresFontBackedText` to
+always refuse fails 6 `latex-renderer` tests and 6 `cli` tests; restoring the *old whole-string*
+test — `/<text|font-family/` over the serialization — fails exactly the 3 `font-family`-echo
+rasterization cases, which is the regression this work removes. Neither mutation survives.
+
+Note for future sessions: `tsc -b` did not rebuild `dist` after a source file was restored to an
+earlier mtime, which briefly produced stale-artifact test failures. `npm run clean` before
+`npm run build` resolves it when a file is reverted rather than edited forward.
+
+### Known limitation
+
+Display math containing CJK, emoji, or other non-math-font text, and any MathJax error marker, is
+never shown graphically on any platform — it always falls back to exact source. This is a deliberate
+correctness choice, not a defect. Rendering it properly would require bundling a licensed text font
+in the renderer and passing it to resvg explicitly as `fontFiles`/`defaultFontFamily`, which stays
+host-independent; that is the natural follow-up if graphical text is wanted later.
+
+## Previous verified state: full gate set green after the carriage-return display fix
 
 An independent final verification pass ran the complete required gate set against the working tree
 as it stands, after the carriage-return display fix described below. Every gate passed and no
-implementation change was required. These are the authoritative counts for the current tree.
+implementation change was required. These counts are historical: they predate the macOS
+terminal-graphics fix above, which is now the authoritative state at 312 tests.
 
 ```text
 npm run clean                                      # passed: 7 workspace packages
@@ -152,10 +308,10 @@ npm run lint                                       # passed: 101 files
 npm run format-check                               # passed: 101 files
 ```
 
-The independent verification pass recorded at the top of this file re-ran the complete gate set
-against this fix and confirmed those counts: `@researk/cli` is 168 tests in 11 files and the
-repository suite is 279 tests in 19 files, with all six npm gates, `git diff --check`, the four CLI
-smoke checks, and the fake-TTY lifecycle green.
+The independent verification pass recorded above re-ran the complete gate set against this fix and
+confirmed those counts at the time: `@researk/cli` was 168 tests in 11 files and the repository suite
+279 in 19 files, with all six npm gates, `git diff --check`, the four CLI smoke checks, and the
+fake-TTY lifecycle green. The macOS terminal-graphics fix has since raised those to 180 and 312.
 
 ## Earlier verification pass: four TUI defects found and fixed
 
@@ -649,11 +805,20 @@ No review agents remain active after this handoff.
   implemented.
 - CLI math output supports the bounded local MathJax 4 SVG backend, in-memory `@resvg/resvg-js`
   rasterization, and direct iTerm2 inline-image emission when a real supported iTerm2 TTY is
-  positively detected. Exact LaTeX source remains the fallback for unsupported, inaccessible,
-  non-TTY, and rendering-error paths. Kitty graphics support is not implemented because its bounded
-  query/reply capability broker is still missing; Sixel and other terminal graphics protocols remain
-  unsupported as well. Full-document TeX compilation, external renderer executables, and arbitrary
-  TeX packages remain out of scope.
+  positively detected. Rasterization is restricted to path-only MathJax output and runs with resvg
+  system-font loading disabled, which is lossless for that content and keeps the image independent
+  of host font state. An SVG carrying `<text>` or `font-family` — CJK, emoji and other non-math-font
+  characters, and every MathJax error marker — is refused rather than rasterized incompletely. That
+  decision reads structural facts recorded by the SVG validator's single parse — an actually parsed
+  `<text>` element, an actual `font-family` attribute, or an actual `font-family:` declaration in an
+  actual `style` attribute — never a substring scan of the serialization, because every element's
+  `data-latex` attribute echoes caller TeX verbatim and a string test would refuse valid math such
+  as `x_{font-family}`.
+  Exact LaTeX source remains the fallback for unsupported, inaccessible,
+  non-TTY, font-backed, and rendering-error paths. Kitty graphics support is not implemented because
+  its bounded query/reply capability broker is still missing; Sixel and other terminal graphics
+  protocols remain unsupported as well. Full-document TeX compilation, external renderer
+  executables, and arbitrary TeX packages remain out of scope.
 - Scholarly web tools and isolated paper-reproduction execution are not implemented.
 - The TUI conversation view is source-oriented. Display math is shown as separated exact LaTeX rather
   than as an inline image, because emitting a terminal graphics protocol inside a retained Ink frame
@@ -665,9 +830,10 @@ No review agents remain active after this handoff.
 
 ## Exact next task
 
-The full-screen TUI milestone, the four reviewed TUI fixes, and the carriage-return display fix are
-all complete, and the tree is green under the full gate set; nothing from them is left unfinished.
-Proceed to the versioned model-catalog cache and CLI capability filters. The TUI already has the
+The full-screen TUI milestone, the four reviewed TUI fixes, the carriage-return display fix, and the
+macOS terminal-graphics fix with its corrected font policy are all complete, and the tree is green
+under the full gate set; nothing from them is left unfinished. Proceed to the versioned
+model-catalog cache and CLI capability filters. The TUI already has the
 natural seams for it: `TuiController.refreshCatalog` is the single catalog entry point and
 `catalogLoading` / `catalog` already exist in the state tree, so a cache belongs behind the
 controller rather than in a component.

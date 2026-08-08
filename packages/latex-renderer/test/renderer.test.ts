@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Worker, type WorkerOptions } from "node:worker_threads";
+import { renderTexToValidatedSvgInWorker } from "../src/core.js";
 import {
+  getManagedLatexRenderer,
   LatexRenderBudget,
   latexSvgRendererLimits,
   ManagedLatexRenderer,
+  ManagedLatexRenderError,
+  renderTexToPng,
   renderTexToSvg,
 } from "../src/index.js";
 
@@ -48,6 +52,206 @@ describe("renderTexToSvg", () => {
     expect(result.display).toBe(false);
     expect(result.svg).not.toMatch(/\b(?:href|xlink:href)=/iu);
     expect(result.svg).not.toMatch(/<(?:script|foreignObject)\b/iu);
+  });
+
+  /**
+   * Rasterization must not depend on host font state.
+   *
+   * The worker previously rasterized with resvg's system-font loading left enabled, which made PNG
+   * rendering perform host-font enumeration. That is unbounded work charged to the per-render
+   * timeout, and on a font-heavy host it pushed the first render past the ceiling, so the CLI fell
+   * back to exact LaTeX and only the macOS CI job saw missing graphics.
+   *
+   * The invariant asserted here is behavioral rather than timing-based: a PNG is produced only from
+   * an SVG that no font can influence. That is what makes disabling system fonts lossless, and it is
+   * the property that would break if font-backed content were ever rasterized instead of refused.
+   */
+  it("rasterizes only from an SVG that no font can influence", async () => {
+    const result = await getManagedLatexRenderer().render(
+      { tex: "E = mc^2", display: true },
+      new LatexRenderBudget(),
+      undefined,
+      "png",
+    );
+
+    expect(result.svg).toContain("<path");
+    expect(result.svg).not.toMatch(/<text\b/iu);
+    expect(result.svg).not.toMatch(/font-family/iu);
+    expect(result.png?.byteLength).toBeGreaterThan(0);
+    expect(result.width).toBeGreaterThan(0);
+    expect(result.height).toBeGreaterThan(0);
+  });
+
+  /**
+   * The refusal must key on parsed markup, not on the serialized string.
+   *
+   * Every MathJax element carries a `data-latex` attribute that echoes the caller's TeX verbatim,
+   * so an expression whose *source* contains `font-family` puts those exact bytes into output that
+   * is still pure `<path>` geometry. A substring test over the serialization cannot tell that from a
+   * real glyph run and refuses valid math, which is a silent loss of graphics for ordinary input.
+   *
+   * Each case below was confirmed against this MathJax configuration to serialize with the literal
+   * bytes `font-family` present while parsing to zero `<text>` elements and zero real `font-family`
+   * attributes or declarations. The last case additionally contains `font-family:` — declaration
+   * shaped — inside a `data-latex` value, which is the exact string a naive `style` scan would trip
+   * on. All of them must rasterize.
+   */
+  it.each([
+    ["a subscript whose source echoes the property name", "x_{font-family}"],
+    ["a fraction whose source echoes the property name", "\\frac{font-family}{2}"],
+    ["a source containing a declaration-shaped `font-family:`", "\\mbox{font-family: serif}"],
+  ])("rasterizes %s because it is structurally path-only", async (_label, tex) => {
+    // The serialization really does carry the bytes the old string test matched on, so this case
+    // is only passing because the decision is structural.
+    const svgResult = await renderTexToSvg({ tex });
+    expect(svgResult.svg).toMatch(/font-family/iu);
+    // ...while containing no glyph run at all: no `<text>` element and no real attribute.
+    expect(svgResult.svg).not.toMatch(/<text\b/iu);
+    expect(svgResult.svg).not.toMatch(/font-family\s*=/iu);
+    expect(svgResult.svg).toContain("<path");
+
+    const png = await renderTexToPng({ tex });
+    expect(png.png.byteLength).toBeGreaterThan(0);
+    expect(png.width).toBeGreaterThan(0);
+    expect(png.height).toBeGreaterThan(0);
+  });
+
+  /**
+   * MathJax does not always emit path-only geometry. Anything outside its bundled math font, and
+   * every `merror` marker, becomes a `<text>` run backed by a real font: CJK and emoji carry a
+   * `font-family` attribute on the `<text>` element itself, and a `merror` marker carries a
+   * `style="font-family: serif;"` declaration on the wrapping `<mtext>` group. Rasterizing that
+   * with host fonts disabled drops the glyphs, and rasterizing it with host fonts enabled makes the
+   * image depend on host font state. ADR 0006 permits neither, so PNG rendering fails closed and
+   * the caller presents exact source.
+   *
+   * The CJK and emoji cases were confirmed to rasterize to a different, smaller PNG with system
+   * fonts disabled, which is the silent glyph loss this refusal prevents.
+   */
+  it.each([
+    ["CJK outside the math font", "x = 中文"],
+    ["an emoji symbol", "x = 😀"],
+    ["a MathJax error marker for invalid TeX", "\\frac{1}"],
+    ["a MathJax error marker for an undefined macro", "\\notarealmacro{x}"],
+  ])("refuses to rasterize %s instead of returning an incomplete image", async (_label, tex) => {
+    // The SVG path still succeeds: only rasterization is refused, so nothing else regresses.
+    const svgResult = await renderTexToSvg({ tex });
+    // A real glyph run, proven structurally: an actual `<text>` element is present.
+    expect(svgResult.svg).toMatch(/<text\b/iu);
+
+    await expect(renderTexToPng({ tex })).rejects.toMatchObject({ code: "render_failed" });
+  });
+
+  it("keeps a font-backed refusal from poisoning later renders on the same pool", async () => {
+    const budget = new LatexRenderBudget();
+
+    await expect(renderTexToPng({ tex: "x = 中文" }, { budget })).rejects.toMatchObject({
+      code: "render_failed",
+    });
+    // A refusal is an ordinary in-contract render failure for the caller, so the very next PNG
+    // still succeeds. The pool reaches that state by replacing the worker, not by keeping it.
+    await expect(renderTexToPng({ tex: "E = mc^2" }, { budget })).resolves.toMatchObject({
+      tex: "E = mc^2",
+    });
+  });
+
+  /**
+   * The pool's own reaction to a refusal, pinned explicitly.
+   *
+   * `ManagedLatexRenderer.#run` sets `replace = true` for every `type: "error"` response, so an
+   * in-contract `render_failed` refusal discards and re-warms the worker exactly like a protocol
+   * failure. That is pre-existing pool behavior which the refusal path inherits rather than changes,
+   * and it is asserted here because this file previously documented the opposite.
+   */
+  it("replaces the worker after a refusal even though the caller sees a render failure", async () => {
+    const created: Worker[] = [];
+    const renderer = new ManagedLatexRenderer({
+      concurrency: 1,
+      workerFactory: () => {
+        // The real packaged worker, so this exercises the production refusal path end to end.
+        const worker = new Worker(new URL("../dist/worker.js", import.meta.url), { execArgv: [] });
+        created.push(worker);
+        return worker;
+      },
+    });
+    renderers.push(renderer);
+    const budget = new LatexRenderBudget();
+
+    await expect(
+      renderer.render({ tex: "E = mc^2" }, budget, undefined, "png"),
+    ).resolves.toMatchObject({ tex: "E = mc^2" });
+    const beforeRefusal = created.length;
+
+    await expect(
+      renderer.render({ tex: "x = 中文" }, budget, undefined, "png"),
+    ).rejects.toMatchObject({ code: "render_failed" });
+
+    // The replacement serves the next job normally, which is the property that actually matters.
+    await expect(
+      renderer.render({ tex: "E = mc^2" }, budget, undefined, "png"),
+    ).resolves.toMatchObject({ tex: "E = mc^2" });
+
+    // The refused worker was discarded and a replacement warmed in its place. This is asserted
+    // after the following render rather than immediately: `#run` rejects the caller before
+    // `#replace` awaits `terminate()` and spawns, so checking straight after the rejection races
+    // that window. The next successful render is the point where the replacement provably exists.
+    expect(created.length).toBe(beforeRefusal + 1);
+    // ...and the original worker really was retired, not merely supplemented.
+    const [retired] = created;
+    expect(retired).toBeDefined();
+    await waitForExit(retired as Worker);
+  });
+
+  it("reports a refusal with a redacted message that leaks no TeX or host detail", async () => {
+    const tex = "\\notarealmacro{secret-marker}";
+
+    const error = await renderTexToPng({ tex }).catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(ManagedLatexRenderError);
+    const message = (error as ManagedLatexRenderError).message;
+    expect(message).toBe("The isolated LaTeX renderer could not render the expression.");
+    expect(message).not.toContain("secret-marker");
+    expect(message).not.toMatch(/font|resvg|mathjax|[/\\]/iu);
+  });
+
+  /**
+   * The structural metadata itself, read straight off the validator, with no worker or rasterizer in
+   * the way. This is the decision input the PNG path branches on, so it is asserted directly: the
+   * table above proves the outcome, this proves the reason.
+   */
+  it.each([
+    ["x_{font-family}", false, false],
+    ["\\frac{font-family}{2}", false, false],
+    ["\\mbox{font-family: serif}", false, false],
+    ["\\text{font-family:}", false, false],
+    ["E = mc^2", false, false],
+    ["x = 中文", true, true],
+    ["x = 😀", true, true],
+    // A `merror` marker has no `font-family` attribute; it carries a real CSS declaration in a
+    // real `style` attribute, so the declaration parser is what has to catch it.
+    ["\\frac{1}", true, true],
+    ["\\notarealmacro{x}", true, true],
+  ])(
+    "reports structural text/font facts for %j as text=%s font-family=%s",
+    (tex, hasTextElement, hasFontFamily) => {
+      const { result, structure } = renderTexToValidatedSvgInWorker({ tex });
+
+      expect(structure).toEqual({ hasTextElement, hasFontFamily });
+      // The public result shape is unchanged and carries no extra field.
+      expect(Object.keys(result).sort()).toEqual(["display", "renderer", "svg", "tex"]);
+      expect(result.tex).toBe(tex);
+    },
+  );
+
+  it("does not treat an echoed TeX source string as a font-family declaration", () => {
+    const echoed = renderTexToValidatedSvgInWorker({ tex: "\\mbox{font-family: serif}" });
+    const real = renderTexToValidatedSvgInWorker({ tex: "\\frac{1}" });
+
+    // Both serializations contain the substring `font-family:`, and only one is a real declaration.
+    expect(echoed.result.svg).toContain("font-family:");
+    expect(real.result.svg).toContain("font-family:");
+    expect(echoed.structure.hasFontFamily).toBe(false);
+    expect(real.structure.hasFontFamily).toBe(true);
   });
 
   it("rejects empty, unbalanced, over-nested, and oversized input before rendering", async () => {

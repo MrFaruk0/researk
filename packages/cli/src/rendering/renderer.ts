@@ -3,6 +3,7 @@ import { type LatexRenderBudget, renderTexToSvg } from "@researk/latex-renderer"
 import type { CliTheme } from "../theme.js";
 import type { MarkdownRenderEvent, MathRenderEvent } from "./parser.js";
 import { detectTerminalCapability, renderTerminalMath } from "./terminal.js";
+import type { TerminalMathImageRenderer } from "./terminal.js";
 
 export interface RenderedMath {
   readonly format: "source" | "svg";
@@ -60,6 +61,8 @@ export async function renderInteractiveEvents(
     readonly writeText?: (value: string) => Promise<void>;
     readonly budget?: LatexRenderBudget;
     readonly signal?: AbortSignal;
+    /** Test seam. Production uses the packaged isolated-worker rasterizer. */
+    readonly renderImage?: TerminalMathImageRenderer;
   },
 ): Promise<string> {
   if (options.accessible === true || options.interactive !== true) {
@@ -81,7 +84,14 @@ export async function renderInteractiveEvents(
         output.length = 0;
       }
       if (
-        await renderTerminalMath(event, capability, options.stdout, options.budget, options.signal)
+        await renderTerminalMath(
+          event,
+          capability,
+          options.stdout,
+          options.budget,
+          options.signal,
+          options.renderImage,
+        )
       ) {
         continue;
       }
