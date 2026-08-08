@@ -1,6 +1,6 @@
 {
   "name": "@researk/research",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.3",
   "description": "Bounded scientific workflow metadata for Researk",
   "license": "Apache-2.0",
   "repository": {
@@ -32,6 +32,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@researk/contracts": "0.1.0-alpha.1"
+    "@researk/contracts": "0.1.0-alpha.3"
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "@researk/provider-openrouter",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.3",
   "description": "Native OpenRouter provider adapter for Researk",
   "license": "Apache-2.0",
   "repository": {
@@ -32,7 +32,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@researk/contracts": "0.1.0-alpha.1",
-    "@researk/harness": "0.1.0-alpha.1"
+    "@researk/contracts": "0.1.0-alpha.3",
+    "@researk/harness": "0.1.0-alpha.3"
   }
 }
