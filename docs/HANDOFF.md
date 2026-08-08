@@ -1,28 +1,302 @@
 # Development handoff
 
-**Last update:** 2026-08-07
+**Last update:** 2026-08-08
 
-## Current verified state: full gate set green after the trusted-renderer-output fix
+## Current verified state: full gate set green after the carriage-return display fix
 
-The complete required gate set was run against the current working tree after the final reviewer
-finding was fixed in `packages/cli/src/run.ts`. Every gate passed. These are the authoritative
-counts for the tree as it stands.
+An independent final verification pass ran the complete required gate set against the working tree
+as it stands, after the carriage-return display fix described below. Every gate passed and no
+implementation change was required. These are the authoritative counts for the current tree.
 
 ```text
 npm run clean                                      # passed: 7 workspace packages
 npm run build                                      # passed: 7 workspace packages
 npm run typecheck                                  # passed: 7 workspace packages
-npm test                                           # passed: 166 tests in 15 files
-npm run lint                                       # passed: 80 files
-npm run format-check                               # passed: 80 files
+npm test                                           # passed: 279 tests in 19 files
+npm run lint                                       # passed: 101 files
+npm run format-check                               # passed: 101 files
+git diff --check                                   # passed: no whitespace errors
+node packages/cli/dist/bin.js help                 # passed: exit 0
+node packages/cli/dist/bin.js version              # passed: exit 0, 0.1.0-alpha.1
+node packages/cli/dist/bin.js doctor --json        # passed: exit 0, telemetry false
+"" | node packages/cli/dist/bin.js                 # passed: exit 2, non-TTY guard on stderr
+fake-TTY dist/tui.js lifecycle                     # passed: enter/exit/cursor restored, exit 0
+```
+
+Per-package totals behind the 279: `@researk/cli` 168 in 11 files, `@researk/latex-renderer` 76 in
+3, `@researk/provider-openai-compatible` 12 in 1, `@researk/contracts` 10 in 1, `@researk/harness` 7
+in 1, `@researk/provider-openrouter` 4 in 1, and `@researk/research` 2 in 1. Within `@researk/cli`:
+`tui-app` 62, `tui-state` 25, `tui-controller` 24, `parser` 15, `runtime` 15, `io` 8, `terminal` 5,
+`tui-provider-integration` 5, `workspace` 4, `safety` 3, and `theme` 2.
+
+`git diff --check` was run with untracked files added as intent-to-add so the new `src/tui/` and
+`test/tui-*` files were actually inspected; `git diff --cached --check` was run too, and the index
+was restored to its exact prior state afterward and confirmed byte-identical to the pre-check
+`git status --porcelain` snapshot. Environment: Node.js `v24.14.1`, npm `11.11.0`, Windows.
+
+The fake-TTY check drove the built `dist/tui.js` through a TTY-shaped stream pair and asserted
+`\u001b[?1049h` on mount, a non-empty painted frame, `\u001b[?1049l` after an idle Ctrl+C with the
+enter preceding the exit, a cursor-show following the last cursor-hide, exit code 0, and empty
+stderr. The driver was kept outside the repository, so the tree is unchanged by verification.
+
+One discrepancy was found and is recorded under current limitations rather than silently fixed: the
+repository carries tag `v0.1.0-alpha.2` while every workspace manifest is still `0.1.0-alpha.1`.
+
+## Completion pass: reviewed TUI fixes implemented and validated
+
+The four reviewed fixes below are implemented and validated in `packages/cli`. At that pass
+`@researk/cli` was 165 tests in 11 files (was 136) and the repository suite was 276; both counts are
+superseded by the verified state above, which is authoritative. Every gate passed:
+
+```text
+npm run clean                                      # passed: 7 workspace packages
+npm run build                                      # passed: 7 workspace packages
+npm run typecheck                                  # passed: 7 workspace packages
+npm test                                           # passed: 276 tests (historical; now 279)
+npm run lint                                       # passed: 101 files
+npm run format-check                               # passed: 101 files
+git diff --check                                   # passed: no whitespace errors
+node packages/cli/dist/bin.js help                 # passed: exit 0
+node packages/cli/dist/bin.js version              # passed: exit 0, 0.1.0-alpha.1
+node packages/cli/dist/bin.js doctor --json        # passed: exit 0, telemetry false
+"" | node packages/cli/dist/bin.js                 # passed: exit 2, non-TTY guard
+fake-TTY dist/tui.js lifecycle                     # passed: enter/restore/render, exit 0
+```
+
+**Exception-safe chat lifecycle.** `TuiController.runChat` performed Harness resolution, canonical
+model parsing, prompt composition, and request validation *before* its `try`, so any of those
+failures rejected out of `runChat`. `App` awaited it without a `catch` or `finally`, so a setup
+failure left `activeRun` populated, the assistant placeholder stranded, and `runStatus` stuck off
+idle: the session was wedged and the alternate screen hid the rejection. Both layers are now guarded.
+All pre-stream work moved inside the controller's `try`, which converts a setup failure into the same
+sanitized `error` + `cancelled`/`failed` outcome a mid-stream failure produces, and honors an already
+aborted signal as cancellation rather than failure. `App` wraps the await in `try/catch/finally`: the
+error is reported through `safeErrorMessage` with the live secret set, and the `finally` always
+clears `activeRun`, finishes the placeholder when text arrived or removes it when nothing streamed,
+and returns `runStatus` to idle. Nine tests cover it across both layers, including that the next
+interaction succeeds after a failure and that idle Ctrl+C then exits instead of trying to cancel.
+
+**`/source` is fully navigable.** The overlay rendered `slice(0, 200)`, so line 201 onward of a long
+response was unreachable and the truncation was silent. It is now a bounded viewport with
+Up/Down, PageUp/PageDown, Home, and End over every retained line, a `lines X-Y of N` status, and
+explicit above/below indicators. The page size is derived from the real render height, the offset is
+clamped to `max(0, total - page)`, and the offset resets when the overlay opens. Two interaction
+tests drive a 260-line response and a 240-line response whose final line is unique, paging until the
+range stops advancing, which proves both clamping and that the last line is reachable without
+depending on a magic press count.
+
+**Canonical source versus safe display.** The retained canonical text and what Ink renders are
+separate by construction, which is what lets both invariants hold at once. `ConversationEntry.source`
+and `latestAssistantSource` keep redacted canonical Markdown/LaTeX for future export: streamed deltas
+pass `StreamingSecretRedactor` first, so a credential split across chunk boundaries is destroyed
+before anything retains it and is never recoverable from the canonical copy. Raw C0/C1 bytes are
+deliberately *not* stripped there, because doing so would silently corrupt canonical output. Display
+is a projection built by `displayText` at the rendering boundary, so those controls are escaped to
+visible text and are never active in a frame, while the canonical copy keeps the exact bytes an
+export needs. The field comments in `state.ts` state which side each value belongs to, and the
+controller documents that `delta` alone carries canonical source while every other event field is
+already neutralized. Two combined tests stream LaTeX, a secret split across chunks, and OSC / BEL /
+C0 controls in one response, then assert the exact ordinary LaTeX survives byte-for-byte in `/source`,
+that no fragment of the secret appears in any frame, and that no active control byte reaches the
+terminal - in the conversation view as well as in the overlay, so `/source` is not the only path
+checked.
+
+**Housekeeping.** `test/runtime.test.ts` had a UTF-8 BOM, which is removed. Stale provider-connect
+completion was re-inspected and needs no further change: the connect handler claims a generation per
+attempt and only the newest attempt may write a result, so a late reply from a superseded endpoint
+cannot overwrite the chosen connection, catalog, or credentials, and a failure path reports the
+redacted error instead of a success notice. No line-scroll redesign was undertaken.
+
+Each fix was confirmed load-bearing by reverting it and observing the new tests fail: restoring the
+200-line cap fails five source-overlay tests including both paging tests, making `displayText` the
+identity fails the combined test, dropping streaming redaction fails both combined tests, and
+hoisting setup back out of the controller's `try` fails three controller tests and, once App's guard
+is also removed, five App tests.
+
+## Follow-up fix: the TUI display projection neutralizes carriage returns
+
+The reviewer's remaining non-blocking display-safety finding is addressed in `packages/cli`. A bare
+U+000D survived to the terminal, so untrusted model or source text containing `SAFE-PREFIX\rSPOOFED`
+returned the cursor to column zero and drew `SPOOFED` over `SAFE-PREFIX`. The user was then shown a
+line the response never actually stood behind, which is a display-spoofing primitive even though it
+executes nothing.
+
+The cause is that `escapeUnsafeTerminalControls` deliberately preserves tab, carriage return, and
+line feed. That is load-bearing for the *one-shot* path, where its output is fed to
+`IncrementalMarkdownMathParser`, which strips a trailing `\r` to normalize CRLF fenced-block lines.
+Escaping U+000D there would change parser and CRLF semantics, so the shared helper is unchanged.
+
+The fix is a display-only second pass, `neutralizeCarriageReturnsForDisplay` in `src/safety.ts`,
+applied by `displayText` in `src/tui/state.ts` after the shared escape. Nothing drawn through
+`displayText` reaches the one-shot parser, so this is the correct boundary: `\r\n` collapses to the
+`\n` that already ends the line, which is what a terminal shows anyway, and a bare `\r` becomes a
+visible `\u{000d}`. Line structure is preserved, tabs and newlines still pass through as layout, and
+only cursor repositioning is removed. Canonical source is untouched, so `ConversationEntry.source`
+and `latestAssistantSource` keep the exact bytes `/source` pages over and a future export needs.
+
+Three regression tests cover it. Two in `test/tui-app.test.tsx` drive a real streamed response
+through `/source`: one asserts that `SAFE-PREFIX\rSPOOFED` renders as `SAFE-PREFIX\u{000d}SPOOFED`
+with both halves still visible and that no frame in the session contains a raw `\r`; the other
+asserts a CRLF stays a line break while a bare `\r` beside a tab is escaped, so layout is unaffected.
+One in `test/parser.test.ts` pins the split explicitly: `escapeUnsafeTerminalControls` still returns
+the carriage return unchanged for the parser, while the display projection escapes it. Both TUI tests
+were confirmed load-bearing by making `displayText` the plain shared escape again and observing them
+fail on the raw `\r` assertion.
+
+Validation actually run for this change:
+
+```text
+npm test --workspace @researk/cli                  # passed: 168 tests in 11 files (was 165)
+npm run typecheck --workspace @researk/cli         # passed: tsc --noEmit clean
+npm run lint                                       # passed: 101 files
+npm run format-check                               # passed: 101 files
+```
+
+The independent verification pass recorded at the top of this file re-ran the complete gate set
+against this fix and confirmed those counts: `@researk/cli` is 168 tests in 11 files and the
+repository suite is 279 tests in 19 files, with all six npm gates, `git diff --check`, the four CLI
+smoke checks, and the fake-TTY lifecycle green.
+
+## Earlier verification pass: four TUI defects found and fixed
+
+An independent verification pass ran the gate set against the Ink TUI and found four real defects
+that the previous 127-test suite did not cover. All four are fixed in `packages/cli`, each with a
+regression test that was confirmed load-bearing by reverting the fix and observing the failure.
+
+The suite is now 136 tests in 11 files for `@researk/cli` (was 127), and the full gate set is green:
+
+```text
+npm run build                                      # passed: 7 workspace packages
+npm run typecheck                                  # passed: 7 workspace packages
+npm test --workspace @researk/cli                  # passed: 136 tests in 11 files
+npm run lint                                       # passed: 101 files
+npm run format-check                               # passed: 101 files
+node packages/cli/dist/bin.js help                 # passed: exit 0
+node packages/cli/dist/bin.js version              # passed: exit 0, 0.1.0-alpha.1
+"" | node packages/cli/dist/bin.js                 # passed: exit 2, non-TTY guard
+```
+
+**Concurrent runs, the most serious defect.** Pressing Enter while a response was streaming started
+a second Harness run and overwrote the single `activeRun` slot. A driven test measured
+`starts=2 aborted=[false,true]`: two live runs, and a subsequent Ctrl+C aborted only the second,
+orphaning the first with no way to cancel it. `submitComposer` now refuses to start a prompt unless
+`runStatus` is `idle`, and `submitPrompt` re-checks the slot before claiming it. Slash commands are
+deliberately still accepted while streaming, because they never start a run.
+
+**Cursor position was not rendered.** The composer always drew the cursor block after the entire
+value, so Left/Right arrows updated `composer.cursor` invisibly and mid-string editing gave no
+feedback. The block is now drawn at the actual offset, preserving the character under it.
+
+**Scrollback ran past the transcript.** `scroll/by` was clamped only at zero, so holding PageUp
+drove `scrollOffset` arbitrarily high; with one entry it reached 500. The conversation window then
+rendered empty while reporting nothing hidden in either direction. The offset is now clamped to the
+retained entry count, so the oldest message stays reachable.
+
+**`/commands` was unreachable.** The `commands` overlay, its reducer case, and `CommandOverlay` were
+fully implemented, but nothing opened it: no key binding, and no entry in `SLASH_COMMANDS`, so it was
+absent from discovery and from the help overlay. `/commands` is now a real command routed to that
+overlay. Selecting `/commands` from inside the overlay closes it rather than reopening it.
+
+Safety boundaries were re-inspected and are unchanged by these fixes: streamed text still passes
+`StreamingSecretRedactor` before `safeTerminalText`, notices are neutralized before reaching Ink,
+entered API keys stay in the ephemeral credential map and are masked, and canonical assistant source
+is still stored byte-exact. Backend behavior, the controller, and the one-shot paths were not
+modified; every change is in `App.tsx`, `Composer.tsx`, `reducer.ts`, and `commands.ts`.
+
+## Previously recorded state: full gate set green after the full-screen TUI replacement
+
+The complete required gate set was run against the current working tree after the readline REPL was
+replaced with an Ink full-screen TUI. Every gate passed. The counts below are historical and predate
+the passes above; the authoritative `@researk/cli` count is now 168.
+
+```text
+npm install                                        # passed: lockfile updated for ink/react
+npm run clean                                      # passed: 7 workspace packages
+npm run build                                      # passed: 7 workspace packages
+npm run typecheck                                  # passed: 7 workspace packages
+npm test                                           # passed: 238 tests in 19 files
+npm run lint                                       # passed: 101 files
+npm run format-check                               # passed: 101 files
 git diff --check                                   # passed: no whitespace errors
 ```
 
-Per-package test totals behind the 166: `@researk/cli` 55 in 7 files, `@researk/latex-renderer` 76
+Per-package test totals behind the 238: `@researk/cli` 127 in 11 files (now 136; see the
+verification pass above), `@researk/latex-renderer` 76
 in 3 files, `@researk/provider-openai-compatible` 12 in 1, `@researk/contracts` 10 in 1,
 `@researk/harness` 7 in 1, `@researk/provider-openrouter` 4 in 1, and `@researk/research` 2 in 1.
 `git diff --check` was run with the untracked files added as intent-to-add so they were actually
 inspected; the index was restored afterward.
+
+Distribution was re-verified because the TUI adds runtime dependencies: `npm run pack:standalone`
+resolved a conflict-free closure including `ink@7.1.1`, `react@19.2.8`, `yoga-layout`, and the
+existing
+renderer packages, and `scripts/smoke-standalone-cli.mjs` installed the resulting tarball into an
+empty global prefix and ran `help` and `version` successfully from an unrelated working directory.
+
+## Completed milestone: argument-less `researk` is a full-screen alternate-screen TUI
+
+The readline REPL is deleted. `packages/cli/src/repl.ts` is gone and an argument-less TTY invocation
+now mounts an Ink application that owns the alternate screen for the whole session. One-shot
+commands are untouched: `chat`, `models`, `doctor`, `help`, `version`, `--raw`, `--json`, and the
+non-TTY guard all keep their previous behavior and exit codes, and the existing one-shot Markdown
+and iTerm2 math renderers are still used by those paths.
+
+Ink 7.1.1 and React 19.2.8 were selected, both pinned exactly to match the repository's dependency
+convention. The package builds TSX through the existing TypeScript project
+references with `"jsx": "react-jsx"` scoped to `@researk/cli`, so no bundler was introduced.
+
+The presentation boundary in ADR 0002 is preserved. No component performs provider I/O; every
+execution path goes through the Harness controller, and provider adapters stay behind it. The TUI
+holds one typed state tree reduced by pure transitions, covering connection, catalog, selected
+model, variant, theme, messages with canonical source, overlay, composer, streaming status,
+workspace and staged documents, and errors.
+
+Variant is provider-driven. Available reasoning intents are derived from the selected
+`ModelDescriptor` capabilities rather than a hardcoded per-provider table, so a model exposing no
+reasoning support yields only the neutral intent and `/variant` reflects that.
+
+Safety carried over intact rather than being reimplemented. `StreamingSecretRedactor` still runs
+first on streamed text so a credential split across chunk boundaries cannot be reconstructed, and
+its retained-prefix state is per-run. Everything reaching Ink is neutralized first: assistant text,
+provider catalog metadata, diagnostics, and error text, so no active `ESC`, `BEL`, or C0 byte can
+reach the terminal through a component. Entered API keys stay in an ephemeral in-memory credential
+map, are masked in the form, and are never written to state that renders, to history, or to disk.
+Workspace boundary checks and bounded staged-document behavior are reused from the existing helpers,
+and history and message sizes remain bounded.
+
+Conversation rendering classifies normal Markdown, fenced code, citations, inline math, display
+math, and tool/research output. Canonical source is stored unchanged and display math is visually
+separated as exact source; no terminal graphics protocol is emitted inside the Ink layout, which
+would corrupt the retained frame. This is the source-oriented view ADR 0006 explicitly permits, and
+`/source` reveals the exact retained canonical text.
+
+`/provider` offers only the two adapters the CLI actually implements, OpenRouter and
+OpenAI-compatible. It is a keyboard picker followed by an in-TUI form with Tab/Shift+Tab field
+movement, a default OpenRouter base URL, a required base URL for the compatible adapter, and a
+masked key field. `/model` is a searchable list over the live catalog, `/themes` applies a semantic
+palette immediately, and `/help`, `/clear`, `/exit`, and `/read` complete the set. Themes are
+consumed only as semantic tokens (background, foreground, muted, border, accent, success, warning,
+error, userMessage, assistantMessage, toolMessage); components carry no scattered raw colors.
+
+Ctrl+C cancels an active run through the existing abort path and keeps the app mounted; pressing it
+while idle exits cleanly. Streaming updates the assistant message in place, and the view follows the
+stream unless the user scrolls with PageUp/PageDown.
+
+Terminal restoration was proven against the real built binary, not only in tests, because
+alternate-screen and raw-mode lifecycle is not observable through `ink-testing-library`. Driving
+`dist/tui.js` with a fake TTY confirmed `\u001b[?1049h` on mount and `\u001b[?1049l` on exit, and a
+second run confirmed idle Ctrl+C exits 0 and still leaves the alternate screen.
+
+Test coverage replaced the obsolete REPL tests with `tui-state`, `tui-controller`, `tui-app`, and
+`tui-provider-integration` suites: slash routing and discovery, provider form semantics, searchable
+model selection, provider-derived variants, theme token application, streaming chunk updates with
+canonical LaTeX retention, errors surfaced in state and UI, Ctrl+C cancel versus idle exit,
+scrolling, alternate-screen lifecycle, and credential non-leakage. Snapshot-only assertions were
+avoided in favor of behavioral ones.
+
+Two stale artifacts were also corrected: the now-dead `REPL_HELP` constant was removed from
+`packages/cli/src/help.ts`, since it documented commands that no longer exist, and the top-level
+help text no longer describes the argument-less mode as a line-oriented interactive CLI.
 
 ## Completed milestone: trusted renderer output is no longer double-escaped
 
@@ -127,8 +401,9 @@ unreferenced, referenced only while a job is actually in flight, and unreference
 the slot goes idle, so an in-flight render still cannot be dropped by process exit. Initialization
 and per-job timers are unreferenced as well, and an unobserved initialization rejection is absorbed
 so it cannot surface as an unhandled rejection that changes a one-shot exit code. The new exported
-`closeManagedLatexRenderer()` provides deterministic shutdown for long-lived hosts and is called by
-the CLI REPL at session end; it also resets the shared pool so a later render reopens it.
+`closeManagedLatexRenderer()` provides deterministic shutdown for long-lived hosts and is called at
+session end by the interactive CLI session (now the Ink TUI); it also resets the shared pool so a
+later render reopens it.
 
 Regression coverage is deliberately split. In-process tests assert that worker options carry an
 empty `execArgv` and that a slot is unreferenced while idle and referenced only for an active job.
@@ -324,9 +599,10 @@ this file.
 - `@researk/provider-openai-compatible`: model discovery, JSON and SSE chat completion, limits,
   cancellation, reasoning maps, substitution checks, and redacted errors.
 - `@researk/research`: bounded workflow and publication-profile metadata.
-- `@researk/cli`: help, version, doctor, models, chat, in-process Harness connection, TTY REPL, raw
-  and JSON output, and safe exact-source LaTeX handling. The offline fake adapter is available for
-  Harness-level tests, but the CLI does not expose a fake-provider mode.
+- `@researk/cli`: help, version, doctor, models, chat, in-process Harness connection, the Ink
+  full-screen TUI for argument-less TTY invocation, raw and JSON output, and safe exact-source LaTeX
+  handling. The offline fake adapter is available for Harness-level tests, but the CLI does not
+  expose a fake-provider mode.
 
 ## Verified review state
 
@@ -334,9 +610,9 @@ Changes from the independent review and interactive CLI/rendering work are integ
 working tree and have passed the full verification set.
 
 The CLI command parsing, `--json` and `--raw` exclusivity, exit codes, redaction, provider behavior,
-approval callback, abort forwarding, TTY REPL, guided selection, and exact-source output paths are
-covered by the current passing tests. Ephemeral guided credentials are masked, remain memory-only,
-and are included in output/error redaction.
+approval callback, abort forwarding, the interactive TTY session, guided selection, and exact-source
+output paths are covered by the current passing tests. Ephemeral guided credentials are masked,
+remain memory-only, and are included in output/error redaction.
 
 The provider review changes for Harness timeout-versus-cancellation behavior, stop handling, and the
 following provider security boundaries are present and covered by the passing workspace suite:
@@ -354,9 +630,15 @@ No review agents remain active after this handoff.
 ## Current limitations
 
 - No installable GitHub Release or native package exists. The CLI runs from the built workspace.
-- Only the generic OpenAI-compatible adapter is exposed through the CLI, and native provider
-  support is not verified. An offline fake adapter exists for Harness-level tests only; the CLI
-  does not support `RESEARK_FAKE_PROVIDER` or `fake:paper` smoke runs.
+- Version metadata is inconsistent with the tags. Tag `v0.1.0-alpha.2` exists, but the root and all
+  workspace manifests are still `0.1.0-alpha.1`, so `researk version` reports `0.1.0-alpha.1`. This
+  was found during verification and deliberately left unchanged, because correcting it is a release
+  decision rather than a gate failure. Resolve it before the next release, and note that
+  `npm run release:verify-version` is the check that should be reconciled with the intended version.
+- Only the OpenRouter and generic OpenAI-compatible adapters are exposed through the CLI and the
+  TUI `/provider` picker. Native OpenAI and Anthropic adapters do not exist and are deliberately not
+  offered in the picker. An offline fake adapter exists for Harness-level tests only; the CLI does
+  not support `RESEARK_FAKE_PROVIDER` or `fake:paper` smoke runs.
 - Model catalogs have no persistent last-known cache or offline freshness behavior.
 - Credentials use an environment-variable reference. Operating-system credential storage is not
   implemented.
@@ -373,11 +655,29 @@ No review agents remain active after this handoff.
   unsupported as well. Full-document TeX compilation, external renderer executables, and arbitrary
   TeX packages remain out of scope.
 - Scholarly web tools and isolated paper-reproduction execution are not implemented.
+- The TUI conversation view is source-oriented. Display math is shown as separated exact LaTeX rather
+  than as an inline image, because emitting a terminal graphics protocol inside a retained Ink frame
+  corrupts the layout. The iTerm2 graphics path remains available in the one-shot `chat` renderer.
+- TUI verification uses `ink-testing-library` for components and controllers plus fake-TTY runs
+  against the built binary for alternate-screen and Ctrl+C lifecycle. There is no real-terminal
+  end-to-end harness, so terminal-specific key encodings beyond those covered by the input tests are
+  not exercised automatically.
 
 ## Exact next task
 
-Proceed to the versioned model-catalog cache and CLI capability filters. Preserve the verified TTY,
-credential-redaction, and exact-source output boundaries. Before completing the next milestone, run:
+The full-screen TUI milestone, the four reviewed TUI fixes, and the carriage-return display fix are
+all complete, and the tree is green under the full gate set; nothing from them is left unfinished.
+Proceed to the versioned model-catalog cache and CLI capability filters. The TUI already has the
+natural seams for it: `TuiController.refreshCatalog` is the single catalog entry point and
+`catalogLoading` / `catalog` already exist in the state tree, so a cache belongs behind the
+controller rather than in a component.
+
+Preserve the verified boundaries when doing so: the Harness stays the execution authority, no
+component performs provider I/O, streamed text keeps passing through `StreamingSecretRedactor`
+before neutralization, everything rendered stays terminal-neutralized, entered credentials stay
+ephemeral, and canonical assistant source stays byte-exact.
+
+Before completing the next milestone, run:
 
 ```text
 npm install
@@ -401,10 +701,15 @@ state at the top of this file.
 The verified CLI smoke commands are `help`, `version`, `doctor --json`, and the non-TTY guard
 invoked with empty standard input. `models` and `chat` require a configured, reachable
 OpenAI-compatible provider and a real model; `RESEARK_FAKE_PROVIDER` and `fake:paper` are not
-supported by the current CLI and must not be used as smoke commands.
+supported by the current CLI and must not be used as smoke commands. The argument-less TUI cannot be
+smoke-tested by piping, because it correctly refuses to start without a TTY; drive `dist/tui.js`
+with a fake TTY stream pair instead, as was done to verify alternate-screen entry and restoration.
 
-Record the final test and file counts only after these commands pass. Only after the complete tree
-is green should work proceed to the versioned model-catalog cache and CLI capability filters.
+If the TUI runtime dependencies change, re-run `npm run pack:standalone` and
+`scripts/smoke-standalone-cli.mjs`, because the standalone packer rejects a runtime closure that
+resolves two versions of the same package.
+
+Record the final test and file counts only after these commands pass.
 
 ## Decisions in force
 

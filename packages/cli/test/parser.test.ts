@@ -11,7 +11,11 @@ import {
   renderExactSource,
   renderTerminalPresentation,
 } from "../src/rendering/renderer.js";
-import { escapeUnsafeTerminalControls, hasTerminalEscape } from "../src/safety.js";
+import {
+  escapeUnsafeTerminalControls,
+  hasTerminalEscape,
+  neutralizeCarriageReturnsForDisplay,
+} from "../src/safety.js";
 import { createTheme } from "../src/theme.js";
 
 function parseBytes(chunks: readonly Uint8Array[]): readonly MarkdownRenderEvent[] {
@@ -128,5 +132,24 @@ describe("terminal control safety", () => {
     const escaped = escapeUnsafeTerminalControls(unsafe);
     expect(hasTerminalEscape(escaped)).toBe(false);
     expect(escaped).toBe("safe\\u{001b}]0;owned\\u{0007}\nnext\tcell");
+  });
+
+  it("keeps carriage returns for the one-shot parser but neutralizes them for display", () => {
+    const spoof = "SAFE-PREFIX\rSPOOFED";
+
+    // The shared escape must preserve U+000D: the one-shot path feeds its output to the
+    // incremental parser, which relies on a trailing `\r` to normalize CRLF fenced-block lines.
+    expect(escapeUnsafeTerminalControls(spoof)).toBe(spoof);
+
+    // The display projection removes the cursor motion, so the prefix cannot be overwritten.
+    const shown = neutralizeCarriageReturnsForDisplay(escapeUnsafeTerminalControls(spoof));
+    expect(shown).toBe("SAFE-PREFIX\\u{000d}SPOOFED");
+    expect(shown).not.toContain("\r");
+  });
+
+  it("treats a CRLF as a line ending rather than a cursor move when projecting for display", () => {
+    // Collapsing to `\n` matches what a terminal already shows and keeps line structure intact,
+    // while tabs survive as layout.
+    expect(neutralizeCarriageReturnsForDisplay("a\r\nb\tc\rd")).toBe("a\nb\tc\\u{000d}d");
   });
 });

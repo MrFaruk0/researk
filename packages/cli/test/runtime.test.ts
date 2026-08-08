@@ -1,11 +1,8 @@
 import { once } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { PassThrough, Readable, Writable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import { type RunEvent, RunEventSchema } from "@researk/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { executeChat, runCli } from "../src/run.js";
 import { createTheme } from "../src/theme.js";
 import type { CliIo } from "../src/types.js";
@@ -30,14 +27,6 @@ function textHarness(runId: string, deltas: readonly string[]) {
     },
   };
 }
-
-const cleanupPaths: string[] = [];
-
-afterEach(async () => {
-  await Promise.all(
-    cleanupPaths.splice(0).map((value) => rm(value, { recursive: true, force: true })),
-  );
-});
 
 function captureIo(
   input = "",
@@ -78,102 +67,6 @@ function captureIo(
     stdout: () => stdout,
     stderr: () => stderr,
     interrupt: () => interruptHandler?.(),
-  };
-}
-
-/**
- * Supplies one command only after readline has rendered the next prompt. This keeps the
- * interaction realistic when a command (such as /provider) performs asynchronous I/O.
- * It deliberately runs readline in non-terminal mode: terminal cursor control belongs to
- * Node's readline UI, not to the application output being asserted here.
- */
-function captureScriptedReplIo(commands: readonly string[]): Readonly<{
-  io: CliIo;
-  stdout: () => string;
-  stderr: () => string;
-}> {
-  let stdout = "";
-  let stderr = "";
-  let nextCommand = 0;
-  const input = new PassThrough();
-  const deliverNextCommand = () => {
-    const command = commands[nextCommand++];
-    if (command === undefined) return;
-    queueMicrotask(() => input.write(`${command}\n`));
-  };
-  const output = (append: (value: string) => void, isPromptOutput = false) =>
-    new Writable({
-      write(chunk, _encoding, callback) {
-        const value = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-        append(value);
-        if (isPromptOutput && value.includes("researk > ")) deliverNextCommand();
-        callback();
-      },
-    });
-  return {
-    io: {
-      stdin: input,
-      stdout: Object.assign(
-        output((value) => {
-          stdout += value;
-        }, true),
-        { isTTY: false },
-      ),
-      stderr: output((value) => {
-        stderr += value;
-      }),
-      isTTY: true,
-    },
-    stdout: () => stdout,
-    stderr: () => stderr,
-  };
-}
-
-function captureGuidedReplIo(
-  steps: readonly Readonly<{ expect: string; input: readonly string[] }>[],
-  stdoutIsTTY = false,
-): Readonly<{ io: CliIo; stdout: () => string; stderr: () => string }> {
-  let stdout = "";
-  let stderr = "";
-  let nextStep = 0;
-  let inspectedThrough = 0;
-  const input = new PassThrough() as PassThrough & { setRawMode?: (enabled: boolean) => void };
-  input.setRawMode = () => undefined;
-  const advance = () => {
-    const step = steps[nextStep];
-    if (step === undefined) return;
-    const match = stdout.indexOf(step.expect, inspectedThrough);
-    if (match < 0) return;
-    inspectedThrough = match + step.expect.length;
-    nextStep++;
-    queueMicrotask(() => {
-      for (const chunk of step.input) input.write(chunk);
-    });
-  };
-  const output = (append: (value: string) => void, advances = false) =>
-    new Writable({
-      write(chunk, _encoding, callback) {
-        append(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
-        if (advances) advance();
-        callback();
-      },
-    });
-  return {
-    io: {
-      stdin: input,
-      stdout: Object.assign(
-        output((value) => {
-          stdout += value;
-        }, true),
-        { isTTY: stdoutIsTTY },
-      ),
-      stderr: output((value) => {
-        stderr += value;
-      }),
-      isTTY: true,
-    },
-    stdout: () => stdout,
-    stderr: () => stderr,
   };
 }
 
@@ -695,158 +588,6 @@ describe("CLI actual provider path", () => {
     }
   });
 
-  it("uses the workspace REPL only after an explicit document read and prompt", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "researk-repl-"));
-    cleanupPaths.push(root);
-    await writeFile(path.join(root, "paper.tex"), "\\section{Methods}\\n$E=mc^2$", "utf8");
-    const provider = await startProvider({ output: "A safe answer\u001b]0;unsafe\u0007" });
-    try {
-      const capture = captureScriptedReplIo([
-        `/provider compatible compatible ${provider.baseUrl} TEST_KEY`,
-        "/read paper.tex",
-        "/model compatible:science",
-        "/reasoning high",
-        "/status",
-        "Explain the formula",
-        "/exit",
-      ]);
-      const code = await runCli([], {
-        io: capture.io,
-        env: { TEST_KEY: "test-secret", NO_COLOR: "1" },
-        cwd: root,
-        createRunId: () => "run-repl",
-      });
-
-      expect(code).toBe(0);
-      expect(capture.stdout()).toContain("Workspace:");
-      expect(capture.stdout()).toContain("Staged paper.tex");
-      expect(capture.stdout()).toContain("catalog:");
-      expect(capture.stdout()).not.toContain("\u001b");
-      expect(capture.stderr()).toContain(
-        "[external] Sending your prompt and 1 staged workspace document",
-      );
-      expect(capture.stderr()).toContain("Unsupported reasoning intent");
-      expect(capture.stderr()).not.toContain("\u001b");
-      expect(provider.chatRequests).toHaveLength(1);
-      expect(provider.chatRequests[0]).toMatchObject({
-        messages: [
-          {
-            role: "user",
-            content: expect.stringContaining("BEGIN UNTRUSTED WORKSPACE DOCUMENT: paper.tex"),
-          },
-        ],
-      });
-      const request = provider.chatRequests[0] as { messages: Array<{ content: string }> };
-      expect(request.messages.at(-1)?.content).toContain("\\section{Methods}");
-      expect(request.messages.at(-1)?.content).toContain("Explain the formula");
-    } finally {
-      await provider.close();
-    }
-  });
-
-  it("reveals the latest assistant response as exact source with /source", async () => {
-    const source = String.raw`Answer: \[E = mc^2\]`;
-    const provider = await startProvider({ output: source });
-    try {
-      const capture = captureGuidedReplIo(
-        [
-          {
-            expect: "researk > ",
-            input: [`/provider compatible compatible ${provider.baseUrl} TEST_KEY\n`],
-          },
-          { expect: "researk > ", input: ["/model compatible:science\n"] },
-          { expect: "researk > ", input: ["Show the result\n"] },
-          {
-            expect: "\u001b]1337;File=inline=1;preserveAspectRatio=1:",
-            input: ["/source\n"],
-          },
-          { expect: source, input: ["/exit\n"] },
-        ],
-        true,
-      );
-      const code = await runCli([], {
-        io: capture.io,
-        env: {
-          TEST_KEY: "test-secret",
-          NO_COLOR: "1",
-          TERM_PROGRAM: "iTerm.app",
-          TERM_PROGRAM_VERSION: "3.5.14",
-        },
-        createRunId: () => "run-repl-source",
-      });
-
-      expect(code).toBe(0);
-      expect(capture.stdout().split(source)).toHaveLength(2);
-      expect(capture.stdout()).toContain("\u001b]1337;File=inline=1;preserveAspectRatio=1:");
-      expect(capture.stderr()).toContain("[external] Sending your prompt");
-      expect(provider.chatRequests).toHaveLength(1);
-    } finally {
-      await provider.close();
-    }
-  });
-
-  it("keeps argument-less REPL theme changes plain in accessible mode", async () => {
-    const capture = captureGuidedReplIo([
-      { expect: "researk > ", input: ["/theme\n"] },
-      { expect: "Theme  (", input: ["\u001b[B", "\r"] },
-      { expect: "Theme set to dark.", input: ["/exit\n"] },
-    ]);
-
-    const code = await runCli(["--accessible"], {
-      io: capture.io,
-      env: {},
-    });
-
-    expect(code).toBe(0);
-    const stdout = capture.stdout();
-    const themeChange = stdout.indexOf("Theme set to dark.");
-    expect(themeChange).toBeGreaterThanOrEqual(0);
-    expect(stdout.slice(themeChange)).not.toContain("\u001b");
-    expect(capture.stderr()).not.toContain("\u001b");
-  });
-
-  it("runs the guided TTY provider, masked key, model, chat, and cancellation flow", async () => {
-    const secret = "synthetic-pasted-guided-key-5da8";
-    const provider = await startProvider({ output: `Provider echoed ${secret}` });
-    try {
-      const capture = captureGuidedReplIo([
-        { expect: "researk > ", input: ["/provider\n"] },
-        { expect: "OpenAI-compatible", input: ["\u001b[", "B", "\r"] },
-        { expect: "Provider ID: ", input: ["compatible\n"] },
-        { expect: "Base URL: ", input: [`${provider.baseUrl}\n`] },
-        { expect: "OPENAI_API_KEY (masked): ", input: [secret, "\r"] },
-        { expect: "researk > ", input: ["/model\n"] },
-        { expect: "compatible:science", input: ["\r"] },
-        { expect: "researk > ", input: ["Explain the result\n"] },
-        { expect: "Provider echoed [REDACTED]", input: [] },
-        { expect: "researk > ", input: ["/provider\n"] },
-        { expect: "OpenAI-compatible", input: ["\u001b"] },
-        { expect: "researk > ", input: ["/exit\n"] },
-      ]);
-
-      const code = await runCli([], {
-        io: capture.io,
-        env: { NO_COLOR: "1" },
-        createRunId: () => "run-guided-repl",
-      });
-
-      expect(code).toBe(0);
-      expect(capture.stdout()).toContain("Connected to compatible");
-      expect(capture.stdout()).toContain("Selected compatible:science");
-      expect(capture.stdout()).toContain("Provider echoed [REDACTED]");
-      expect(capture.stdout()).toContain("Connected provider: compatible");
-      expect(capture.stdout()).not.toContain(secret);
-      expect(capture.stderr()).not.toContain(secret);
-      expect(provider.chatRequests).toHaveLength(1);
-      expect(provider.chatRequests[0]).toMatchObject({
-        model: "science",
-        messages: [{ role: "user", content: "Explain the result" }],
-      });
-    } finally {
-      await provider.close();
-    }
-  });
-
   it("emits real theme ANSI styling rather than escaped renderer output on a dark TTY", async () => {
     const capture = captureIo("", true);
     const theme = createTheme("dark", { isTTY: true, env: {} });
@@ -936,21 +677,5 @@ describe("CLI actual provider path", () => {
     expect(result.exitCode).toBe(0);
     expect(capture.stdout()).toBe("ok\\u{001b}]0;pwned\\u{0007}\\u{0001}");
     expect(capture.stdout()).not.toContain("\u001b");
-  });
-
-  it("rejects workspace traversal before any provider request", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "researk-traversal-"));
-    cleanupPaths.push(root);
-    const capture = captureScriptedReplIo(["/read ../outside.md", "/exit"]);
-
-    const code = await runCli([], {
-      io: capture.io,
-      env: { NO_COLOR: "1" },
-      cwd: root,
-    });
-
-    expect(code).toBe(0);
-    expect(capture.stderr()).toContain("Parent-directory traversal is not allowed");
-    expect(capture.stderr()).not.toContain("\u001b");
   });
 });

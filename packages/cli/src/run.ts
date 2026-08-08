@@ -66,8 +66,8 @@ export async function runCli(
       await write(io.stderr, "Error: a command is required when standard input is not a TTY.\n");
       return 2;
     }
-    const { startRepl } = await import("./repl.js");
-    return startRepl(args, dependencies, io, env);
+    const { startTui } = await import("./tui.js");
+    return startTui(args, dependencies, io, env);
   }
 
   const harnessResult = await resolveHarness(args, dependencies, env, io);

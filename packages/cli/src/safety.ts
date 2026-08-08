@@ -13,6 +13,25 @@ export function escapeUnsafeTerminalControls(value: string): string {
   return result;
 }
 
+/**
+ * Removes the cursor-repositioning power of U+000D for a terminal display projection.
+ *
+ * `escapeUnsafeTerminalControls` intentionally preserves U+000D because the one-shot rendering path
+ * feeds its output to `IncrementalMarkdownMathParser`, which strips a trailing `\r` to normalize
+ * CRLF input. A carriage return is still an active control where text is actually drawn: it returns
+ * the cursor to column zero, so untrusted text can overwrite an already-drawn line and spoof what
+ * the user sees (`SAFE-PREFIX\rSPOOFED` displays as `SPOOFED`).
+ *
+ * A `\r\n` pair is collapsed to the `\n` that already ends the line, which is what a terminal shows
+ * anyway, and a bare `\r` becomes a visible escape. Line structure is therefore unchanged and only
+ * cursor motion is removed. This is a display-only transform: it must never be applied to canonical
+ * source, and it is deliberately separate from `escapeUnsafeTerminalControls` so the one-shot parser
+ * and its CRLF handling keep seeing raw carriage returns.
+ */
+export function neutralizeCarriageReturnsForDisplay(value: string): string {
+  return value.replaceAll("\r\n", "\n").replaceAll("\r", "\\u{000d}");
+}
+
 export function hasTerminalEscape(value: string): boolean {
   return value.includes("\u001b");
 }
