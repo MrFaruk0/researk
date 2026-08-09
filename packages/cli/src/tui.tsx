@@ -14,7 +14,7 @@ import { createInitialState, type ProviderConnection } from "./tui/state.js";
  * Mounts the full-screen TUI in the terminal's alternate screen buffer.
  *
  * Ink owns entering and leaving the alternate screen, cursor visibility, and raw mode. Restoration
- * runs on normal exit, on Ctrl+C, and on an error, because `unmount` and `cleanup` are invoked from
+ * runs on normal exit and on an error, because `unmount` and `cleanup` are invoked from
  * a `finally` block that cannot be skipped.
  */
 export async function startTui(
@@ -57,7 +57,7 @@ export async function startTui(
     stdout: io.stdout as NodeJS.WriteStream,
     stdin: io.stdin as NodeJS.ReadStream,
     stderr: io.stderr as NodeJS.WriteStream,
-    // The application handles Ctrl+C itself so it can cancel a run without exiting.
+    // The application consumes Ctrl+C as a no-op and uses Ctrl+X for active-run cancellation.
     exitOnCtrlC: false,
     alternateScreen: true,
     patchConsole: true,

@@ -1,6 +1,87 @@
 # Development handoff
 
-**Last update:** 2026-08-08
+## 2026-08-09 TUI UX milestone
+
+Implemented a responsive centered shell capped at 112 columns, edge-to-edge narrow rendering,
+unique slash-command Tab completion, simplified provider forms, four additional themes, and explicit
+keyboard semantics. OpenRouter uses its built-in endpoint and `OPENROUTER_API_KEY`; the advanced
+OpenAI-compatible form uses `OPENAI_API_KEY`. Neither form exposes an environment-reference field,
+and pasted credentials remain ephemeral and masked. Ctrl+C is an application no-op, Ctrl+X cancels
+an active run, and `/exit` is the normal exit path.
+
+Tests cover 140- and 50-column layouts without overflow, completion without submission, provider
+field visibility, fixed internal credential references, theme construction, and cancellation/exit
+behavior.
+
+### Verification
+
+Focused runs first, then the full gate set, all green on Node.js `v24.14.1`:
+
+```text
+npm test --workspace @researk/cli -- tui-state.test.ts                  # passed: 32 tests
+npm test --workspace @researk/cli -- tui-app.test.tsx                   # passed: 65 tests
+npm test --workspace @researk/cli -- tui-provider-integration.test.tsx  # passed: 5 tests
+npm test --workspace @researk/cli -- tui-controller.test.ts theme.test.ts # passed: 27 tests
+npm test --workspace @researk/cli                                       # passed: 191 in 11 files
+npm run clean                                                           # passed: 7 workspace packages
+npm run build                                                           # passed: 7 workspace packages
+npm run typecheck                                                       # passed: 7 workspace packages
+npm test                                                                # passed: 323 in 19 files
+npm run lint                                                            # passed: 101 files
+npm run format-check                                                    # passed: 101 files
+git diff --check                                                        # passed: no whitespace errors
+node packages/cli/dist/bin.js help                                      # passed: exit 0
+node packages/cli/dist/bin.js version                                   # passed: exit 0
+node packages/cli/dist/bin.js doctor --json                             # passed: exit 0, telemetry false
+"" | node packages/cli/dist/bin.js                                      # passed: exit 2, non-TTY guard
+```
+
+Per-package totals behind the 323: `@researk/cli` 191 in 11 files (was 180), `@researk/latex-renderer`
+97 in 3, `@researk/provider-openai-compatible` 12, `@researk/contracts` 10, `@researk/harness` 7,
+`@researk/provider-openrouter` 4, and `@researk/research` 2. The CLI count rose by 11 because this
+milestone adds completion, layout, and key-binding coverage.
+
+The real Ink lifecycle was also driven through `startTui` with a TTY-shaped stream pair against the
+built `dist`: the alternate screen entered on mount, an idle Ctrl+C kept the app mounted without
+inserting a `c`, an idle Ctrl+X was also a no-op, `/pro`+Tab produced `/provider` and Enter opened
+the provider picker rather than submitting, `/exit` exited with code 0, the alternate screen was
+restored, and stderr stayed empty.
+
+### Files changed
+
+- `packages/cli/src/tui/commands.ts` — `completeSlashCommand` for unambiguous Tab completion
+- `packages/cli/src/tui/App.tsx` — Tab handler, Ctrl+C/Ctrl+X semantics, `terminalWidth`/`terminalHeight`
+  test seams, centered 112-column layout
+- `packages/cli/src/tui/components/Composer.tsx` — placeholder documents Ctrl+X
+- `packages/cli/src/tui/components/Footer.tsx` — persistent footer documents Ctrl+X and `/exit`
+- `packages/cli/src/tui/components/Conversation.tsx` — empty-state vertical centering
+- `packages/cli/src/tui/overlays/InfoOverlays.tsx` — help overlay key bindings
+- `packages/cli/src/tui/overlays/ProviderOverlay.tsx` — simplified forms; removed the
+  environment-reference field
+- `packages/cli/src/tui/controller.ts` — fixed internal references (`OPENROUTER_API_KEY`,
+  `OPENAI_API_KEY`) and OpenRouter default base URL
+- `packages/cli/src/tui/theme.ts` — four additional semantic themes (nord, dracula, solarized-dark,
+  gruvbox)
+- `packages/cli/src/theme.ts` — extended one-shot theme names and palettes
+- `packages/cli/src/tui.tsx` — comment and `exitOnCtrlC: false` intent
+- `packages/cli/test/tui-state.test.ts` — completion unit tests
+- `packages/cli/test/tui-app.test.tsx` — completion, layout, cancellation/exit, and provider form
+  tests
+- `packages/cli/test/tui-controller.test.ts` — connection reference tests
+- `packages/cli/test/tui-provider-integration.test.tsx` — pasted-key integration tests
+- `packages/cli/test/theme.test.ts` — extended theme construction
+- `docs/HANDOFF.md`
+
+### Intentional limitation: OpenAI-compatible URLs
+
+There is no universal default endpoint for an OpenAI-compatible provider. The normal `/provider`
+flow keeps the explicit Base URL field on the advanced OpenAI-compatible form (Provider ID + Base
+URL + masked key) because omitting it would pretend an impossible default exists. The form itself
+carries the disclosure line, and `validateProviderEndpoint` still enforces HTTPS-or-loopback and
+rejects credentials, query strings, and fragments in that URL. OpenRouter is the only choice with a
+built-in default endpoint, and its form exposes only the masked key field.
+
+**Last update:** 2026-08-09
 
 ## Current milestone: macOS TUI provider-integration timeouts fixed as a budget problem, not a hang
 

@@ -76,6 +76,31 @@ export function discoverSlashCommands(input: string): readonly SlashCommand[] {
   return SLASH_COMMANDS.filter((command) => command.name.startsWith(lowered));
 }
 
+/**
+ * Completes only an unambiguous command prefix; Tab never submits the composer.
+ *
+ * The result reports the matched command so the caller (and tests) can confirm exactly which command
+ * a completion expanded to. When zero or multiple commands match the prefix, the input is returned
+ * unchanged and no `command` is reported, so Tab is a no-op and the discovery list stays the only
+ * guidance.
+ */
+export function completeSlashCommand(
+  input: string,
+  cursor: number,
+): Readonly<{ value: string; cursor: number; command?: SlashCommand }> {
+  const safeCursor = Math.min(Math.max(cursor, 0), input.length);
+  const beforeCursor = input.slice(0, safeCursor);
+  if (!beforeCursor.startsWith("/") || /\s/u.test(beforeCursor)) {
+    return { value: input, cursor: safeCursor };
+  }
+  const matches = discoverSlashCommands(beforeCursor);
+  if (matches.length !== 1) return { value: input, cursor: safeCursor };
+  const command = matches[0];
+  if (command === undefined) return { value: input, cursor: safeCursor };
+  const value = command.name + input.slice(safeCursor);
+  return { value, cursor: command.name.length, command };
+}
+
 export interface ParsedSlashCommand {
   readonly name: string;
   readonly argument: string;

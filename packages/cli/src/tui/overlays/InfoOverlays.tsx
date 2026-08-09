@@ -12,7 +12,7 @@ const KEY_BINDINGS: readonly (readonly [string, string])[] = Object.freeze([
   ["PageUp / PageDown", "scroll conversation, or page source"],
   ["Tab / Shift+Tab", "move between form fields"],
   ["Esc", "close overlay"],
-  ["Ctrl+C", "cancel a run, or exit when idle"],
+  ["Ctrl+X", "cancel an active run"],
   ["Ctrl+L", "clear conversation"],
 ]);
 

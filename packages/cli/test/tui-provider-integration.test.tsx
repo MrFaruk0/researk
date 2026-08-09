@@ -179,7 +179,7 @@ async function mount(
 async function connect(
   app: Awaited<ReturnType<typeof mount>>,
   baseUrl: string,
-  key: Readonly<{ envReference?: string; secret?: string }> = {},
+  key: Readonly<{ secret?: string }> = {},
 ): Promise<void> {
   await app.type("/provider");
   await app.type(KEYS.enter);
@@ -189,17 +189,7 @@ async function connect(
   await app.type(KEYS.tab);
   await app.type(baseUrl);
   await app.type(KEYS.tab);
-  if (key.envReference !== undefined) {
-    // The reference field is prefilled with OPENAI_API_KEY, so clear it before typing. Each
-    // backspace must be written separately: Ink delivers one stdin write as a single `input`
-    // string, so a batched burst would be handled as one keypress and delete one character.
-    for (let index = 0; index < "OPENAI_API_KEY".length; index += 1) {
-      await app.type(KEYS.backspace);
-    }
-    await app.type(key.envReference);
-  }
   if (key.secret !== undefined) {
-    await app.type(KEYS.tab);
     await app.type(key.secret);
   }
   await app.type(KEYS.enter);
@@ -229,9 +219,9 @@ describe("TUI over the actual provider path", () => {
       try {
         app = await mount({
           files: { "paper.tex": "\\section{Methods}\n$E=mc^2$" },
-          env: { TEST_KEY: "test-secret" },
+          env: { OPENAI_API_KEY: "test-secret" },
         });
-        await connect(app, provider.baseUrl, { envReference: "TEST_KEY" });
+        await connect(app, provider.baseUrl);
         await selectFirstModel(app);
         await app.type("/read paper.tex");
         await app.type(KEYS.enter);
@@ -266,8 +256,8 @@ describe("TUI over the actual provider path", () => {
       const provider = await startProvider({ output: "Streamed provider answer" });
       let app: Awaited<ReturnType<typeof mount>> | undefined;
       try {
-        app = await mount({ env: { TEST_KEY: "test-secret" } });
-        await connect(app, provider.baseUrl, { envReference: "TEST_KEY" });
+        app = await mount({ env: { OPENAI_API_KEY: "test-secret" } });
+        await connect(app, provider.baseUrl);
         await selectFirstModel(app);
         await app.type("Explain");
         await app.type(KEYS.enter);
@@ -291,8 +281,8 @@ describe("TUI over the actual provider path", () => {
       const provider = await startProvider({ output: source });
       let app: Awaited<ReturnType<typeof mount>> | undefined;
       try {
-        app = await mount({ env: { TEST_KEY: "test-secret" } });
-        await connect(app, provider.baseUrl, { envReference: "TEST_KEY" });
+        app = await mount({ env: { OPENAI_API_KEY: "test-secret" } });
+        await connect(app, provider.baseUrl);
         await selectFirstModel(app);
         await app.type("Show the result");
         await app.type(KEYS.enter);
@@ -323,7 +313,6 @@ describe("TUI over the actual provider path", () => {
       try {
         app = await mount();
         await connect(app, provider.baseUrl, {
-          envReference: "OPENAI_API_KEY",
           secret,
         });
         await selectFirstModel(app);
@@ -352,8 +341,8 @@ describe("TUI over the actual provider path", () => {
       const provider = await startProvider();
       let app: Awaited<ReturnType<typeof mount>> | undefined;
       try {
-        app = await mount({ env: { TEST_KEY: "test-secret" } });
-        await connect(app, provider.baseUrl, { envReference: "TEST_KEY" });
+        app = await mount({ env: { OPENAI_API_KEY: "test-secret" } });
+        await connect(app, provider.baseUrl);
         await app.type("/read ../outside.md");
         await app.type(KEYS.enter);
         // Rejection happens in the same async staging path, so wait for the error to be rendered.

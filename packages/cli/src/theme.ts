@@ -1,4 +1,14 @@
-export const THEME_NAMES = ["system", "dark", "light", "high-contrast", "mono"] as const;
+export const THEME_NAMES = [
+  "system",
+  "dark",
+  "light",
+  "high-contrast",
+  "mono",
+  "nord",
+  "dracula",
+  "solarized-dark",
+  "gruvbox",
+] as const;
 
 export type ThemeName = (typeof THEME_NAMES)[number];
 
@@ -93,5 +103,37 @@ const PALETTES: Readonly<
     error: "37;1",
     math: "37",
     code: "37;2",
+  }),
+  nord: Object.freeze({
+    accent: "38;5;110;1",
+    muted: "38;5;109",
+    heading: "38;5;255;1",
+    error: "38;5;174;1",
+    math: "38;5;110",
+    code: "38;5;221",
+  }),
+  dracula: Object.freeze({
+    accent: "38;5;141;1",
+    muted: "38;5;61",
+    heading: "38;5;231;1",
+    error: "38;5;203;1",
+    math: "38;5;212",
+    code: "38;5;228",
+  }),
+  "solarized-dark": Object.freeze({
+    accent: "38;5;37;1",
+    muted: "38;5;244",
+    heading: "38;5;230;1",
+    error: "38;5;166;1",
+    math: "38;5;37",
+    code: "38;5;136",
+  }),
+  gruvbox: Object.freeze({
+    accent: "38;5;108;1",
+    muted: "38;5;245",
+    heading: "38;5;223;1",
+    error: "38;5;167;1",
+    math: "38;5;142",
+    code: "38;5;214",
   }),
 });

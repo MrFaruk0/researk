@@ -7,7 +7,7 @@ import {
   RunRequestSchema,
   splitCanonicalModelId,
 } from "@researk/contracts";
-import { parseModelIdentity, validateEnvironmentReference } from "../args.js";
+import { parseModelIdentity } from "../args.js";
 import {
   configuredSecretValues,
   safeErrorMessage,
@@ -134,17 +134,15 @@ export class TuiController {
       apiKeyEnvironmentVariable: string;
     }>,
   ): ProviderConnection {
-    const reference = validateEnvironmentReference(input.apiKeyEnvironmentVariable.trim());
     if (input.kind === "openrouter") {
-      const baseUrl = input.baseUrl.trim();
-      if (baseUrl.length > 0) validateProviderEndpoint(baseUrl);
       return {
         providerId: "openrouter",
-        ...(baseUrl.length === 0 ? {} : { baseUrl }),
-        apiKeyEnvironmentVariable: reference,
+        baseUrl: OPENROUTER_DEFAULT_BASE_URL,
+        apiKeyEnvironmentVariable: "OPENROUTER_API_KEY",
         kind: "openrouter",
       };
     }
+    const reference = "OPENAI_API_KEY";
     const providerId = ProviderIdSchema.parse(input.providerId.trim());
     if (providerId === "openrouter") {
       throw new Error("Use the OpenRouter profile for the openrouter provider identity.");

@@ -25,6 +25,7 @@ const KEYS = {
   left: "\u001b[D",
   right: "\u001b[C",
   ctrlC: "\u0003",
+  ctrlX: "\u0018",
   ctrlJ: "\n",
   backspace: "\u007f",
 };
@@ -78,6 +79,7 @@ async function mount(
     catalog?: readonly ModelDescriptor[];
     files?: Record<string, string>;
     onExit?: () => void;
+    terminalWidth?: number;
   }> = {},
 ) {
   const workspace = await makeWorkspace(options.files ?? {});
@@ -107,6 +109,7 @@ async function mount(
         variant: "auto",
       }),
       onExit: options.onExit ?? (() => {}),
+      ...(options.terminalWidth === undefined ? {} : { terminalWidth: options.terminalWidth }),
     }),
   );
 
@@ -166,6 +169,20 @@ describe("TUI shell", () => {
     app.unmount();
   });
 
+  it("centers a bounded shell at 140 columns and uses all 50 columns when narrow", async () => {
+    const wide = await mount({ terminalWidth: 140 });
+    const wideLines = (wide.lastFrame() ?? "").split("\n").filter((line) => line.trim().length > 0);
+    expect(Math.max(...wideLines.map((line) => line.length))).toBeLessThanOrEqual(140);
+    expect(wideLines.some((line) => line.includes("Researk") && line.startsWith(" "))).toBe(true);
+    wide.unmount();
+
+    const narrow = await mount({ terminalWidth: 50 });
+    const narrowLines = (narrow.lastFrame() ?? "").split("\n");
+    expect(Math.max(...narrowLines.map((line) => line.length))).toBeLessThanOrEqual(50);
+    expect(narrowLines.some((line) => line.startsWith(" Researk"))).toBe(true);
+    narrow.unmount();
+  });
+
   it("lists slash commands while typing a slash and filters by prefix", async () => {
     const app = await mount();
     await app.type("/");
@@ -180,13 +197,32 @@ describe("TUI shell", () => {
     app.unmount();
   });
 
+  it("completes a unique slash-command prefix with Tab without submitting", async () => {
+    const app = await mount();
+    await app.type("/pro");
+    await app.type(KEYS.tab);
+    const frame = app.lastFrame() ?? "";
+    expect(frame).toContain("/provider\u2588");
+    expect(frame).not.toMatch(/Connect a provider/u);
+    app.unmount();
+  });
+
+  it("leaves an ambiguous command prefix deterministic and unsubmitted on Tab", async () => {
+    const app = await mount();
+    await app.type("/");
+    await app.type(KEYS.tab);
+    expect(app.lastFrame() ?? "").toContain("/\u2588");
+    expect(app.lastFrame() ?? "").not.toMatch(/Connect a provider/u);
+    app.unmount();
+  });
+
   it("opens the help overlay and documents the newline binding", async () => {
     const app = await mount();
     await app.type("/help");
     await app.type(KEYS.enter);
     const frame = app.lastFrame() ?? "";
     expect(frame).toMatch(/Ctrl\+J/u);
-    expect(frame).toMatch(/Ctrl\+C/u);
+    expect(frame).toMatch(/Ctrl\+X/u);
     expect(frame).toMatch(/PageUp/iu);
     app.unmount();
   });
@@ -227,8 +263,7 @@ describe("TUI provider configuration", () => {
     await app.type("/provider");
     await app.type(KEYS.enter);
     await app.type(KEYS.enter);
-    // OpenRouter fields are base URL, environment reference, then the secret key.
-    await app.type(KEYS.tab);
+    // OpenRouter exposes only the ephemeral secret field.
     await app.type(KEYS.tab);
     await app.type("supersecretvalue");
     const frame = app.lastFrame() ?? "";
@@ -237,17 +272,16 @@ describe("TUI provider configuration", () => {
     app.unmount();
   });
 
-  it("prefills the OpenRouter default base URL and moves focus with Tab and Shift+Tab", async () => {
+  it("shows the OpenRouter default endpoint disclosure and only one key field", async () => {
     const app = await mount();
     await app.type("/provider");
     await app.type(KEYS.enter);
     await app.type(KEYS.enter);
     expect(app.lastFrame() ?? "").toContain("openrouter.ai");
-    await app.type(KEYS.tab);
-    await app.type("XX");
-    await app.type(KEYS.shiftTab);
-    await app.type(KEYS.backspace);
-    expect(app.lastFrame() ?? "").toContain("XX");
+    const frame = app.lastFrame() ?? "";
+    expect(frame).toContain("API key (this session only)");
+    expect(frame).not.toContain("Base URL");
+    expect(frame).not.toContain("environment reference");
     app.unmount();
   });
 
@@ -294,7 +328,6 @@ describe("TUI provider configuration", () => {
     await app.type("local");
     await app.type(KEYS.tab);
     await app.type("https://example.test/v1/");
-    await app.type(KEYS.tab);
     await app.type(KEYS.tab);
     await app.type("literal-secret-value");
     await app.type(KEYS.enter);
@@ -372,12 +405,12 @@ describe("TUI model, variant and theme overlays", () => {
     await app.type(KEYS.enter);
     const list = app.lastFrame() ?? "";
     expect(list).toMatch(/Theme/u);
-    for (const name of ["system", "dark", "light", "high-contrast", "mono"]) {
+    for (const name of ["system", "dark", "high-contrast", "mono"]) {
       expect(list).toContain(name);
     }
     // Moving the selection applies the theme immediately, so the marker follows the cursor.
     await app.type(KEYS.down);
-    expect(app.lastFrame() ?? "").toMatch(/light\s+applied/u);
+    expect(app.lastFrame() ?? "").toMatch(/high-contrast/u);
     await app.type(KEYS.enter);
     expect(app.lastFrame() ?? "").not.toMatch(/Up\/Down preview/u);
     app.unmount();
@@ -449,7 +482,7 @@ describe("TUI conversation, streaming and cancellation", () => {
     app.unmount();
   });
 
-  it("cancels an active run with Ctrl+C and stays mounted", async () => {
+  it("cancels an active run with Ctrl+X and stays mounted", async () => {
     let observedSignal: AbortSignal | undefined;
     const harness: CliHarness = {
       async *run(_request, options): AsyncIterable<RunEvent> {
@@ -478,7 +511,7 @@ describe("TUI conversation, streaming and cancellation", () => {
     await app.type("Explain");
     await app.type(KEYS.enter);
     await app.settle();
-    await app.type(KEYS.ctrlC);
+    await app.type(KEYS.ctrlX);
     await app.settle();
 
     // The run is aborted, the app remains mounted, and the status returns to idle.
@@ -489,11 +522,11 @@ describe("TUI conversation, streaming and cancellation", () => {
     app.unmount();
   });
 
-  it("exits on Ctrl+C when idle", async () => {
+  it("does nothing on Ctrl+C when idle", async () => {
     const exit = vi.fn();
     const app = await mount({ onExit: exit });
     await app.type(KEYS.ctrlC);
-    expect(exit).toHaveBeenCalledTimes(1);
+    expect(exit).not.toHaveBeenCalled();
     app.unmount();
   });
 
@@ -714,13 +747,13 @@ describe("TUI run lifecycle", () => {
     app.unmount();
   });
 
-  it("cancels the one in-flight run with Ctrl+C", async () => {
+  it("cancels the one in-flight run with Ctrl+X", async () => {
     const app = await mountGated();
     await app.type("first");
     await app.type(KEYS.enter);
     await app.type("second");
     await app.type(KEYS.enter);
-    await app.type(KEYS.ctrlC);
+    await app.type(KEYS.ctrlX);
 
     // The single started run is the one that actually receives the abort.
     expect(app.runCount()).toBe(1);
@@ -871,7 +904,7 @@ describe("TUI pre-stream run failures", () => {
     app.unmount();
   });
 
-  it("exits on Ctrl+C after a pre-stream failure instead of trying to cancel", async () => {
+  it("keeps Ctrl+C idle after a pre-stream failure", async () => {
     const exit = vi.fn();
     const workspace = await makeWorkspace();
     const controller = new TuiController({
@@ -912,7 +945,7 @@ describe("TUI pre-stream run failures", () => {
     // A stranded `activeRun` would make Ctrl+C abort a dead run forever instead of exiting.
     instance.stdin.write(KEYS.ctrlC);
     await settle();
-    expect(exit).toHaveBeenCalledTimes(1);
+    expect(exit).not.toHaveBeenCalled();
     instance.unmount();
   });
 

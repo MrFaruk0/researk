@@ -414,7 +414,8 @@ describe("TUI controller provider configuration", () => {
       baseUrl: "",
       apiKeyEnvironmentVariable: "OPENROUTER_API_KEY",
     });
-    expect(built.baseUrl).toBeUndefined();
+    expect(built.baseUrl).toBe("https://openrouter.ai/api/v1/");
+    expect(built.apiKeyEnvironmentVariable).toBe("OPENROUTER_API_KEY");
     expect(controller.describeConnection(built)).toContain("openrouter.ai");
   });
 
@@ -438,7 +439,7 @@ describe("TUI controller provider configuration", () => {
     expect(() => validateProviderEndpoint("http://127.0.0.1:8080/v1/")).not.toThrow();
   });
 
-  it("rejects an invalid credential environment reference", async () => {
+  it("ignores custom credential references for built-in OpenRouter", async () => {
     const controller = await makeController(harnessOf([]));
     expect(() =>
       controller.buildConnection({
@@ -447,7 +448,7 @@ describe("TUI controller provider configuration", () => {
         baseUrl: "",
         apiKeyEnvironmentVariable: "bad name!",
       }),
-    ).toThrow();
+    ).not.toThrow();
   });
 
   it("describes an endpoint without exposing credentials", async () => {

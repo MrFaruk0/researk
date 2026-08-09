@@ -1,6 +1,7 @@
 import type { ModelDescriptor } from "@researk/contracts";
 import { describe, expect, it } from "vitest";
 import {
+  completeSlashCommand,
   discoverSlashCommands,
   isKnownSlashCommand,
   parseSlashCommand,
@@ -97,6 +98,73 @@ describe("slash command discovery and routing", () => {
       argument: "docs/paper.tex",
     });
     expect(parseSlashCommand("not a command")).toBeUndefined();
+  });
+});
+
+describe("slash command Tab completion", () => {
+  it("completes a unique prefix to the full command and moves the cursor to its end", () => {
+    const result = completeSlashCommand("/pro", 4);
+    expect(result).toEqual({ value: "/provider", cursor: 9, command: SLASH_COMMANDS[0] });
+  });
+
+  it("is case-insensitive and reports the matched command", () => {
+    const result = completeSlashCommand("/PRO", 4);
+    expect(result.value).toBe("/provider");
+    expect(result.cursor).toBe(9);
+    expect(result.command?.name).toBe("/provider");
+  });
+
+  it("completes only the text before the cursor and preserves the tail", () => {
+    const result = completeSlashCommand("/prople", 4);
+    expect(result).toEqual({
+      value: "/providerple",
+      cursor: 9,
+      command: SLASH_COMMANDS[0],
+    });
+  });
+
+  it("clamps an out-of-range cursor into the input", () => {
+    const result = completeSlashCommand("/pro", 99);
+    expect(result).toEqual({
+      value: "/provider",
+      cursor: 9,
+      command: SLASH_COMMANDS[0],
+    });
+    const negative = completeSlashCommand("/pro", -3);
+    // A negative cursor is treated as the start, so nothing before the slash completes.
+    expect(negative).toEqual({ value: "/pro", cursor: 0 });
+    expect(negative.command).toBeUndefined();
+  });
+
+  it("leaves an ambiguous prefix untouched because it must not guess", () => {
+    // `/` matches every command, and `/c` matches both /commands and /clear, so neither can be
+    // completed without guessing which one the user meant.
+    const bare = completeSlashCommand("/", 1);
+    expect(bare).toEqual({ value: "/", cursor: 1 });
+    const ambiguous = completeSlashCommand("/c", 2);
+    expect(ambiguous).toEqual({ value: "/c", cursor: 2 });
+    expect(ambiguous.command).toBeUndefined();
+  });
+
+  it("completes an exact command unchanged", () => {
+    const result = completeSlashCommand("/provider", 9);
+    expect(result).toEqual({
+      value: "/provider",
+      cursor: 9,
+      command: SLASH_COMMANDS[0],
+    });
+  });
+
+  it("does nothing for plain prose or a command with an argument", () => {
+    // The cursor is clamped to the input length before the no-op check, so an out-of-range cursor
+    // reports the clamped position and never changes the text.
+    expect(completeSlashCommand("prompt text", 12)).toEqual({ value: "prompt text", cursor: 11 });
+    // Space ends the command head, so a cursor at the end of the command is not command text and
+    // must not complete into anything.
+    expect(completeSlashCommand("/read paper.tex", 15)).toEqual({
+      value: "/read paper.tex",
+      cursor: 15,
+    });
   });
 });
 

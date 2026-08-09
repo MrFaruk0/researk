@@ -4,7 +4,7 @@ import { type ReactNode, useCallback, useEffect, useMemo, useReducer, useRef } f
 import { VERSION } from "../help.js";
 import { redactSecrets, safeErrorMessage, safeTerminalText } from "../safety.js";
 import { isThemeName, type ThemeName } from "../theme.js";
-import { parseSlashCommand, SLASH_COMMANDS } from "./commands.js";
+import { completeSlashCommand, parseSlashCommand, SLASH_COMMANDS } from "./commands.js";
 import { Composer } from "./components/Composer.js";
 import { Conversation } from "./components/Conversation.js";
 import { Footer } from "./components/Footer.js";
@@ -47,6 +47,9 @@ export interface AppProps {
   readonly now?: () => number;
   /** Overrides Ink's own exit so the exit path can be observed in tests. */
   readonly onExit?: () => void;
+  /** Deterministic terminal dimensions for render tests. */
+  readonly terminalWidth?: number;
+  readonly terminalHeight?: number;
 }
 
 let noticeCounter = 0;
@@ -68,11 +71,12 @@ export function App(props: AppProps): ReactNode {
     [state.themeName, state.colorEnabled],
   );
 
-  const width = Math.max(40, stdout.columns ?? 80);
-  const height = Math.max(10, stdout.rows ?? 24);
+  const terminalWidth = Math.max(1, props.terminalWidth ?? stdout.columns ?? 80);
+  const width = Math.min(112, terminalWidth);
+  const height = Math.max(10, props.terminalHeight ?? stdout.rows ?? 24);
   // The conversation and any overlay share one fixed region. Both the key handler and the renderer
   // need this height, so it is derived once here rather than recomputed at each use.
-  const conversationHeight = Math.max(3, height - 12);
+  const conversationHeight = Math.max(3, height - 10);
 
   const notify = useCallback(
     (level: "info" | "warning" | "error" | "success", message: string): void => {
@@ -437,7 +441,7 @@ export function App(props: AppProps): ReactNode {
     // start a second Harness run and overwrite that slot, orphaning the first run beyond the reach
     // of Ctrl+C. Slash commands stay available because they never start a run.
     if (current.runStatus !== "idle" && !trimmed.startsWith("/")) {
-      notify("warning", "A response is still streaming. Press Ctrl+C to cancel it first.");
+      notify("warning", "A response is still streaming. Press Ctrl+X to cancel it first.");
       return;
     }
     dispatch({ type: "composer/submit" });
@@ -453,14 +457,15 @@ export function App(props: AppProps): ReactNode {
   useInput((input, key) => {
     const current = stateRef.current;
 
-    // Ctrl+C cancels an active run and keeps the app mounted; when idle it exits.
-    if (key.ctrl && input === "c") {
+    // Ctrl+C belongs to the terminal and is deliberately a no-op in the app. Ctrl+X is the
+    // explicit in-app cancellation binding; /exit is the only normal exit command.
+    if (key.ctrl && input === "c") return;
+    if (key.ctrl && input === "x") {
       if (activeRun.current !== undefined) {
         activeRun.current.abort();
         dispatch({ type: "run/status", status: "cancelling" });
         return;
       }
-      dispatch({ type: "exit" });
       return;
     }
 
@@ -490,6 +495,13 @@ export function App(props: AppProps): ReactNode {
     // most terminals cannot distinguish Shift+Enter from Enter.
     if (key.ctrl && input === "j") {
       insertText("\n");
+      return;
+    }
+    if (key.tab) {
+      const completed = completeSlashCommand(current.composer.value, current.composer.cursor);
+      if (completed.value !== current.composer.value) {
+        dispatch({ type: "composer/set", value: completed.value, cursor: completed.cursor });
+      }
       return;
     }
     if (key.return) {
@@ -776,43 +788,45 @@ export function App(props: AppProps): ReactNode {
   const overlayNode = renderOverlay();
 
   return (
-    <Box flexDirection="column" width={width} height={height}>
-      <Header theme={theme} state={state} version={VERSION} width={width} />
-      {overlayNode === undefined ? (
-        <Conversation
+    <Box flexDirection="column" width={terminalWidth} height={height} alignItems="center">
+      <Box flexDirection="column" width={width} height={height}>
+        <Header theme={theme} state={state} version={VERSION} width={width} />
+        {overlayNode === undefined ? (
+          <Conversation
+            theme={theme}
+            entries={state.conversation}
+            height={conversationHeight}
+            scrollOffset={state.scrollOffset}
+            emptyHint={
+              state.connection === undefined
+                ? "No provider is connected. Use /provider to connect OpenRouter or an OpenAI-compatible endpoint."
+                : state.model === undefined
+                  ? "Connected. Use /model to select a model from the live catalog."
+                  : "Ready. Type a prompt, or / for commands."
+            }
+          />
+        ) : (
+          <Box
+            flexDirection="column"
+            flexGrow={1}
+            flexShrink={1}
+            minHeight={0}
+            height={conversationHeight}
+            paddingX={1}
+            overflow="hidden"
+          >
+            {overlayNode}
+          </Box>
+        )}
+        <Notices theme={theme} notices={state.notices} width={width} />
+        <Composer
           theme={theme}
-          entries={state.conversation}
-          height={conversationHeight}
-          scrollOffset={state.scrollOffset}
-          emptyHint={
-            state.connection === undefined
-              ? "No provider is connected. Use /provider to connect OpenRouter or an OpenAI-compatible endpoint."
-              : state.model === undefined
-                ? "Connected. Use /model to select a model from the live catalog."
-                : "Ready. Type a prompt, or / for commands."
-          }
+          composer={state.composer}
+          disabled={state.runStatus !== "idle"}
+          width={width}
         />
-      ) : (
-        <Box
-          flexDirection="column"
-          flexGrow={1}
-          flexShrink={1}
-          minHeight={0}
-          height={conversationHeight}
-          paddingX={1}
-          overflow="hidden"
-        >
-          {overlayNode}
-        </Box>
-      )}
-      <Notices theme={theme} notices={state.notices} width={width} />
-      <Composer
-        theme={theme}
-        composer={state.composer}
-        disabled={state.runStatus !== "idle"}
-        width={width}
-      />
-      <Footer theme={theme} state={state} width={width} />
+        <Footer theme={theme} state={state} width={width} />
+      </Box>
     </Box>
   );
 
@@ -883,12 +897,10 @@ export function App(props: AppProps): ReactNode {
 
 /** Describes the exact external endpoint the form will contact, so network use is never implicit. */
 export function providerDisclosure(form: ProviderFormState): string {
-  const raw =
-    form.baseUrl.trim().length > 0
-      ? form.baseUrl.trim()
-      : form.kind === "openrouter"
-        ? OPENROUTER_DEFAULT_BASE_URL
-        : "";
+  if (form.kind === "openrouter") {
+    return `connecting will contact ${OPENROUTER_DEFAULT_BASE_URL} using the built-in OPENROUTER_API_KEY reference`;
+  }
+  const raw = form.baseUrl.trim().length > 0 ? form.baseUrl.trim() : "";
   if (raw.length === 0) return "a base URL is required before any request is made";
   try {
     const url = new URL(raw);

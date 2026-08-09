@@ -62,7 +62,7 @@ export function Footer(props: {
       </Box>
       <Box>
         <Text {...(muted === undefined ? {} : { color: muted })}>
-          {`workspace ${state.workspaceRoot}`}
+          {`workspace ${state.workspaceRoot}  \u00b7  Ctrl+X cancel  \u00b7  /exit quit`}
         </Text>
       </Box>
     </Box>

@@ -3,7 +3,17 @@ import { createTheme, THEME_NAMES } from "../src/theme.js";
 
 describe("CLI themes", () => {
   it("offers the original built-in themes", () => {
-    expect(THEME_NAMES).toEqual(["system", "dark", "light", "high-contrast", "mono"]);
+    expect(THEME_NAMES).toEqual([
+      "system",
+      "dark",
+      "light",
+      "high-contrast",
+      "mono",
+      "nord",
+      "dracula",
+      "solarized-dark",
+      "gruvbox",
+    ]);
   });
 
   it("never emits ANSI controls outside an interactive color-enabled terminal", () => {
@@ -15,6 +25,14 @@ describe("CLI themes", () => {
       expect(theme.colorEnabled).toBe(false);
       expect(theme.prompt()).not.toContain("\u001b");
       expect(theme.heading("status")).not.toContain("\u001b");
+    }
+  });
+
+  it("creates every extended theme", () => {
+    for (const name of THEME_NAMES) {
+      const theme = createTheme(name, { isTTY: true, env: {} });
+      expect(theme.accent("x")).toContain("x");
+      expect(theme.heading("x")).toContain("x");
     }
   });
 });

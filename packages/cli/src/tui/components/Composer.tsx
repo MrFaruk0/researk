@@ -43,7 +43,7 @@ export function Composer(props: {
           {props.composer.value.length === 0 ? (
             <Text {...(muted === undefined ? {} : { color: muted })}>
               {props.disabled
-                ? "Streaming\u2026 Ctrl+C cancels"
+                ? "Streaming\u2026 Ctrl+X cancels"
                 : "Ask a question, or type / for commands"}
             </Text>
           ) : (

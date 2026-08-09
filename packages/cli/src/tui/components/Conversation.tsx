@@ -218,7 +218,7 @@ export function Conversation(props: {
   const muted = themeColor(props.theme, "muted");
   if (props.entries.length === 0) {
     return (
-      <Box flexDirection="column" flexGrow={1} paddingX={1}>
+      <Box flexDirection="column" flexGrow={1} justifyContent="center" paddingX={1}>
         <Text {...(muted === undefined ? {} : { color: muted })}>{props.emptyHint}</Text>
       </Box>
     );

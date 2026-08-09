@@ -23,8 +23,8 @@ export const PROVIDER_CHOICES: readonly ProviderChoice[] = Object.freeze([
   }),
   Object.freeze({
     kind: "compatible" as const,
-    label: "OpenAI-compatible endpoint",
-    hint: "requires an explicit base URL",
+    label: "OpenAI-compatible endpoint (Advanced/custom)",
+    hint: "custom provider ID and explicit base URL",
   }),
 ]);
 
@@ -52,7 +52,7 @@ export function ProviderPicker(props: {
 }
 
 export interface FormField {
-  readonly key: "providerId" | "baseUrl" | "apiKeyEnvironmentVariable" | "apiKey";
+  readonly key: "providerId" | "baseUrl" | "apiKey";
   readonly label: string;
   readonly secret: boolean;
   readonly hint: string;
@@ -61,29 +61,13 @@ export interface FormField {
 export function formFields(kind: ProviderConnectionKind): readonly FormField[] {
   const shared: readonly FormField[] = [
     {
-      key: "apiKeyEnvironmentVariable",
-      label: "API key environment reference",
-      secret: false,
-      hint: "name only, never a value",
-    },
-    {
       key: "apiKey",
       label: "API key (this session only)",
       secret: true,
       hint: "optional if the environment variable is already set",
     },
   ];
-  if (kind === "openrouter") {
-    return [
-      {
-        key: "baseUrl",
-        label: "Base URL",
-        secret: false,
-        hint: "leave empty for the OpenRouter default",
-      },
-      ...shared,
-    ];
-  }
+  if (kind === "openrouter") return shared;
   return [
     { key: "providerId", label: "Provider ID", secret: false, hint: "e.g. local-vllm" },
     { key: "baseUrl", label: "Base URL", secret: false, hint: "required, HTTPS or loopback" },
