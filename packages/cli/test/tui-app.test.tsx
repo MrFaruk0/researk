@@ -2165,6 +2165,10 @@ describe("TUI formula interaction", () => {
     await app.type("e");
     await app.type("+z");
     await app.type(KEYS.enter);
+    expect(app.lastFrame() ?? "").toContain("Local draft · typeset preview unavailable");
+    expect(app.lastFrame() ?? "").not.toContain("Exact source · typeset preview unavailable");
+    expect(app.lastFrame() ?? "").toContain("c copy canonical");
+    expect(app.lastFrame() ?? "").toContain("i insert local draft");
     await app.type("i");
     expect(app.lastFrame() ?? "").toContain("$x+z$");
     for (let index = 0; index < 5; index += 1) await app.type(KEYS.backspace);

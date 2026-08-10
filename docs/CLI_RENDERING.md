@@ -5,11 +5,11 @@
 This document defines the normative rendering contract for the Researk CLI. The current
 `0.1.0-alpha.4` source build includes restricted local MathJax 4 SVG generation, in-memory resvg
 rasterization, one-shot display-math emission in positively detected iTerm2 TTYs, and retained
-formula graphics in the full-screen TUI. The TUI uses Kitty only after an explicit bounded query
-succeeds and Windows Terminal Sixel only after its advertised capability and cell-pixel response
-are proven. Exact source is used everywhere else. Sections that explicitly describe planned
-command-line or configuration options are future contract requirements, not claims that those
-options are accepted by the current CLI.
+formula graphics in the full-screen TUI. The TUI uses Kitty only after complete bounded query
+evidence (matching `i=31` literal `OK`, valid DA1, and measured cell pixels) and Windows Terminal
+Sixel only after its advertised capability and cell-pixel response are proven. Exact source is used
+everywhere else. Sections that explicitly describe planned command-line or configuration options are
+future contract requirements, not claims that those options are accepted by the current CLI.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** describe requirements for implementations of the official CLI and compatible clients.
 
@@ -392,17 +392,22 @@ For the retained TUI path, capability detection proceeds before Ink mounts:
 1. Confirm stdin and stdout are TTYs and the invocation is interactive.
 2. Reject `TERM=dumb`, CI/non-interactive environments, accessible/raw/JSON paths, and unverified
    `tmux`, `screen`, or other multiplexer sessions.
-3. Send one bounded Kitty graphics query together with DA1 and cell-pixel queries. The input broker
-   waits no longer than 100 milliseconds, accepts Kitty only after query id `31` receives the
-   explicit protocol `OK`, and replays bytes that were not positively identified as replies.
+3. Send one bounded Kitty graphics query together with DA1 and cell-pixel queries. The initial
+   probe is capped at 100 milliseconds. Kitty requires complete evidence: matching query id `31`
+   with literal protocol `OK`, a valid DA1 response, and bounded measured cell-pixel dimensions.
 4. Select Windows Terminal Sixel only when `WT_SESSION` is non-empty, the DA1 response includes
    parameter `4`, and a valid bounded `CSI 6;<height>;<width>t` cell-pixel response is present.
 5. Otherwise use source fallback. A trusted iTerm2 identity may enable the one-shot path, but it does
    not enable retained TUI placements.
 
 No capability query may be emitted in Markdown, JSON, accessible, raw, or non-TTY output. A missing,
-malformed, late, or oversized response means unsupported for that process. Bytes that are not
-positively identified as protocol replies are replayed before Ink consumes input; user keystrokes
+malformed, late, or oversized response means unsupported for that process. If the initial timeout
+leaves an unresolved APC/CSI candidate and a paused readable stream plus replay sink are available,
+an unref'd 50-millisecond retirement broker may continue that candidate without extending the
+initial probe. Ordinary, malformed, or ultimately incomplete bytes that are not positively
+identified as replies are replayed exactly once within the response/replay ceilings, preserving
+order on bounded handoff. Replies arriving after broker retirement cannot be distinguished from
+ordinary input and are treated as ordinary input. Before that retirement boundary, user keystrokes
 must not be consumed or inserted into the prompt.
 
 ## 8.2 Layout and lifecycle

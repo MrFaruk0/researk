@@ -10,6 +10,26 @@ export interface TerminalCapability {
   readonly reason: string;
 }
 
+/** Shared environment gates used by both synchronous detection and the startup query broker. */
+export function terminalEnvironmentGateReason(
+  env: Readonly<Record<string, string | undefined>>,
+): "non-interactive terminal environment" | "multiplexer passthrough is not verified" | undefined {
+  const term = env.TERM?.trim().toLowerCase();
+  if (term === "dumb" || env.CI !== undefined) return "non-interactive terminal environment";
+  if (
+    env.TMUX !== undefined ||
+    env.STY !== undefined ||
+    env.ZELLIJ !== undefined ||
+    term === "screen" ||
+    term?.startsWith("screen-") ||
+    term === "tmux" ||
+    term?.startsWith("tmux-")
+  ) {
+    return "multiplexer passthrough is not verified";
+  }
+  return undefined;
+}
+
 /**
  * Capability detection is deliberately conservative. iTerm's documented identity is sufficient
  * for its inline-image protocol. Kitty and Sixel are selected only by the separate bounded
@@ -20,17 +40,8 @@ export function detectTerminalCapability(
   env: Readonly<Record<string, string | undefined>>,
 ): TerminalCapability {
   if (stdout.isTTY !== true) return { protocol: "unsupported", reason: "stdout is not a TTY" };
-  if (env.TERM === "dumb" || env.CI !== undefined) {
-    return { protocol: "unsupported", reason: "non-interactive terminal environment" };
-  }
-  if (
-    env.TMUX !== undefined ||
-    env.STY !== undefined ||
-    env.TERM === "screen" ||
-    env.TERM?.startsWith("screen-")
-  ) {
-    return { protocol: "unsupported", reason: "multiplexer passthrough is not verified" };
-  }
+  const environmentGate = terminalEnvironmentGateReason(env);
+  if (environmentGate !== undefined) return { protocol: "unsupported", reason: environmentGate };
   const itermVersion = env.TERM_PROGRAM_VERSION ?? env.LC_TERMINAL_VERSION;
   if (
     (env.TERM_PROGRAM === "iTerm.app" || env.LC_TERMINAL === "iTerm2") &&

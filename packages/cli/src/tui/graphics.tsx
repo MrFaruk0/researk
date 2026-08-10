@@ -30,8 +30,6 @@ const RESTORE_CURSOR = `${ESC}[u`;
 // Windows Terminal DECSDM: reset (?80l) is cursor-relative/scrolling; set (?80h) clamps to the
 // top-left. We CUP to a pre-clipped cell, so leave the terminal in the reset/default mode.
 const SIXEL_SCROLL_RESET = `${ESC}[?80l`;
-const DEFAULT_KITTY_CELL_WIDTH = 10;
-const DEFAULT_KITTY_CELL_HEIGHT = 20;
 const DEFAULT_MAX_VISIBLE_SLOTS = 32;
 const DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_VISIBLE_SLOTS = 256;
@@ -105,6 +103,8 @@ export interface FormulaGraphicsRuntimeOptions {
   readonly measure?: (ref: DOMElement) => FormulaGraphicsMetrics | undefined;
   readonly maxVisibleSlots?: number;
   readonly maxFrameBytes?: number;
+  /** Requests one follow-up Ink frame after a raster registration lands after onRender. */
+  readonly requestFrame?: () => void;
 }
 
 export interface FormulaGraphicsRenderRequest {
@@ -174,6 +174,7 @@ export class FormulaGraphicsRuntime {
   readonly #measure: (ref: DOMElement) => FormulaGraphicsMetrics | undefined;
   readonly #maxVisibleSlots: number;
   readonly #maxFrameBytes: number;
+  readonly #requestFrame: (() => void) | undefined;
   readonly #registrations = new Map<string, RegisteredFormula>();
   readonly #listeners = new Set<RuntimeListener>();
   readonly #controllers = new Set<AbortController>();
@@ -182,6 +183,7 @@ export class FormulaGraphicsRuntime {
   #generation = 0;
   #snapshot: SnapshotFrame | undefined;
   #visibleKeys = new Set<string>();
+  #visibleRegistrations = new Map<string, RegisteredFormula>();
   #placed: PlacedFormula[] = [];
   #nextImageId = 1;
   #nextPlacementId = 1;
@@ -233,6 +235,7 @@ export class FormulaGraphicsRuntime {
       DEFAULT_MAX_FRAME_BYTES,
       MAX_FRAME_BYTES,
     );
+    this.#requestFrame = options.requestFrame;
     this.#cache =
       options.cache ??
       options.rasterCache ??
@@ -336,6 +339,11 @@ export class FormulaGraphicsRuntime {
     const cellSize = this.cellSize(value.raster);
     if (cellSize === undefined) return false;
     this.#registrations.set(value.key, { ...value, refNode, clipNode });
+    try {
+      this.#requestFrame?.();
+    } catch {
+      // A frame scheduler belongs to the embedding lifecycle and cannot invalidate registration.
+    }
     return true;
   }
 
@@ -345,6 +353,7 @@ export class FormulaGraphicsRuntime {
     if (ref !== undefined && resolveRef(ref) !== current.refNode) return false;
     this.#registrations.delete(key);
     this.#visibleKeys.delete(key);
+    this.#visibleRegistrations.delete(key);
     this.#notify();
     return true;
   }
@@ -388,15 +397,24 @@ export class FormulaGraphicsRuntime {
         ) {
           continue;
         }
-        if (!isContainedByClip(metrics, clipMetrics)) continue;
+        if (!isContainedByClip(metrics, cellSize, clipMetrics)) continue;
         if (registration.raster.png.byteLength > this.#maxFrameBytes) continue;
         formulas.push({ cellSize, metrics, registration });
       }
     }
+    const retainedKeys = new Set<string>();
+    for (const formula of formulas) {
+      if (
+        this.#visibleKeys.has(formula.registration.key) &&
+        this.#visibleRegistrations.get(formula.registration.key) === formula.registration
+      ) {
+        retainedKeys.add(formula.registration.key);
+      }
+    }
     this.#snapshot = { generation: this.#generation, formulas };
-    // A frame is only graphically visible after its protocol write succeeds. Clearing here keeps
-    // pending, failed, and stale generations on exact-source fallback.
-    this.#setVisibleKeys(new Set<string>());
+    // Preserve already-successful graphical boxes that remain eligible. New/unproven formulas
+    // remain exact-source until this generation's protocol write succeeds.
+    this.#setVisibleKeys(retainedKeys);
     return this.#generation;
   }
 
@@ -406,11 +424,15 @@ export class FormulaGraphicsRuntime {
    */
   public afterFrame(generation: number, inkFlush?: PromiseLike<unknown> | boolean): Promise<void> {
     const run = async (): Promise<void> => {
-      if (inkFlush === false) return;
+      if (inkFlush === false) {
+        this.#fallbackSnapshot(generation);
+        return;
+      }
       if (inkFlush !== undefined && typeof inkFlush !== "boolean") {
         try {
           await inkFlush;
         } catch {
+          this.#fallbackSnapshot(generation);
           return;
         }
       }
@@ -440,6 +462,7 @@ export class FormulaGraphicsRuntime {
     this.#generation += 1;
     this.#registrations.clear();
     this.#visibleKeys.clear();
+    this.#visibleRegistrations.clear();
     this.#snapshot = undefined;
     for (const controller of this.#controllers) controller.abort();
     this.#controllers.clear();
@@ -454,7 +477,11 @@ export class FormulaGraphicsRuntime {
   }
 
   async #emitFrame(generation: number): Promise<void> {
-    if (this.#disposed || generation !== this.#generation || this.#writeBroken) return;
+    if (this.#disposed || generation !== this.#generation) return;
+    if (this.#writeBroken) {
+      this.#fallbackSnapshot(generation);
+      return;
+    }
     const snapshot = this.#snapshot;
     if (snapshot === undefined || snapshot.generation !== generation) return;
 
@@ -483,16 +510,19 @@ export class FormulaGraphicsRuntime {
         const result = await this.#queueWrite(built.sequence, generation);
         if (result === "stale") {
           this.#removePlaced(placed);
-          this.#setVisible(item.registration.key, false);
+          // A newer beforeFrame owns visibility now; an old stale continuation must not clear it.
+          if (generation === this.#generation) {
+            this.#setVisible(item.registration.key, false);
+          }
           continue;
         }
       } catch {
-        this.#setVisible(item.registration.key, false);
+        this.#fallbackSnapshot(generation);
         return;
       }
       if (this.#disposed || generation !== this.#generation) return;
       nextPlaced.push(placed);
-      this.#setVisible(item.registration.key, true);
+      this.#setVisible(item.registration.key, true, item.registration);
     }
     if (!this.#disposed && generation === this.#generation) this.#placed = nextPlaced;
   }
@@ -564,9 +594,7 @@ export class FormulaGraphicsRuntime {
       const explicit = capability.kittyResponse?.explicitOk;
       if (explicit === false) return undefined;
       const returned = capability.cellPixels;
-      return isCellPixels(returned)
-        ? returned
-        : { width: DEFAULT_KITTY_CELL_WIDTH, height: DEFAULT_KITTY_CELL_HEIGHT };
+      return isCellPixels(returned) ? returned : undefined;
     }
     if (this.#capability.protocol === "sixel") {
       const cellPixels = (
@@ -695,15 +723,36 @@ export class FormulaGraphicsRuntime {
     });
   }
 
-  #setVisible(key: string, visible: boolean): void {
+  #fallbackSnapshot(generation: number): void {
+    if (this.#disposed || generation !== this.#generation) return;
+    const snapshot = this.#snapshot;
+    if (snapshot === undefined || snapshot.generation !== generation) return;
+    for (const formula of snapshot.formulas) {
+      this.#setVisible(formula.registration.key, false);
+    }
+  }
+
+  #setVisible(key: string, visible: boolean, registration?: RegisteredFormula): void {
     const had = this.#visibleKeys.has(key);
-    if (had === visible) return;
-    if (visible) this.#visibleKeys.add(key);
-    else this.#visibleKeys.delete(key);
+    const sameRegistration =
+      !visible ||
+      registration === undefined ||
+      this.#visibleRegistrations.get(key) === registration;
+    if (had === visible && sameRegistration) return;
+    if (visible) {
+      this.#visibleKeys.add(key);
+      if (registration !== undefined) this.#visibleRegistrations.set(key, registration);
+    } else {
+      this.#visibleKeys.delete(key);
+      this.#visibleRegistrations.delete(key);
+    }
     this.#notify();
   }
 
   #setVisibleKeys(keys: Set<string>): void {
+    for (const key of this.#visibleRegistrations.keys()) {
+      if (!keys.has(key)) this.#visibleRegistrations.delete(key);
+    }
     if (sameSet(this.#visibleKeys, keys)) return;
     this.#visibleKeys = keys;
     this.#notify();
@@ -789,10 +838,19 @@ export function FormulaGraphic(props: FormulaGraphicProps): React.ReactElement {
 
   const raster = outcome?.ok === true ? outcome.raster : undefined;
   const cellSize = raster === undefined ? undefined : props.runtime.cellSize(raster);
+  const cellWidth = cellSize?.width;
+  const cellHeight = cellSize?.height;
   const placeable = raster !== undefined && cellSize !== undefined && visible;
 
   React.useLayoutEffect(() => {
-    if (raster === undefined || cellSize === undefined || props.runtime.disposed) return undefined;
+    if (
+      raster === undefined ||
+      cellWidth === undefined ||
+      cellHeight === undefined ||
+      props.runtime.disposed
+    ) {
+      return undefined;
+    }
     const accepted = props.runtime.register({
       clipRef: props.clipRef,
       key: formulaKey,
@@ -802,7 +860,7 @@ export function FormulaGraphic(props: FormulaGraphicProps): React.ReactElement {
     return () => {
       if (accepted) props.runtime.unregister(formulaKey, ref);
     };
-  }, [cellSize, formulaKey, props.clipRef, props.runtime, raster]);
+  }, [cellHeight, cellWidth, formulaKey, props.clipRef, props.runtime, raster]);
 
   const safeSource = displayText(exactSource);
   const style = props.style === undefined ? {} : props.style;
@@ -933,6 +991,7 @@ function isVisibleMetrics(
 
 function isContainedByClip(
   metrics: FormulaGraphicsMetrics,
+  cellSize: ImageCellSize,
   clip: FormulaGraphicsMetrics | undefined,
 ): boolean {
   if (clip === undefined) return true;
@@ -943,8 +1002,8 @@ function isContainedByClip(
     clip.y >= 0 &&
     metrics.x >= clip.x &&
     metrics.y >= clip.y &&
-    metrics.x + metrics.width <= clip.x + clip.width &&
-    metrics.y + metrics.height <= clip.y + clip.height
+    metrics.x + cellSize.width <= clip.x + clip.width &&
+    metrics.y + cellSize.height <= clip.y + clip.height
   );
 }
 

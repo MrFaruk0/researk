@@ -37,6 +37,8 @@ export interface FormulaOverlayBaseProps {
   readonly exactSource?: string | undefined;
   /** Label for the exact-source fallback (for example, when typesetting is unsupported). */
   readonly sourceLabel?: string | undefined;
+  /** Whether the displayed preview/source fallback is an applied local draft. */
+  readonly localDraft?: boolean | undefined;
   /** Optional dimensions supplied by the bounded App overlay region. */
   readonly width?: number | undefined;
   readonly height?: number | undefined;
@@ -123,6 +125,24 @@ function formulaSource(props: FormulaOverlayBaseProps): string {
   return props.exactSource ?? props.formula?.source ?? "";
 }
 
+function mentionsLocalDraft(value: string | undefined): boolean {
+  return value?.toLowerCase().includes("local draft") === true;
+}
+
+function previewLabel(props: FormulaOverlayBaseProps): string {
+  if (!props.localDraft) return props.previewLabel ?? "Typeset preview · exact source fallback";
+  return mentionsLocalDraft(props.previewLabel)
+    ? (props.previewLabel as string)
+    : "Local draft preview/fallback · canonical source unchanged";
+}
+
+function sourceLabel(props: FormulaOverlayBaseProps): string {
+  if (!props.localDraft) return props.sourceLabel ?? "Exact source";
+  return mentionsLocalDraft(props.sourceLabel)
+    ? (props.sourceLabel as string)
+    : "Local draft · typeset preview unavailable";
+}
+
 function formulaBody(props: FormulaOverlayBaseProps): ReactNode {
   const muted = themeColor(props.theme, "muted");
   const formula = props.formula;
@@ -133,9 +153,7 @@ function formulaBody(props: FormulaOverlayBaseProps): ReactNode {
   if (props.preview !== undefined) {
     return (
       <Box flexDirection="column">
-        <Text {...(muted === undefined ? {} : { color: muted })}>
-          {props.previewLabel ?? "Typeset preview · exact source fallback"}
-        </Text>
+        <Text {...(muted === undefined ? {} : { color: muted })}>{previewLabel(props)}</Text>
         <Box marginTop={1} flexDirection="column" overflow="hidden">
           {props.preview}
         </Box>
@@ -145,20 +163,20 @@ function formulaBody(props: FormulaOverlayBaseProps): ReactNode {
 
   return (
     <Box flexDirection="column">
-      <Text {...(muted === undefined ? {} : { color: muted })}>
-        {props.sourceLabel ?? "Exact source"}
-      </Text>
+      <Text {...(muted === undefined ? {} : { color: muted })}>{sourceLabel(props)}</Text>
       <Text wrap="truncate-end">{displayText(formulaSource(props))}</Text>
     </Box>
   );
 }
 
-function browseHints(): string {
-  return "Up/Down or j/k navigate · c copy source · e edit/rerender\ni insert · s source · Esc close";
+function browseHints(localDraft = false): string {
+  const insert = localDraft ? "i insert local draft" : "i insert";
+  const copy = localDraft ? "c copy canonical" : "c copy source";
+  return `Up/Down or j/k navigate · ${copy} · e edit/rerender\n${insert} · s source · Esc close`;
 }
 
 function editHints(): string {
-  return "Left/Right · Backspace · Ctrl+J newline\nEnter apply/rerender · Esc cancel";
+  return "Left/Right · Backspace/Delete · Ctrl+J newline\nEnter apply/rerender · Esc cancel";
 }
 
 function compactSource(value: string): string {
@@ -169,55 +187,76 @@ function compactSource(value: string): string {
     .trim();
 }
 
-function compactHint(mode: "browse" | "edit"): string {
-  return mode === "edit" ? "Esc cancel · Enter apply" : "Esc close · c copy · e edit";
+function compactText(value: string, width: number): string {
+  if (width <= 0) return "";
+  if (value.length <= width) return value;
+  if (width === 1) return "…";
+  return `${value.slice(0, width - 1)}…`;
 }
 
-function compactLines(props: FormulaOverlayProps, height: number): readonly string[] {
+function compactHint(props: FormulaOverlayProps, height: number): string {
+  if (props.mode === "edit") {
+    if (height <= 1) return "Esc cancel · ←→ · Backspace/Del · Ctrl+J newline · Enter apply";
+    // Keep the short form within a normal narrow terminal row while retaining every editor route.
+    return "Esc cancel · ←→ · Backspace/Del · Ctrl+J newline · Enter apply";
+  }
+  const insert = props.localDraft ? "i insert draft" : "i insert";
+  return `Esc close · ↑↓/jk nav · c copy · e edit · ${insert} · s source`;
+}
+
+function compactHintLines(props: FormulaOverlayProps): readonly string[] {
+  if (props.mode === "edit") {
+    return [
+      "Left/Right move · Backspace/Delete delete · Ctrl+J newline",
+      "Enter apply/rerender · Esc cancel",
+    ];
+  }
+  const insert = props.localDraft ? "i insert local draft" : "i insert";
+  return [
+    "Up/Down or j/k navigate · c copy source (canonical)",
+    `${insert} · e edit/rerender · s source · Esc close`,
+  ];
+}
+
+function compactLines(
+  props: FormulaOverlayProps,
+  height: number,
+  width: number,
+): readonly string[] {
   const formula = props.formula;
   const source = compactSource(formulaSource(props));
   const tex = compactSource(props.mode === "edit" ? props.draft : (formula?.tex ?? ""));
   const title = formulaTitle(props);
-  const hint = compactHint(props.mode === "edit" ? "edit" : "browse");
-  const label =
-    props.preview === undefined
-      ? (props.sourceLabel ?? "Exact source")
-      : (props.previewLabel ?? "Typeset preview · exact source fallback");
+  const label = props.preview === undefined ? sourceLabel(props) : previewLabel(props);
   const compactLabel = compactSource(label);
+  const value = props.mode === "edit" ? tex : source;
 
   if (height <= 1) {
-    const value = props.mode === "edit" ? tex : source;
-    // Keep the close/cancel affordance and a useful source projection visible even when the
-    // terminal can render only one row. The full status label is intentionally omitted here;
-    // height 2+ has room for it without truncating the formula itself.
-    return [`${hint} · ${props.mode === "edit" ? "TeX" : "exact source"}: ${value}`];
+    // Put the value first and reserve the rest of the row for every route. This keeps both the
+    // selected formula/draft and Escape guidance visible on the smallest supported overlay.
+    const hint = compactHint(props, height);
+    const valueWidth = Math.max(1, width - hint.length - 3);
+    return [`${compactText(value, valueWidth)} · ${compactText(hint, Math.max(1, width - 1))}`];
   }
-  if (height === 2) {
-    return [
-      `${props.mode === "edit" ? "TeX" : compactLabel}: ${props.mode === "edit" ? tex : source}`,
-      hint,
-    ];
-  }
-  if (height === 3) {
-    return [
-      title,
-      `${props.mode === "edit" ? "TeX" : compactLabel}: ${props.mode === "edit" ? tex : source}`,
-      hint,
-    ];
-  }
-  if (props.mode === "edit") {
-    const lines = [title, `TeX: ${tex}`, `${compactLabel}: ${source}`, hint];
-    return height === 4 ? lines : [...lines, "Ctrl+J newline · Backspace delete"];
-  }
-  const lines = [title, `TeX: ${tex}`, `${compactLabel}: ${source}`, hint];
-  return height === 4 ? lines : [...lines, "s source · i insert"];
+
+  const valueLabel = props.mode === "edit" ? "Draft" : compactLabel;
+  const valueWidth = Math.max(1, width - valueLabel.length - 2);
+  const valueLine = `${valueLabel}: ${compactText(value, valueWidth)}`;
+  if (height === 2) return [valueLine, compactText(compactHint(props, height), width)];
+  if (height === 3) return [title, valueLine, compactText(compactHint(props, height), width)];
+
+  const controls = compactHintLines(props);
+  const compactControls = compactText(compactHint(props, height), width);
+  if (height === 4) return [title, `TeX: ${tex}`, `${compactLabel}: ${source}`, compactControls];
+
+  return [title, `TeX: ${tex}`, `${compactLabel}: ${source}`, ...controls];
 }
 
 function renderCompact(props: FormulaOverlayProps, height: number, width: number): ReactNode {
   const muted = themeColor(props.theme, "muted");
   return (
     <Box flexDirection="column" width={width} height={height} overflow="hidden">
-      {compactLines(props, height).map((line) => (
+      {compactLines(props, height, width).map((line) => (
         <Text key={line} wrap="truncate-end" {...(muted === undefined ? {} : { color: muted })}>
           {line}
         </Text>
@@ -240,7 +279,7 @@ function renderBrowse(props: FormulaOverlayBrowseProps): ReactNode {
       <Box marginTop={1} flexDirection="column">
         {formulaBody(props)}
       </Box>
-      <HintLine theme={props.theme} text={browseHints()} />
+      <HintLine theme={props.theme} text={browseHints(props.localDraft)} />
     </Panel>
   );
 }
@@ -261,16 +300,12 @@ function renderEdit(props: FormulaOverlayEditProps): ReactNode {
         </Box>
         {props.preview === undefined ? (
           <Box marginTop={1} flexDirection="column">
-            <Text {...(muted === undefined ? {} : { color: muted })}>
-              {props.sourceLabel ?? "Exact source"}
-            </Text>
+            <Text {...(muted === undefined ? {} : { color: muted })}>{sourceLabel(props)}</Text>
             <Text wrap="truncate-end">{displayText(formulaSource(props))}</Text>
           </Box>
         ) : (
           <Box marginTop={1} flexDirection="column" overflow="hidden">
-            <Text {...(muted === undefined ? {} : { color: muted })}>
-              {props.previewLabel ?? "Typeset preview · exact source fallback"}
-            </Text>
+            <Text {...(muted === undefined ? {} : { color: muted })}>{previewLabel(props)}</Text>
             <Box marginTop={1} flexDirection="column" overflow="hidden">
               {props.preview}
             </Box>

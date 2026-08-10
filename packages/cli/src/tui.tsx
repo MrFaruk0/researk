@@ -256,20 +256,7 @@ export async function startTui(
       capability = undefined;
     }
   }
-  const graphicsRuntime: FormulaGraphicsRuntime = createFormulaGraphicsRuntime({
-    stdout: io.stdout,
-    capability: capability ?? {
-      protocol: "unsupported",
-      reason: probeEligible
-        ? "terminal graphics probe failed"
-        : "terminal graphics probe ineligible",
-    },
-    terminalSize: {
-      columns: terminalColumns(io.stdout),
-      rows: terminalRows(io.stdout),
-    },
-  });
-
+  let graphicsRuntime: FormulaGraphicsRuntime;
   let instance: ReturnType<typeof render> | undefined;
   const pendingGenerations: number[] = [];
   const queueAfterFrame = (generation: number): void => {
@@ -281,13 +268,53 @@ export async function startTui(
       .afterFrame(generation, instance.waitUntilRenderFlush())
       .catch(() => undefined);
   };
+  let registrationFrameRequested = false;
+  let registrationFrameScheduled = false;
+  const scheduleRegistrationFrame = (): void => {
+    if (registrationFrameScheduled) return;
+    registrationFrameScheduled = true;
+    queueMicrotask(() => {
+      registrationFrameScheduled = false;
+      if (!registrationFrameRequested || graphicsRuntime.disposed) return;
+      if (instance === undefined) {
+        // The synchronous Ink mount can run layout effects before render() returns. The request
+        // remains bounded and is picked up by the post-mount drain below.
+        return;
+      }
+      registrationFrameRequested = false;
+      onRender();
+    });
+  };
+  const requestRegistrationFrame = (): void => {
+    if (graphicsRuntime?.disposed || registrationFrameRequested) return;
+    registrationFrameRequested = true;
+    scheduleRegistrationFrame();
+  };
   const onRender = (): void => {
+    // If registration landed before Ink's commit callback, this render already includes it and the
+    // queued follow-up is unnecessary. A registration after this callback leaves the flag set and
+    // receives exactly one coalesced post-registration frame.
+    registrationFrameRequested = false;
     const generation = graphicsRuntime.beforeFrame(
       terminalColumns(io.stdout),
       terminalRows(io.stdout),
     );
     queueAfterFrame(generation);
   };
+  graphicsRuntime = createFormulaGraphicsRuntime({
+    stdout: io.stdout,
+    capability: capability ?? {
+      protocol: "unsupported",
+      reason: probeEligible
+        ? "terminal graphics probe failed"
+        : "terminal graphics probe ineligible",
+    },
+    requestFrame: requestRegistrationFrame,
+    terminalSize: {
+      columns: terminalColumns(io.stdout),
+      rows: terminalRows(io.stdout),
+    },
+  });
   try {
     instance = render(
       <App
@@ -313,6 +340,7 @@ export async function startTui(
     // generations only after the instance exists so every graphic waits for the matching Ink
     // flush; subsequent renders queue directly in generation order.
     for (const generation of pendingGenerations.splice(0)) queueAfterFrame(generation);
+    if (registrationFrameRequested) scheduleRegistrationFrame();
     await instance.waitUntilExit();
     return 0;
   } catch (error) {

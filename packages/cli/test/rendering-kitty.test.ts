@@ -12,15 +12,24 @@ import {
 describe("Kitty graphics emitter", () => {
   it("chunks base64 payloads at 4096 bytes and emits deterministic placement controls", () => {
     const png = Uint8Array.from({ length: 4098 }, (_, index) => index % 251);
-    const result = buildKittyPng(png, { row: 3, column: 4, columns: 7, rows: 2 });
+    const result = buildKittyPng(png, {
+      row: 3,
+      column: 4,
+      columns: 7,
+      rows: 2,
+      // Unknown caller fields must not be interpolated into trusted controls.
+      q: "q=0",
+    } as never);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.imageId).toBe(KITTY_IMAGE_ID);
     expect(result.placementId).toBe(KITTY_PLACEMENT_ID);
     expect(result.chunks.every((chunk) => chunk.length <= 4096)).toBe(true);
     expect(result.sequence.startsWith("\u001b[s\u001b[3;4H")).toBe(true);
-    expect(result.sequence).toContain("a=T,f=100,t=d,i=1,p=1,c=7,r=2,C=1,m=1;");
-    expect(result.sequence).toContain("\u001b_Gm=0;");
+    expect(result.sequence).toContain("a=T,f=100,t=d,i=1,p=1,c=7,r=2,C=1,m=1,q=2;");
+    expect(result.sequence).toContain("\u001b_Gm=0,q=2;");
+    expect(result.sequence.match(/q=2/g)).toHaveLength(result.chunks.length);
+    expect(result.sequence).not.toContain("q=0");
     expect(result.sequence.endsWith("\u001b[u")).toBe(true);
     expect(result.sequence).not.toContain("font");
     expect(buildKittyPng(png, { row: 3, column: 4, columns: 7, rows: 2 })).toEqual(result);
@@ -44,8 +53,8 @@ describe("Kitty graphics emitter", () => {
   });
 
   it("exposes trusted delete-by-id and delete-all controls", () => {
-    expect(buildKittyDeleteById(9)).toBe("\u001b_Ga=d,d=I,i=9\u001b\\");
-    expect(buildKittyDeleteAll()).toBe("\u001b_Ga=d,d=A\u001b\\");
+    expect(buildKittyDeleteById(9)).toBe("\u001b_Ga=d,d=I,i=9,q=2\u001b\\");
+    expect(buildKittyDeleteAll()).toBe("\u001b_Ga=d,d=A,q=2\u001b\\");
     expect(buildKittyDeleteById(0)).toBeUndefined();
   });
 });

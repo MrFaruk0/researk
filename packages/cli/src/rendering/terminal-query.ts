@@ -4,6 +4,7 @@ import {
   detectTerminalCapability,
   type TerminalCapability,
   type TerminalGraphicsProtocol,
+  terminalEnvironmentGateReason,
 } from "./terminal.js";
 
 const ESC = 0x1b;
@@ -14,6 +15,7 @@ const MAX_QUERY_TIMEOUT_MS = 100;
 const DEFAULT_QUERY_TIMEOUT_MS = 100;
 const DEFAULT_RESPONSE_BUFFER_BYTES = 8 * 1024;
 const MAX_RESPONSE_BUFFER_BYTES = 16 * 1024;
+const LATE_BROKER_WINDOW_MS = 50;
 const MAX_CELL_PIXELS = 4096;
 const MAX_CELL_AREA = MAX_CELL_PIXELS * MAX_CELL_PIXELS;
 
@@ -49,35 +51,31 @@ export function parseKittyGraphicsResponse(
   if (start < 0) return undefined;
   const end = bytes.indexOf(STRING_TERMINATOR, start + APC_START.length);
   if (end < 0) return undefined;
-  const body = bytes.subarray(start + APC_START.length, end).toString("ascii");
-  const separator = body.indexOf(";");
+  const bodyBytes = bytes.subarray(start + APC_START.length, end);
+  if (!isPrintableAsciiBytes(bodyBytes)) return undefined;
+  const separator = bodyBytes.indexOf(0x3b);
   if (separator < 0) return undefined;
-  const controls = body.slice(0, separator);
-  const message = body.slice(separator + 1);
-  if (!isPrintableAscii(controls) || !isPrintableAscii(message) || message.length === 0) {
+  const controls = bodyBytes.subarray(0, separator).toString("ascii");
+  const message = bodyBytes.subarray(separator + 1).toString("ascii");
+  if (controls.length === 0 || message.length === 0) {
     return undefined;
   }
 
-  let id: number | undefined;
-  if (controls.length > 0) {
-    for (const field of controls.split(",")) {
-      const equals = field.indexOf("=");
-      if (equals <= 0 || equals === field.length - 1) return undefined;
-      const key = field.slice(0, equals);
-      const value = field.slice(equals + 1);
-      if (key === "i") {
-        if (!/^\d+$/u.test(value)) return undefined;
-        const parsed = Number(value);
-        if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 0xffff_ffff) {
-          return undefined;
-        }
-        id = parsed;
-      }
-    }
+  // A query reply has exactly one control field. Reject duplicate/unknown fields instead of
+  // letting unrelated Kitty APCs or malformed controls influence capability selection.
+  const equals = controls.indexOf("=");
+  if (equals <= 0 || equals === controls.length - 1 || controls.indexOf(",") >= 0) {
+    return undefined;
   }
+  const key = controls.slice(0, equals);
+  const value = controls.slice(equals + 1);
+  if (key !== "i" || !/^\d+$/u.test(value)) return undefined;
+  const id = Number(value);
+  if (!Number.isSafeInteger(id) || id < 1 || id > 0xffff_ffff) return undefined;
+  if (!isPrintableAscii(message)) return undefined;
   const explicitOk = message === "OK";
   return {
-    ...(id === undefined ? {} : { id }),
+    id,
     message,
     status: explicitOk ? "ok" : "error",
     explicitOk,
@@ -94,10 +92,9 @@ export function parseDa1Parameters(input: string | Uint8Array): readonly number[
   const match = findCsi(bytes, "c");
   if (match === undefined) return undefined;
   let parameters = match.parameters;
-  if (parameters.startsWith("?") || parameters.startsWith(">")) {
-    parameters = parameters.slice(1);
-  }
-  if (parameters.length === 0) return [];
+  if (!parameters.startsWith("?")) return undefined;
+  parameters = parameters.slice(1);
+  if (parameters.length === 0) return undefined;
   if (!/^\d+(?:;\d+)*$/u.test(parameters)) return undefined;
   const values = parameters.split(";").map((value) => Number(value));
   if (values.some((value) => !Number.isSafeInteger(value) || value < 0)) return undefined;
@@ -137,6 +134,13 @@ export interface TerminalQueryInput {
   off?(event: "data", listener: (chunk: Buffer | Uint8Array | string) => void): unknown;
   removeListener?(event: "data", listener: (chunk: Buffer | Uint8Array | string) => void): unknown;
 }
+
+type ReadableProbeInput = TerminalQueryInput & {
+  readonly read?: () => Buffer | Uint8Array | string | null;
+  on(event: "readable", listener: () => void): unknown;
+  off?(event: "readable", listener: () => void): unknown;
+  removeListener?(event: "readable", listener: () => void): unknown;
+};
 
 export type TerminalQueryOutput = Writable & { readonly isTTY?: boolean };
 
@@ -237,6 +241,7 @@ function runProbe(options: TerminalCapabilityProbeOptions): Promise<TerminalCapa
     const replayParts: Buffer[] = [];
     const handoffParts: Buffer[] = [];
     const replayHandler = options.replay ?? options.onReplay;
+    const readableInput = options.stdin as ReadableProbeInput;
     let kittyResponse: KittyGraphicsResponse | undefined;
     let da1Parameters: readonly number[] | undefined;
     let cellPixels: CellPixelDimensions | undefined;
@@ -245,6 +250,15 @@ function runProbe(options: TerminalCapabilityProbeOptions): Promise<TerminalCapa
     let replaySize = 0;
     let replayExternalized = false;
     let replayOverflow = false;
+    let lateBrokerActive = false;
+    let lateTimer: ReturnType<typeof setTimeout> | undefined;
+    let latePending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    const lateReplayParts: Buffer[] = [];
+    let lateReplayBytes = 0;
+    // Bytes that have already crossed the ordinary replay budget still have to stay ordered
+    // behind an unresolved protocol candidate. They are deferred until the late broker retires;
+    // keeping them separate means the candidate never consumes the ordinary replay budget.
+    const lateHandoffParts: Buffer[] = [];
 
     const wasPaused = options.stdin.isPaused?.();
     const wasFlowing = options.stdin.readableFlowing;
@@ -310,6 +324,198 @@ function runProbe(options: TerminalCapabilityProbeOptions): Promise<TerminalCapa
       }
     };
 
+    function removeLateListener(): void {
+      try {
+        if (readableInput.off !== undefined) readableInput.off("readable", onLateReadable);
+        else readableInput.removeListener?.("readable", onLateReadable);
+      } catch {
+        // A minimal injected stream may not expose readable-listener removal.
+      }
+    }
+
+    function retireLateBroker(extra?: Uint8Array): void {
+      if (!lateBrokerActive) return;
+      lateBrokerActive = false;
+      if (lateTimer !== undefined) clearTimeout(lateTimer);
+      lateTimer = undefined;
+      removeLateListener();
+      const replay = Buffer.concat([
+        ...lateHandoffParts,
+        ...lateReplayParts,
+        latePending,
+        ...(extra === undefined || extra.length === 0 ? [] : [Buffer.from(extra)]),
+      ]);
+      latePending = Buffer.alloc(0);
+      lateReplayParts.length = 0;
+      lateReplayBytes = 0;
+      lateHandoffParts.length = 0;
+      if (replay.length > 0) {
+        try {
+          replayHandler?.(Buffer.from(replay));
+        } catch {
+          // The probe has no authority to make a caller's replay sink succeed.
+        }
+      }
+      const dataListeners = (
+        options.stdin as { readonly listenerCount?: (event: string) => number }
+      ).listenerCount?.("data");
+      try {
+        if (wasFlowing === true || (dataListeners ?? 0) > 0) options.stdin.resume?.();
+        else options.stdin.pause?.();
+      } catch {
+        // Keep the lifecycle result stable if a minimal stream rejects flow restoration.
+      }
+    }
+
+    function appendLateReplay(bytes: Uint8Array): boolean {
+      if (bytes.length === 0) return true;
+      if (lateReplayBytes + bytes.length > maxReplayBytes) return false;
+      lateReplayParts.push(Buffer.from(bytes));
+      lateReplayBytes += bytes.length;
+      return true;
+    }
+
+    function queueLateReplay(bytes: Uint8Array): void {
+      if (bytes.length === 0) return;
+      // This is called while promoting the probe buffer, before the late broker is active. If the
+      // ordinary budget is already full, classify the excess as an ordered handoff; unlike the
+      // candidate it is no longer parsed or retained as protocol state.
+      if (!appendLateReplay(bytes)) {
+        // Preserve the order of any ordinary bytes already queued before this chunk when moving
+        // the queue out of the bounded replay bucket.
+        lateHandoffParts.push(...lateReplayParts, Buffer.from(bytes));
+        lateReplayParts.length = 0;
+        lateReplayBytes = 0;
+      }
+    }
+
+    function queueLatePending(bytes: Uint8Array): void {
+      if (bytes.length === 0) return;
+      // The unresolved candidate has its own response-sized bound. It must not be externalized
+      // merely because ordinary replay has reached maxReplayBytes.
+      latePending = Buffer.from(bytes);
+    }
+
+    function drainLatePending(): void {
+      while (latePending.length > 0 && lateBrokerActive) {
+        const candidate = nextCandidate(latePending);
+        if (candidate === undefined) {
+          const retained = protocolPrefixSuffixLength(latePending);
+          const flushLength = latePending.length - retained;
+          if (flushLength > 0) {
+            const flushed = latePending.subarray(0, flushLength);
+            latePending = latePending.subarray(flushLength);
+            if (!appendLateReplay(flushed)) {
+              // Leave the unconsumed bytes in place so retirement emits them in their original
+              // order, including a possible lone ESC prefix.
+              latePending = Buffer.concat([flushed, latePending]);
+              retireLateBroker();
+              return;
+            }
+          }
+          if (latePending.length === 0) retireLateBroker();
+          return;
+        }
+        if (candidate.start > 0) {
+          const prefix = latePending.subarray(0, candidate.start);
+          if (!appendLateReplay(prefix)) {
+            retireLateBroker();
+            return;
+          }
+          latePending = latePending.subarray(candidate.start);
+        }
+        if (candidate.kind === "kitty") {
+          const end = latePending.indexOf(STRING_TERMINATOR, APC_START.length);
+          if (end < 0) return;
+          const frame = latePending.subarray(0, end + STRING_TERMINATOR.length);
+          const parsed = parseKittyGraphicsResponse(frame);
+          if (parsed === undefined || parsed.id !== 31) {
+            if (!appendLateReplay(frame)) {
+              retireLateBroker();
+              return;
+            }
+          }
+          latePending = latePending.subarray(frame.length);
+          continue;
+        }
+        const final = findCsiFinal(latePending);
+        if (final === undefined) return;
+        const frame = latePending.subarray(0, final + 1);
+        if (latePending[final] === 0x63) {
+          if (parseDa1Parameters(frame) === undefined) {
+            const first = latePending.subarray(0, 1);
+            if (!appendLateReplay(first)) {
+              retireLateBroker();
+              return;
+            }
+            latePending = latePending.subarray(1);
+          } else {
+            latePending = latePending.subarray(frame.length);
+          }
+        } else if (latePending[final] === 0x74) {
+          if (parseCellPixelReply(frame) === undefined) {
+            const first = latePending.subarray(0, 1);
+            if (!appendLateReplay(first)) {
+              retireLateBroker();
+              return;
+            }
+            latePending = latePending.subarray(1);
+          } else {
+            latePending = latePending.subarray(frame.length);
+          }
+        } else {
+          const first = latePending.subarray(0, 1);
+          if (!appendLateReplay(first)) {
+            retireLateBroker();
+            return;
+          }
+          latePending = latePending.subarray(1);
+        }
+      }
+      if (latePending.length === 0) retireLateBroker();
+    }
+
+    function onLateReadable(): void {
+      if (!lateBrokerActive || readableInput.read === undefined) return;
+      let chunk = readableInput.read();
+      while (chunk !== null && lateBrokerActive) {
+        const bytes = toBuffer(chunk);
+        if (bytes.length > 0) {
+          if (latePending.length + bytes.length > maxResponseBytes) {
+            // Retire before handing off: otherwise the callback's unshift can be read again by
+            // this broker and duplicate the same user bytes. The incoming chunk is included in
+            // the one ordered handoff, so the response-sized candidate bound never turns into
+            // silent data loss.
+            retireLateBroker(bytes);
+          } else {
+            latePending =
+              latePending.length === 0 ? Buffer.from(bytes) : Buffer.concat([latePending, bytes]);
+            drainLatePending();
+          }
+        }
+        if (!lateBrokerActive) break;
+        chunk = readableInput.read();
+      }
+    }
+
+    function startLateBroker(): boolean {
+      // This retirement window never extends the probe promise or pre-Ink startup delay. It only
+      // quarantines bytes already buffered by a paused Readable; once ordinary bytes are observed,
+      // they are handed back and the broker retires. Replies after this bounded handoff boundary
+      // cannot be distinguished from user input without a terminal-owned input multiplexer.
+      if (replayHandler === undefined || readableInput.read === undefined) return false;
+      lateBrokerActive = true;
+      try {
+        readableInput.on("readable", onLateReadable);
+      } catch {
+        lateBrokerActive = false;
+        return false;
+      }
+      lateTimer = setTimeout(retireLateBroker, LATE_BROKER_WINDOW_MS);
+      lateTimer.unref?.();
+      return true;
+    }
+
     const finish = (
       timedOut: boolean,
       reason: string,
@@ -319,24 +525,88 @@ function runProbe(options: TerminalCapabilityProbeOptions): Promise<TerminalCapa
       finished = true;
       if (timer !== undefined) clearTimeout(timer);
       removeListener();
+      let bufferedReplay = Buffer.concat(replayParts);
+      let handoff = Buffer.concat(handoffParts);
+      let keepLateBroker = false;
+      if (
+        timedOut &&
+        latePending.length > 0 &&
+        replayHandler !== undefined &&
+        readableInput.read !== undefined
+      ) {
+        // Promote the unresolved candidate independently of ordinary replay. Prefix bytes stay in
+        // the ordered late output until the broker retires, so a replay sink that unshifts them
+        // cannot feed them back into the active candidate parser.
+        if (handoff.length > 0) {
+          lateHandoffParts.push(handoff);
+          handoffParts.length = 0;
+          handoff = Buffer.alloc(0);
+        }
+        if (bufferedReplay.length > 0) {
+          if (lateReplayBytes + bufferedReplay.length <= maxReplayBytes) {
+            lateReplayParts.unshift(bufferedReplay);
+            lateReplayBytes += bufferedReplay.length;
+            replayParts.length = 0;
+            replaySize = 0;
+            bufferedReplay = Buffer.alloc(0);
+          } else {
+            // The candidate remains late-brokered even when the ordinary replay prefix has
+            // already reached its cap. The excess is an ordered handoff, never candidate state.
+            lateHandoffParts.push(bufferedReplay);
+            if (lateReplayParts.length > 0) {
+              lateHandoffParts.push(...lateReplayParts);
+              lateReplayParts.length = 0;
+              lateReplayBytes = 0;
+            }
+            replayParts.length = 0;
+            replaySize = 0;
+            bufferedReplay = Buffer.alloc(0);
+          }
+        }
+        keepLateBroker = startLateBroker();
+      } else if (
+        timedOut &&
+        handoff.length === 0 &&
+        bufferedReplay.length === 0 &&
+        latePending.length === 0 &&
+        lateReplayParts.length === 0
+      ) {
+        // With no initial bytes, retain the old bounded retirement behavior so replies or user
+        // input arriving immediately after the timeout are still brokered before handoff.
+        keepLateBroker = startLateBroker();
+      }
+      let lateSeed = Buffer.alloc(0);
+      if (
+        !keepLateBroker &&
+        (lateHandoffParts.length > 0 || latePending.length > 0 || lateReplayParts.length > 0)
+      ) {
+        lateSeed = Buffer.concat([...lateHandoffParts, ...lateReplayParts, latePending]);
+        lateHandoffParts.length = 0;
+        latePending = Buffer.alloc(0);
+        lateReplayParts.length = 0;
+        lateReplayBytes = 0;
+      }
       restoreInput();
-      const bufferedReplay = Buffer.concat(replayParts);
-      const handoff = Buffer.concat(handoffParts);
       let replay = bufferedReplay;
       try {
         if (replayHandler !== undefined) {
           if (handoff.length > 0) replayHandler(Buffer.from(handoff));
-          else if (bufferedReplay.length > 0) replayHandler(Buffer.from(bufferedReplay));
-        } else if (handoff.length > 0) {
-          replay = Buffer.concat([handoff, bufferedReplay]);
+          else if (!keepLateBroker && (bufferedReplay.length > 0 || lateSeed.length > 0)) {
+            replayHandler(Buffer.concat([bufferedReplay, lateSeed]));
+          }
+        } else if (handoff.length > 0 || lateSeed.length > 0) {
+          replay = Buffer.concat([handoff, bufferedReplay, lateSeed]);
         }
       } catch {
         // A failed handoff remains available in the result rather than being silently discarded.
-        replay = Buffer.concat([handoff, bufferedReplay]);
+        replay = Buffer.concat([handoff, bufferedReplay, lateSeed]);
       }
       const protocol =
         forcedProtocol ??
-        (kittyResponse?.explicitOk === true
+        (kittyResponse?.explicitOk === true &&
+        kittyResponse.id === 31 &&
+        da1Parameters !== undefined &&
+        cellPixels !== undefined
           ? "kitty"
           : syncCapability.protocol === "iterm2"
             ? "iterm2"
@@ -444,11 +714,26 @@ function runProbe(options: TerminalCapabilityProbeOptions): Promise<TerminalCapa
       }
     };
 
+    const preservePendingForLate = (): void => {
+      if (pending.length === 0) return;
+      const candidate = nextCandidate(pending);
+      if (candidate === undefined) {
+        const retained = protocolPrefixSuffixLength(pending);
+        const flushLength = pending.length - retained;
+        if (flushLength > 0) queueLateReplay(pending.subarray(0, flushLength));
+        if (retained > 0) queueLatePending(pending.subarray(flushLength));
+        else if (flushLength === 0) appendReplay(pending);
+      } else {
+        if (candidate.start > 0) queueLateReplay(pending.subarray(0, candidate.start));
+        queueLatePending(pending.subarray(candidate.start));
+      }
+      pending = Buffer.alloc(0);
+    };
+
     // The listener is installed while paused, then the previous flow state is restored at exit.
     try {
       timer = setTimeout(() => {
-        if (pending.length > 0) appendReplay(pending);
-        pending = Buffer.alloc(0);
+        preservePendingForLate();
         finish(true, "terminal graphics probe timed out");
       }, timeoutMs);
       options.stdin.pause?.();
@@ -487,17 +772,8 @@ function probeGateReason(
       reason: "terminal graphics probe disabled for this output mode",
     };
   }
-  if (options.env.TERM === "dumb" || options.env.CI !== undefined) {
-    return { protocol: "unsupported", reason: "non-interactive terminal environment" };
-  }
-  if (
-    options.env.TMUX !== undefined ||
-    options.env.STY !== undefined ||
-    options.env.TERM === "screen" ||
-    options.env.TERM?.startsWith("screen-")
-  ) {
-    return { protocol: "unsupported", reason: "multiplexer passthrough is not verified" };
-  }
+  const environmentGate = terminalEnvironmentGateReason(options.env);
+  if (environmentGate !== undefined) return { protocol: "unsupported", reason: environmentGate };
   return undefined;
 }
 
@@ -612,6 +888,13 @@ function isPrintableAscii(value: string): boolean {
   for (const character of value) {
     const code = character.charCodeAt(0);
     if (code < 0x20 || code > 0x7e) return false;
+  }
+  return true;
+}
+
+function isPrintableAsciiBytes(value: Uint8Array): boolean {
+  for (const byte of value) {
+    if (byte < 0x20 || byte > 0x7e) return false;
   }
   return true;
 }

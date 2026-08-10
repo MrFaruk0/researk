@@ -53,7 +53,7 @@ function createGraphicsRuntime(
   requests: Array<{ readonly display: boolean; readonly tex: string }>,
 ) {
   return new FormulaGraphicsRuntime({
-    capability: { protocol: "kitty" },
+    capability: { cellPixels: { height: 20, width: 10 }, protocol: "kitty" },
     columns: 48,
     renderer: async (request) => {
       requests.push({ display: request.display, tex: request.tex });
@@ -66,6 +66,40 @@ function createGraphicsRuntime(
     },
     stdout: { write: () => true },
   });
+}
+
+function createMeasuredGraphicsRuntime(
+  protocol: "kitty" | "sixel",
+  requests: Array<{ readonly display: boolean; readonly tex: string }>,
+  measure: () =>
+    | { readonly height: number; readonly width: number; readonly x: number; readonly y: number }
+    | undefined,
+) {
+  const writes: string[] = [];
+  const stdout = {
+    write: (chunk: string): boolean => {
+      writes.push(chunk);
+      return true;
+    },
+  };
+  const capability = { cellPixels: { height: 20, width: 10 }, protocol };
+  const runtime = new FormulaGraphicsRuntime({
+    capability,
+    columns: 48,
+    measure,
+    renderer: async (request) => {
+      requests.push({ display: request.display, tex: request.tex });
+      return {
+        height: 20,
+        pixels: new Uint8Array(20 * 20 * 4),
+        png: Uint8Array.from([0x89, 0x50, 0x4e, 0x47]),
+        width: 20,
+      };
+    },
+    rows: 10,
+    stdout,
+  });
+  return { runtime, writes };
 }
 
 async function settleLayout(): Promise<void> {
@@ -216,6 +250,106 @@ describe("conversation content and viewport", () => {
 
     view.unmount();
     runtime.dispose();
+  });
+
+  it.each(["kitty", "sixel"] as const)(
+    "rasterizes and places an assistant formula through the %s frame lifecycle",
+    async (protocol) => {
+      const requests: Array<{ readonly display: boolean; readonly tex: string }> = [];
+      const source = "Rendered answer: $x^2 + y^2$";
+      const [formula] = indexConversationFormulas([entry("assistant-placed", "assistant", source)]);
+      expect(formula).toBeDefined();
+      const runtime = createMeasuredGraphicsRuntime(protocol, requests, () => ({
+        height: 1,
+        width: 2,
+        x: 1,
+        y: 1,
+      }));
+      const view = render(
+        transcript(
+          monoTheme,
+          [entry("assistant-placed", "assistant", source)],
+          8,
+          0,
+          undefined,
+          48,
+          runtime.runtime,
+        ),
+      );
+      await settleLayout();
+
+      expect(runtime.runtime.registrationCount()).toBe(1);
+      expect(requests).toEqual([{ display: false, tex: "x^2 + y^2" }]);
+      expect(view.lastFrame() ?? "").toContain("Rendered answer:");
+      expect(view.lastFrame() ?? "").toContain("$x^2 + y^2$");
+
+      const generation = runtime.runtime.beforeFrame(48, 10);
+      await runtime.runtime.afterFrame(generation);
+      await settleLayout();
+
+      expect(formula).toBeDefined();
+      expect(runtime.runtime.isVisible(formula?.key ?? "")).toBe(true);
+      expect(runtime.runtime.placedCount()).toBe(1);
+      expect(view.lastFrame() ?? "").not.toContain(source);
+      const output = runtime.writes.join("");
+      if (protocol === "kitty") {
+        expect(output).toContain("\u001b_Ga=T");
+        expect(output).toContain("c=2,r=1");
+      } else {
+        expect(output).toContain("\u001bP0;1q");
+        expect(output).toContain("\u001b[2;2H");
+      }
+
+      view.unmount();
+      runtime.runtime.dispose();
+    },
+  );
+
+  it("falls back to the exact source when a rendered formula becomes invalidly placed", async () => {
+    const requests: Array<{ readonly display: boolean; readonly tex: string }> = [];
+    const source = "Answer with a formula: $\\frac{a}{b}$";
+    const [formula] = indexConversationFormulas([
+      entry("assistant-invalid-placement", "assistant", source),
+    ]);
+    expect(formula).toBeDefined();
+    let validPlacement = true;
+    const runtime = createMeasuredGraphicsRuntime("kitty", requests, () =>
+      validPlacement ? { height: 1, width: 2, x: 1, y: 1 } : undefined,
+    );
+    const view = render(
+      transcript(
+        monoTheme,
+        [entry("assistant-invalid-placement", "assistant", source)],
+        8,
+        0,
+        undefined,
+        48,
+        runtime.runtime,
+      ),
+    );
+    await settleLayout();
+
+    const firstGeneration = runtime.runtime.beforeFrame(48, 10);
+    await runtime.runtime.afterFrame(firstGeneration);
+    await settleLayout();
+    expect(runtime.runtime.isVisible(formula?.key ?? "")).toBe(true);
+    expect(view.lastFrame() ?? "").not.toContain("$\\frac{a}{b}$");
+    const kittyPlacementMarker = `${String.fromCharCode(27)}_Ga=T`;
+    const placedOutputCount = runtime.writes.join("").split(kittyPlacementMarker).length - 1;
+
+    validPlacement = false;
+    const invalidGeneration = runtime.runtime.beforeFrame(48, 10);
+    await runtime.runtime.afterFrame(invalidGeneration);
+    await settleLayout();
+
+    expect(runtime.runtime.isVisible(formula?.key ?? "")).toBe(false);
+    expect(runtime.runtime.placedCount()).toBe(0);
+    expect(view.lastFrame() ?? "").toContain("Answer with a formula:");
+    expect(view.lastFrame() ?? "").toContain("$\\frac{a}{b}$");
+    expect(runtime.writes.join("").split(kittyPlacementMarker).length - 1).toBe(placedOutputCount);
+
+    view.unmount();
+    runtime.runtime.dispose();
   });
 
   it("keeps non-assistant and incomplete math source-only and marks selected formulas", async () => {

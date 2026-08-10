@@ -1646,6 +1646,7 @@ export function App(props: AppProps): ReactNode {
     if (view === undefined || formula === undefined) return undefined;
     const previewSource = selectedFormulaPreviewSource ?? formula.source;
     const graphicsSupported = props.graphicsRuntime?.supportsGraphics() === true;
+    const localDraftPreview = view.appliedDraft !== undefined && !view.showSource;
     // An absent or unsupported runtime must not be represented as a fake "preview": showing the
     // source directly lets the overlay label it honestly. A supported runtime can still fail while
     // rendering, so FormulaGraphic retains its exact-source fallback under an explicit status.
@@ -1662,11 +1663,16 @@ export function App(props: AppProps): ReactNode {
         />
       );
     const exactSource = view.showSource ? formula.source : previewSource;
-    const sourceLabel =
-      !view.showSource && !graphicsSupported
-        ? "Exact source · typeset preview unavailable"
-        : undefined;
-    const previewLabel = "Typeset preview · exact source fallback";
+    const sourceLabel = view.showSource
+      ? undefined
+      : localDraftPreview
+        ? "Local draft · typeset preview unavailable"
+        : !graphicsSupported
+          ? "Exact source · typeset preview unavailable"
+          : undefined;
+    const previewLabel = localDraftPreview
+      ? "Local draft preview/fallback · canonical source unchanged"
+      : "Typeset preview · exact source fallback";
     if (view.mode === "edit") {
       return (
         <FormulaOverlay
@@ -1681,6 +1687,7 @@ export function App(props: AppProps): ReactNode {
           previewLabel={previewLabel}
           exactSource={exactSource}
           sourceLabel={sourceLabel}
+          localDraft={localDraftPreview}
           width={sourcePanelWidth}
           height={conversationHeight}
           onDraftChange={(draft, cursor) =>
@@ -1719,6 +1726,7 @@ export function App(props: AppProps): ReactNode {
         previewLabel={previewLabel}
         exactSource={exactSource}
         sourceLabel={sourceLabel}
+        localDraft={localDraftPreview}
         width={sourcePanelWidth}
         height={conversationHeight}
         onPrevious={() => {

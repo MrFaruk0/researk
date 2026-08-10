@@ -134,6 +134,23 @@ describe("formula overlay", () => {
     expect(frame).toContain("$x^2$");
   });
 
+  it.each([1, 2, 3, 4])(
+    "makes every browse operation discoverable at compact height %i",
+    (height) => {
+      const view = render(
+        <FormulaOverlay theme={theme} formula={formula()} width={70} height={height} />,
+      );
+      const frame = view.lastFrame() ?? "";
+      expect(frame).toContain("$x^2$");
+      expect(frame).toContain("↑↓/jk");
+      expect(frame).toContain("c copy");
+      expect(frame).toContain("e edit");
+      expect(frame).toContain("i insert");
+      expect(frame).toContain("s source");
+      expect(frame).toContain("Esc close");
+    },
+  );
+
   it.each([1, 2, 3, 4, 5])("keeps edit controls and draft usable at height %i", (height) => {
     const view = render(
       <FormulaOverlay
@@ -151,5 +168,54 @@ describe("formula overlay", () => {
     expect(frame.split("\n")).toHaveLength(height);
     expect(frame).toContain("Esc cancel");
     expect(frame).toContain("x+1");
+  });
+
+  it.each([1, 2, 3, 4])(
+    "makes every edit operation discoverable at compact height %i",
+    (height) => {
+      const view = render(
+        <FormulaOverlay
+          theme={theme}
+          mode="edit"
+          formula={formula()}
+          draft="x+1"
+          cursor={2}
+          width={70}
+          height={height}
+          sourceLabel="Exact source · typeset preview unavailable"
+        />,
+      );
+      const frame = view.lastFrame() ?? "";
+      expect(frame).toContain("x+1");
+      expect(frame).toContain("←→");
+      expect(frame).toContain("Backspace/Del");
+      expect(frame).toContain("Ctrl+J");
+      expect(frame).toContain("Enter apply");
+      expect(frame).toContain("Esc cancel");
+    },
+  );
+
+  it("labels a local draft preview and fallback without calling either exact source", () => {
+    const ref = formula();
+    const preview = render(
+      <FormulaOverlay
+        theme={theme}
+        formula={ref}
+        localDraft
+        exactSource="$x+1$"
+        preview={<Text>rendered local draft</Text>}
+        width={70}
+      />,
+    );
+    const previewFrame = preview.lastFrame() ?? "";
+    expect(previewFrame).toContain("Local draft preview/fallback");
+    expect(previewFrame).not.toContain("Exact source");
+
+    const fallback = render(
+      <FormulaOverlay theme={theme} formula={ref} localDraft exactSource="$x+1$" width={70} />,
+    );
+    const fallbackFrame = fallback.lastFrame() ?? "";
+    expect(fallbackFrame).toContain("Local draft · typeset preview unavailable");
+    expect(fallbackFrame).not.toContain("Exact source");
   });
 });

@@ -275,6 +275,18 @@ describe("trusted terminal math path", () => {
     expect(detectTerminalCapability(tty, { ...ITERM_ENV, TMUX: "/tmp/x" }).protocol).toBe(
       "unsupported",
     );
+    expect(detectTerminalCapability(tty, { ...ITERM_ENV, ZELLIJ: "1" }).protocol).toBe(
+      "unsupported",
+    );
+    expect(detectTerminalCapability(tty, { ...ITERM_ENV, TERM: " TMUX-256COLOR " }).protocol).toBe(
+      "unsupported",
+    );
+    expect(detectTerminalCapability(tty, { ...ITERM_ENV, TERM: "screen-256color" }).protocol).toBe(
+      "unsupported",
+    );
+    expect(detectTerminalCapability(tty, { ...ITERM_ENV, TERM: " DuMb " }).protocol).toBe(
+      "unsupported",
+    );
     // A trusted identity without a parseable version is not positively supported.
     expect(detectTerminalCapability(tty, { TERM_PROGRAM: "iTerm.app" }).protocol).toBe(
       "unsupported",

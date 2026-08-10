@@ -1351,8 +1351,43 @@ npm run typecheck --workspace @researk/cli
 npm run release:verify-version -- --tag v0.1.0-alpha.4                                                                                           # 7 public packages
 ```
 
-Markdown link targets were inspected against the official VS Code terminal documentation. The
-independent review and final full workspace gate set are still pending at the time of this write.
+Markdown link targets were inspected against the official VS Code terminal documentation. At the
+time of this earlier documentation pass, the independent review and final full workspace gate set
+were still pending; the 2026-08-11 alpha.4 completion milestone below supersedes that status.
 Manual real-terminal visual smoke also remains relevant: exercise Kitty in a recent VS Code
 terminal with image/GPU support and the documented Windows ConPTY DLL setting when needed, and
 exercise Windows Terminal Sixel only on a terminal that actually advertises it.
+
+## 2026-08-11 alpha.4 completion milestone
+
+The final alpha.4 formula, graphics, terminal-convergence, verification, and standalone packaging
+pass is complete. Independent formula, graphics, and terminal convergence reviews passed, including
+exact reproduction of the replay-cap boundary for both APC and CSI candidates.
+
+### Formula and source boundary
+
+- Formula workspace operations are implemented: keyboard navigation, bounded OSC 52 copy of exact
+  canonical source, local draft edit/rerender, source toggling, and insertion of either the edited
+  draft or original canonical formula.
+- Assistant and persisted session source remain immutable. This milestone makes no CAS
+  simplify/differentiate claim.
+
+### Verification and packaging
+
+- The single `npm run verify` invocation reached lint only after build, all workspace typechecks, and
+  all workspace tests had succeeded. The test run passed 39 files / 626 tests: CLI 31/474; contracts
+  1/10; harness 1/7; latex-renderer 3/117; provider-openai-compatible 1/12; provider-openrouter 1/4;
+  research 1/2.
+- Lint then found only two test-only control-character regex errors. Those errors were fixed, the
+  changed Conversation suite passed 12/12, and subsequent full workspace lint and format-check
+  passed. The original `npm run verify` invocation therefore did not exit zero; the required gates
+  were green after the targeted test fixes.
+- `npm run release:verify-version -- --tag v0.1.0-alpha.4` passed for all 7 public packages.
+- The standalone `0.1.0-alpha.4` tarball and SBOM were built with 67 bundled packages, installed and
+  smoked offline from an unrelated directory, and passed `help` and `version`. Nothing was
+  published.
+
+### Remaining handoff item
+
+Manual visual smoke in a real Kitty/VS Code terminal and Windows Terminal Sixel remains outstanding:
+this environment has no supported interactive real TTY, so those checks could not be run here.

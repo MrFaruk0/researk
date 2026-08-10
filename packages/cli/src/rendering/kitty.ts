@@ -108,10 +108,10 @@ export function buildKittyPng(png: Uint8Array, options: KittyPngOptions = {}): K
   const graphics = chunks.map((chunk, index) => {
     if (index === 0) {
       const more = chunks.length > 1 ? 1 : 0;
-      return `${ESC}_Ga=T,f=100,t=d,i=${imageId},p=${placementId},c=${columns},r=${rows},C=1,m=${more};${chunk}${STRING_TERMINATOR}`;
+      return `${ESC}_Ga=T,f=100,t=d,i=${imageId},p=${placementId},c=${columns},r=${rows},C=1,m=${more},q=2;${chunk}${STRING_TERMINATOR}`;
     }
     const more = index < chunks.length - 1 ? 1 : 0;
-    return `${ESC}_Gm=${more};${chunk}${STRING_TERMINATOR}`;
+    return `${ESC}_Gm=${more},q=2;${chunk}${STRING_TERMINATOR}`;
   });
   return {
     ok: true,
@@ -151,12 +151,12 @@ export const emitKittyImage = emitKittyPng;
 /** Return a trusted numeric delete-by-image-ID sequence. */
 export function kittyDeleteById(imageId: number = KITTY_IMAGE_ID): string | undefined {
   if (!validId(imageId, MAX_IMAGE_ID)) return undefined;
-  return `${ESC}_Ga=d,d=I,i=${imageId}${STRING_TERMINATOR}`;
+  return `${ESC}_Ga=d,d=I,i=${imageId},q=2${STRING_TERMINATOR}`;
 }
 
 /** Delete all visible Kitty image placements. */
 export function kittyDeleteAll(): string {
-  return `${ESC}_Ga=d,d=A${STRING_TERMINATOR}`;
+  return `${ESC}_Ga=d,d=A,q=2${STRING_TERMINATOR}`;
 }
 
 export const buildKittyDeleteById = kittyDeleteById;

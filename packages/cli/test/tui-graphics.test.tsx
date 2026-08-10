@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { FormulaRasterCache, type FormulaRasterRenderer } from "../src/tui/formula-renderer.js";
 import {
   FormulaGraphic,
+  type FormulaGraphicsCapability,
   type FormulaGraphicsMetrics,
   FormulaGraphicsRuntime,
 } from "../src/tui/graphics.js";
@@ -38,7 +39,11 @@ function setup(
   const ref = {} as Parameters<NonNullable<FormulaGraphicsRuntime["register"]>>[0];
   const runtime = new FormulaGraphicsRuntime({
     cache,
-    capability: { protocol, ...extra },
+    capability: {
+      protocol,
+      ...(protocol === "kitty" ? { cellPixels: { height: 20, width: 10 } } : {}),
+      ...extra,
+    },
     measure: () => metrics,
     rows: 10,
     stdout,
@@ -64,6 +69,37 @@ describe("FormulaGraphicsRuntime", () => {
     );
     expect(lastFrame()).toContain("\\u{001b}");
     expect(stdout.writes).toEqual([]);
+    runtime.dispose();
+  });
+
+  it.each([
+    undefined,
+    { height: 20, width: 0 },
+    { height: 20, width: Number.NaN },
+    { height: Number.POSITIVE_INFINITY, width: 10 },
+    { height: 20, width: -1 },
+  ])("requires measured Kitty cell pixels for graphics (%j)", (cellPixels) => {
+    const stdout = new FakeStdout();
+    const runtime = new FormulaGraphicsRuntime({
+      capability: {
+        ...(cellPixels === undefined ? {} : { cellPixels }),
+        protocol: "kitty",
+      } as FormulaGraphicsCapability,
+      stdout,
+    });
+    const source = "$x$";
+    const view = render(
+      <FormulaGraphic
+        exactSource={source}
+        formulaKey="kitty-metrics"
+        innerTex="x"
+        runtime={runtime}
+      />,
+    );
+    expect(runtime.supportsGraphics()).toBe(false);
+    expect(view.lastFrame()).toContain(source);
+    expect(stdout.writes).toEqual([]);
+    view.unmount();
     runtime.dispose();
   });
 
@@ -107,6 +143,48 @@ describe("FormulaGraphicsRuntime", () => {
     await runtime.afterFrame(generation);
     expect(runtime.isVisible("bottom")).toBe(false);
     expect(stdout.writes).toEqual([]);
+    runtime.dispose();
+  });
+
+  it("checks the complete raster cell footprint at clip boundaries", async () => {
+    const { ref, runtime, stdout } = setup("kitty");
+    expect(
+      runtime.register({
+        clipMetrics: { height: 3, width: 4, x: 0, y: 0 },
+        key: "footprint-outside",
+        // The source box ends exactly at the right clip edge, but the 2-cell raster does not.
+        metrics: { height: 1, width: 1, x: 3, y: 2 },
+        raster: raster(),
+        ref,
+      }),
+    ).toBe(true);
+    expect(
+      runtime.register({
+        clipMetrics: { height: 3, width: 4, x: 0, y: 0 },
+        key: "footprint-edge",
+        // The full 2x1-cell reservation ends exactly on both clip edges and is eligible.
+        metrics: { height: 1, width: 1, x: 2, y: 2 },
+        raster: raster(),
+        ref: {} as Parameters<NonNullable<FormulaGraphicsRuntime["register"]>>[0],
+      }),
+    ).toBe(true);
+    expect(
+      runtime.register({
+        clipMetrics: { height: 4, width: 4, x: 0, y: 0 },
+        key: "footprint-outside-vertical",
+        // A one-row source box fits, while this two-row raster crosses the clip bottom edge.
+        metrics: { height: 1, width: 1, x: 2, y: 3 },
+        raster: raster(20, 40),
+        ref: {} as Parameters<NonNullable<FormulaGraphicsRuntime["register"]>>[0],
+      }),
+    ).toBe(true);
+
+    const generation = runtime.beforeFrame(20, 10);
+    await runtime.afterFrame(generation);
+    expect(runtime.isVisible("footprint-outside")).toBe(false);
+    expect(runtime.isVisible("footprint-outside-vertical")).toBe(false);
+    expect(runtime.isVisible("footprint-edge")).toBe(true);
+    expect(stdout.writes).toHaveLength(1);
     runtime.dispose();
   });
 
@@ -186,7 +264,7 @@ describe("FormulaGraphicsRuntime", () => {
       throw new Error("closed");
     };
     const failedRuntime = new FormulaGraphicsRuntime({
-      capability: { protocol: "kitty" },
+      capability: { cellPixels: { height: 20, width: 10 }, protocol: "kitty" },
       stdout: failing,
       columns: 20,
       rows: 10,
@@ -331,7 +409,7 @@ describe("FormulaGraphicsRuntime", () => {
   ])("rejects invalid measured metrics without placing at origin (%j)", async (metrics) => {
     const stdout = new FakeStdout();
     const runtime = new FormulaGraphicsRuntime({
-      capability: { protocol: "kitty" },
+      capability: { cellPixels: { height: 20, width: 10 }, protocol: "kitty" },
       measure: () => metrics,
       stdout,
       columns: 20,
@@ -357,7 +435,7 @@ describe("FormulaGraphicsRuntime", () => {
     const cache = new FormulaRasterCache(vi.fn<FormulaRasterRenderer>(async () => raster()));
     const runtime = new FormulaGraphicsRuntime({
       cache,
-      capability: { protocol: "kitty" },
+      capability: { cellPixels: { height: 20, width: 10 }, protocol: "kitty" },
       stdout,
       columns: 20,
       rows: 10,
@@ -369,5 +447,87 @@ describe("FormulaGraphicsRuntime", () => {
     expect(view.lastFrame()).toContain(source);
     runtime.dispose();
     view.unmount();
+  });
+
+  it("does not unregister a formula when placement visibility rerenders the component", async () => {
+    const stdout = new FakeStdout();
+    const cache = new FormulaRasterCache(vi.fn<FormulaRasterRenderer>(async () => raster()));
+    const runtime = new FormulaGraphicsRuntime({
+      cache,
+      capability: { cellPixels: { height: 20, width: 10 }, protocol: "kitty" },
+      stdout,
+      columns: 20,
+      rows: 10,
+    });
+    const view = render(
+      <FormulaGraphic
+        exactSource="$x$"
+        formulaKey="react-visible"
+        innerTex="x"
+        runtime={runtime}
+      />,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const generation = runtime.beforeFrame(20, 10);
+    await runtime.afterFrame(generation);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(runtime.placedCount()).toBe(1);
+    expect(runtime.registrationCount()).toBe(1);
+    expect(runtime.isVisible("react-visible")).toBe(true);
+    view.unmount();
+    runtime.dispose();
+  });
+
+  it("retains successful visibility through a redraw without notification oscillation", async () => {
+    const { ref, runtime } = setup("kitty");
+    expect(
+      runtime.register({
+        key: "stable",
+        metrics: { height: 1, width: 2, x: 1, y: 1 },
+        raster: raster(),
+        ref,
+      }),
+    ).toBe(true);
+    let notifications = 0;
+    const unsubscribe = runtime.subscribe(() => {
+      notifications += 1;
+    });
+    const first = runtime.beforeFrame(20, 10);
+    await runtime.afterFrame(first);
+    expect(runtime.isVisible("stable")).toBe(true);
+    const afterPlacementNotifications = notifications;
+
+    const redraw = runtime.beforeFrame(20, 10);
+    expect(runtime.isVisible("stable")).toBe(true);
+    expect(notifications).toBe(afterPlacementNotifications);
+    await runtime.afterFrame(redraw);
+    expect(runtime.isVisible("stable")).toBe(true);
+    expect(notifications).toBe(afterPlacementNotifications);
+    unsubscribe();
+    runtime.dispose();
+  });
+
+  it("restores exact-source visibility when Ink flush is false or rejected", async () => {
+    const { ref, runtime } = setup("kitty");
+    expect(
+      runtime.register({
+        key: "flush-fallback",
+        metrics: { height: 1, width: 2, x: 1, y: 1 },
+        raster: raster(),
+        ref,
+      }),
+    ).toBe(true);
+    const first = runtime.beforeFrame(20, 10);
+    await runtime.afterFrame(first);
+    expect(runtime.isVisible("flush-fallback")).toBe(true);
+
+    const skipped = runtime.beforeFrame(20, 10);
+    await runtime.afterFrame(skipped, false);
+    expect(runtime.isVisible("flush-fallback")).toBe(false);
+
+    const rejected = runtime.beforeFrame(20, 10);
+    await runtime.afterFrame(rejected, Promise.reject(new Error("Ink flush failed")));
+    expect(runtime.isVisible("flush-fallback")).toBe(false);
+    runtime.dispose();
   });
 });
