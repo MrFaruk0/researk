@@ -53,3 +53,5 @@ Desktop.ini
 # Dependency lockfiles are intentionally not ignored.
 # Research sources and artifacts (.tex, .bib, .pdf, data) are intentionally
 # not ignored; repository owners must decide what they have the right to commit.
+
+AGENTS.md
