@@ -2,6 +2,10 @@ import { Buffer } from "node:buffer";
 import { liteAdaptor } from "@mathjax/src/js/adaptors/liteAdaptor.js";
 import { RegisterHTMLHandler } from "@mathjax/src/js/handlers/html.js";
 import { TeX } from "@mathjax/src/js/input/tex.js";
+// Register only the explicitly selected AMS TeX configuration. Do not import the component
+// loader, autoload, require, HTML, URL, or all-packages bundles: this worker must keep a closed
+// package graph for untrusted source.
+import "@mathjax/src/js/input/tex/ams/AmsConfiguration.js";
 import { mathjax } from "@mathjax/src/js/mathjax.js";
 import { SVG } from "@mathjax/src/js/output/svg.js";
 
@@ -76,6 +80,8 @@ export interface LatexSvgRenderResult {
   readonly svg: string;
   readonly tex: string;
   readonly png?: Uint8Array;
+  /** Raw RGBA pixels for bounded terminal protocols that do not consume PNG. */
+  readonly pixels?: Uint8Array;
   readonly width?: number;
   readonly height?: number;
 }
@@ -115,7 +121,7 @@ let renderer: Renderer | undefined;
 /**
  * Renders one restricted TeX expression to a validated SVG string in memory.
  *
- * This intentionally loads only MathJax's base TeX package. It does not execute
+ * This intentionally loads MathJax's base and explicitly selected AMS TeX packages. It does not execute
  * system TeX, invoke a shell, load external resources, rasterize output, or write files.
  */
 export function renderTexToSvgInWorker(request: LatexSvgRenderRequest): LatexSvgRenderResult {
@@ -178,7 +184,7 @@ function getRenderer(): Renderer {
   const adaptor = liteAdaptor();
   RegisterHTMLHandler(adaptor);
 
-  const tex = new TeX({ packages: ["base"] });
+  const tex = new TeX({ packages: ["base", "ams"] });
   const svg = new SVG({ fontCache: "none" });
 
   renderer = {
@@ -414,7 +420,13 @@ function validateAttributes(elementName: string, attributes: ReadonlyMap<string,
       );
     }
 
-    if (/^(?:href|xlink:href)$/iu.test(name) || containsUnsafeControlCharacter(value)) {
+    // MathJax echoes canonical TeX in data-latex. XML permits tab, LF, and CR in an attribute,
+    // and preserving those whitespace bytes is required for multi-line AMS input; all other
+    // controls remain rejected. Presentation attributes never receive this relaxation.
+    if (
+      /^(?:href|xlink:href)$/iu.test(name) ||
+      containsUnsafeControlCharacter(value, name === "data-latex")
+    ) {
       throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG contains an unsafe attribute.");
     }
 
@@ -428,10 +440,14 @@ function validateAttributes(elementName: string, attributes: ReadonlyMap<string,
   }
 }
 
-function containsUnsafeControlCharacter(value: string): boolean {
+function containsUnsafeControlCharacter(value: string, allowXmlWhitespace = false): boolean {
   for (const character of value) {
     const codePoint = character.codePointAt(0);
-    if (codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f)) {
+    if (
+      codePoint !== undefined &&
+      (codePoint === 0x7f ||
+        (codePoint <= 0x1f && !(allowXmlWhitespace && [0x09, 0x0a, 0x0d].includes(codePoint))))
+    ) {
       return true;
     }
   }

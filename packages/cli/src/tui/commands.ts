@@ -31,6 +31,16 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = Object.freeze([
     detail: "Preview and apply a semantic palette across the whole application.",
   }),
   Object.freeze({
+    name: "/sessions",
+    summary: "List saved sessions",
+    detail: "Browse previously saved sessions and load one into this workspace.",
+  }),
+  Object.freeze({
+    name: "/new",
+    summary: "Start a new session",
+    detail: "Discard the in-memory conversation and reset to a fresh, untitled session.",
+  }),
+  Object.freeze({
     name: "/read",
     summary: "Stage a workspace document",
     detail:
@@ -41,6 +51,12 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = Object.freeze([
     name: "/source",
     summary: "Show canonical assistant source",
     detail: "Reveal the exact, unmodified Markdown and LaTeX source of the latest response.",
+  }),
+  Object.freeze({
+    name: "/formula",
+    summary: "Browse assistant formulas",
+    detail:
+      "Browse, preview, copy, locally edit, or insert indexed assistant formulas without changing canonical conversation source.",
   }),
   Object.freeze({
     name: "/commands",

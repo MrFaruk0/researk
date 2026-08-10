@@ -8,6 +8,10 @@ export const THEME_NAMES = [
   "dracula",
   "solarized-dark",
   "gruvbox",
+  "tokyo-night",
+  "catppuccin",
+  "rose-pine",
+  "everforest",
 ] as const;
 
 export type ThemeName = (typeof THEME_NAMES)[number];
@@ -135,5 +139,37 @@ const PALETTES: Readonly<
     error: "38;5;167;1",
     math: "38;5;142",
     code: "38;5;214",
+  }),
+  "tokyo-night": Object.freeze({
+    accent: "38;5;99;1",
+    muted: "38;5;242",
+    heading: "38;5;255;1",
+    error: "38;5;203;1",
+    math: "38;5;81",
+    code: "38;5;221",
+  }),
+  catppuccin: Object.freeze({
+    accent: "38;5;183;1",
+    muted: "38;5;243",
+    heading: "38;5;255;1",
+    error: "38;5;211;1",
+    math: "38;5;117",
+    code: "38;5;223",
+  }),
+  "rose-pine": Object.freeze({
+    accent: "38;5;182;1",
+    muted: "38;5;243",
+    heading: "38;5;230;1",
+    error: "38;5;203;1",
+    math: "38;5;153",
+    code: "38;5;222",
+  }),
+  everforest: Object.freeze({
+    accent: "38;5;108;1",
+    muted: "38;5;243",
+    heading: "38;5;223;1",
+    error: "38;5;167;1",
+    math: "38;5;109",
+    code: "38;5;180",
   }),
 });

@@ -1,6 +1,7 @@
 import { Box, Text } from "ink";
 import type { ReactNode } from "react";
-import { themeColor, type TuiTheme } from "../theme.js";
+import { displayText } from "../state.js";
+import { type TuiTheme, themeColor } from "../theme.js";
 
 export function Panel(props: {
   readonly theme: TuiTheme;
@@ -10,18 +11,20 @@ export function Panel(props: {
 }): ReactNode {
   const border = themeColor(props.theme, "border");
   const accent = themeColor(props.theme, "accent");
+  const surface = themeColor(props.theme, "surface");
   return (
     <Box
       flexDirection="column"
       borderStyle="round"
       paddingX={1}
       {...(border === undefined ? {} : { borderColor: border })}
+      {...(surface === undefined ? {} : { backgroundColor: surface })}
       {...(props.width === undefined ? {} : { width: props.width })}
     >
       {props.title === undefined ? null : (
         <Box marginBottom={1}>
           <Text bold {...(accent === undefined ? {} : { color: accent })}>
-            {props.title}
+            {displayText(props.title)}
           </Text>
         </Box>
       )}
@@ -40,17 +43,26 @@ export function OptionRow(props: {
   const accent = themeColor(props.theme, "accent");
   const muted = themeColor(props.theme, "muted");
   const foreground = themeColor(props.theme, "foreground");
+  const selectedSurface = themeColor(props.theme, "surfaceMuted");
   const color = props.selected ? accent : foreground;
   return (
-    <Box>
+    <Box
+      {...(props.selected && selectedSurface === undefined
+        ? {}
+        : props.selected
+          ? { backgroundColor: selectedSurface }
+          : {})}
+    >
       <Text {...(accent === undefined ? {} : { color: accent })}>
-        {props.selected ? "\u276f " : "  "}
+        {props.selected ? "❯ " : "  "}
       </Text>
-      <Text bold={props.selected} {...(color === undefined ? {} : { color })}>
-        {props.label}
+      <Text bold={props.selected} wrap="truncate-end" {...(color === undefined ? {} : { color })}>
+        {displayText(props.label)}
       </Text>
       {props.hint === undefined ? null : (
-        <Text {...(muted === undefined ? {} : { color: muted })}>{`  ${props.hint}`}</Text>
+        <Text wrap="truncate-end" {...(muted === undefined ? {} : { color: muted })}>
+          {`  ${displayText(props.hint)}`}
+        </Text>
       )}
     </Box>
   );
@@ -60,7 +72,7 @@ export function HintLine(props: { readonly theme: TuiTheme; readonly text: strin
   const muted = themeColor(props.theme, "muted");
   return (
     <Box marginTop={1}>
-      <Text {...(muted === undefined ? {} : { color: muted })}>{props.text}</Text>
+      <Text {...(muted === undefined ? {} : { color: muted })}>{displayText(props.text)}</Text>
     </Box>
   );
 }

@@ -1,19 +1,26 @@
 import { Box, Text } from "ink";
 import type { ReactNode } from "react";
-import { themeColor, type TuiTheme } from "../theme.js";
-import type { AppState } from "../state.js";
+import { type AppState, displayText } from "../state.js";
+import { type TuiTheme, themeColor } from "../theme.js";
 
-export function statusLabel(state: AppState): string {
-  switch (state.runStatus) {
-    case "idle":
-      return state.connectionStatus === "connecting" ? "connecting" : "ready";
-    case "starting":
-      return "starting";
-    case "streaming":
-      return state.phase === undefined ? "streaming" : `streaming \u00b7 ${state.phase}`;
-    case "cancelling":
-      return "cancelling";
-  }
+function oneLine(value: string): string {
+  return displayText(value)
+    .replace(/[\r\n\t]+/gu, " ")
+    .trim();
+}
+
+function compact(value: string, limit: number): string {
+  const text = oneLine(value);
+  if (text.length <= limit) return text;
+  if (limit <= 1) return text.slice(0, limit);
+  return `${text.slice(0, limit - 1)}…`;
+}
+
+function workspaceName(root: string): string {
+  const parts = oneLine(root)
+    .split(/[\\/]/u)
+    .filter((part) => part.length > 0);
+  return parts.at(-1) ?? oneLine(root);
 }
 
 export function Footer(props: {
@@ -24,19 +31,21 @@ export function Footer(props: {
   const muted = themeColor(props.theme, "muted");
   const accent = themeColor(props.theme, "accent");
   const border = themeColor(props.theme, "border");
-  const warning = themeColor(props.theme, "warning");
-  const success = themeColor(props.theme, "success");
   const { state } = props;
 
-  const provider =
-    state.connection === undefined ? "no provider" : `${state.connection.providerId}`;
-  const model = state.model ?? "no model";
-  const busy = state.runStatus !== "idle";
-  const statusColor = busy ? warning : success;
+  const provider = state.connection?.providerId ?? "none";
+  const model = state.model ?? "none";
+  const context = [
+    `workspace ${compact(workspaceName(state.workspaceRoot), 24)}`,
+    `provider ${compact(provider, 20)}`,
+    `model ${compact(model, 30)}`,
+    `variant ${compact(state.variant, 12)}`,
+    `session ${compact(state.sessionTitle, 24)}`,
+  ].join("  ·  ");
 
   return (
     <Box
-      flexDirection="column"
+      flexDirection="row"
       borderStyle="single"
       borderBottom={false}
       borderLeft={false}
@@ -45,26 +54,12 @@ export function Footer(props: {
       width={props.width}
       {...(border === undefined ? {} : { borderColor: border })}
     >
-      <Box flexDirection="row" justifyContent="space-between">
-        <Box>
-          <Text {...(muted === undefined ? {} : { color: muted })}>provider </Text>
-          <Text {...(accent === undefined ? {} : { color: accent })}>{provider}</Text>
-          <Text {...(muted === undefined ? {} : { color: muted })}>{"  model "}</Text>
-          <Text {...(accent === undefined ? {} : { color: accent })}>{model}</Text>
-          <Text {...(muted === undefined ? {} : { color: muted })}>{"  variant "}</Text>
-          <Text {...(accent === undefined ? {} : { color: accent })}>{state.variant}</Text>
-        </Box>
-        <Box>
-          <Text {...(statusColor === undefined ? {} : { color: statusColor })}>
-            {statusLabel(state)}
-          </Text>
-        </Box>
-      </Box>
-      <Box>
-        <Text {...(muted === undefined ? {} : { color: muted })}>
-          {`workspace ${state.workspaceRoot}  \u00b7  Ctrl+X cancel  \u00b7  /exit quit`}
+      <Box flexGrow={1} flexShrink={1}>
+        <Text wrap="truncate-end" {...(accent === undefined ? {} : { color: accent })}>
+          {context}
         </Text>
       </Box>
+      <Text {...(muted === undefined ? {} : { color: muted })}> </Text>
     </Box>
   );
 }

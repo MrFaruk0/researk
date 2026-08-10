@@ -1,5 +1,210 @@
 # Development handoff
 
+## 2026-08-10 OpenCode-inspired TUI redesign
+
+Completed the OpenCode-inspired Researk TUI redesign, using `img/home.png` and `img/fullscreen.png`
+as visual references. The home view is clean and centered, and the interactive shell adapts to
+full-screen terminal dimensions.
+
+### Delivered behavior
+
+- User and assistant messages render in bordered surfaces without visible `you:`/`researk:` labels.
+  There is no routine bottom chat-log/status feed; actionable notices remain, with compact activity
+  in the header.
+- Transcript scrolling supports keyboard input and SGR mouse-wheel input, with follow-tail and
+  anchored states.
+- Canonical Markdown/LaTeX is preserved. Terminal-safe styled math, code, and citation rendering is
+  used; `/source` shows exact source with a bounded sparse layout cache for very long or unbroken
+  content.
+- Added `tokyo-night`, `catppuccin`, `rose-pine`, and `everforest` themes with semantic tokens;
+  runtime no-color preference dominates theme styling.
+- Tiny terminals degrade responsively, including overlay sizing. History redacts secrets; active-run
+  commands are guarded; cancellation suppresses late writes; session/workspace safety is preserved.
+- Provider reconnect race guards, redactor finalization, and credential-fingerprint cache
+  invalidation harden runtime behavior.
+- Config and session writes are atomic and serialized per target; unrelated sessions can write
+  concurrently.
+- Normal startup uses non-persistent credentials. The OS keychain backend remains future work; no
+  plaintext key is persisted by normal startup.
+
+### Validation
+
+- `npm install`: passed — 125 packages audited, 0 vulnerabilities.
+- In the one `npm run verify` attempt, clean/build/typecheck passed across all 7 workspaces; all
+  non-CLI workspace tests passed (132); CLI had 329/330 passing. The sole failure was test code,
+  `ReferenceError: mountGated is not defined` in `tui-app.test.tsx`, not product behavior. The
+  aggregate command was therefore not green and stopped before lint/format.
+- The test-helper scoping defect was fixed afterward; the formerly failing test passed 1/1 in a
+  targeted run.
+- No second full-suite run was performed, intentionally avoiding another redundant broad rerun at
+  the user's request.
+- Final `npm run lint`: exit 0 — 122 files, one non-blocking style warning plus 14 informational
+  template/import suggestions.
+- Final `npm run format-check`: passed — 122 files.
+- Final `git diff --check`: passed.
+- CLI smoke: help, version, and doctor passed; piped non-TTY invocation rejected a missing command as
+  designed.
+
+### Residual limitations / risks
+
+- The OS keychain backend is not yet implemented; keys must be injected through supported
+  environment-variable references each startup.
+- Atomic persistence serialization is in-process; cross-process writers remain a limitation.
+- Help/version currently print `0.1.0-alpha.1` while the root package is `0.1.0-alpha.3`; this
+  pre-existing version metadata mismatch remains a follow-up.
+
+## 2026-08-10 TUI persistence wiring
+
+Wired the persistence storage layer into the Researk TUI controller and startup. The storage layer
+from the previous milestone is now consumed end to end: startup restoration, session autosave,
+the `/sessions` browser, and `/new`.
+
+### What was built
+
+- `TuiController` gained an optional `storage` constructor dependency (`configStore`,
+  `sessionStore`, `providerRegistry`, `credentialStore`). Every storage method degrades to a no-op
+  (null / empty array / void) when the matching store is absent, so the controller stays fully
+  usable in tests and non-TUI contexts.
+- Controller persistence API: `loadConfig`, `saveConfig` (partial merge over the persisted config),
+  `listSessions`, `loadSession`, `saveSession`, `deleteSession`, `autoTitle`, `resolveBaseUrl`,
+  `resolveCredential`, `getProvider`, `persistProvider`. All I/O is best-effort and swallowed inside
+  the controller; App call sites add `.catch(() => {})` as defence in depth.
+- `startTui` now builds the stores from `ensureDataDirs()` (guarded: no data root means in-memory
+  only), loads the persisted app config, and restores the provider profile, default model, reasoning
+  variant, theme, colour preference, and the last session's conversation. Normal startup credentials
+  are intentionally non-persistent and must be supplied through supported environment-variable
+  references each run. Explicit CLI flags still win over persisted values.
+- Provider persistence: after a successful connect, the active provider profile and connection
+  metadata are persisted; normal TUI startup does not persist or restore plaintext credentials, so
+  supported environment-variable references must provide keys again on each startup.
+- Session autosave: after every completed exchange the conversation (history captured before the run
+  plus the run outcome) is persisted to a stable per-session file; the session id is reused across
+  exchanges, and `lastSessionId` is recorded. `/new` clears the pointer.
+- `/sessions` now opens a real session browser (`SessionOverlay`) listing saved sessions; Enter loads
+  the selected session into the conversation. `/new` starts a fresh untitled session and clears the
+  persisted pointer.
+- `createInitialState` accepts optional session metadata and a restored conversation so startup
+  restoration can carry the transcript directly.
+
+### Verification
+
+```text
+npm test --workspace @researk/cli                                  # passed: 263 in 18 files
+npm run typecheck                                                  # passed
+npm run build                                                      # passed: 7 workspace packages
+npm run format-check                                               # passed: 114 files
+git diff --check                                                   # passed: no whitespace errors
+```
+
+`@researk/cli` went from 250 to 263 tests. New coverage: controller persistence (config partial
+merge, model-preserving writes, session CRUD through the controller, provider profile persistence,
+no-op behaviour without stores) and TUI session integration (browser listing, load into the
+conversation, autosave with footer title, `/new` pointer clearing, `/clear` leaving saved sessions
+untouched).
+
+The only remaining lint error is in the untracked `packages/cli/test/tmp-debug.test.tsx` debug
+fixture from the earlier TUI milestone; it is not part of this milestone's ownership scope.
+
+### Files changed (this milestone, on top of the storage layer)
+
+- `packages/cli/src/tui/controller.ts`
+- `packages/cli/src/tui.tsx`
+- `packages/cli/src/tui/App.tsx`
+- `packages/cli/src/tui/state.ts`
+- `packages/cli/src/tui/overlays/SelectOverlays.tsx`
+- `packages/cli/test/tui-controller.test.ts`
+- `packages/cli/test/tui-app.test.tsx`
+- `docs/HANDOFF.md`
+
+### Remaining work / next steps
+
+- Rename/retitle sessions (`/rename` is not implemented yet; `session/title` action exists).
+- Real schema migrations once version 2 of any schema is introduced.
+- An OS-keychain credential backend per ADR 0003 remains future work; normal startup does not
+  persist plaintext credentials and requires supported environment-variable references each run.
+
+## 2026-08-10 Persistence storage layer for the CLI
+
+Implemented the complete persistence storage layer in `packages/cli/src/config/` with full tests in
+`packages/cli/test/config/`. Nothing is wired into the TUI yet; the layer is ready to be consumed by
+the next milestone.
+
+### What was built
+
+- `paths.ts` — platform-specific per-user data directories under a `researk/` root: `config`,
+  `sessions`, `credentials` (created as an empty dir marker), `cache`, and `logs`. Windows uses
+  `%APPDATA%`, macOS `~/Library/Application Support`, Linux `$XDG_DATA_HOME` or `~/.local/share`.
+  `ensureDataDirs()` creates them all idempotently; resolution degrades to `null`/rejection when no
+  platform root is available.
+- `store.ts` — `FileConfigStore<T>`: versioned JSON persistence. `load` merges saved JSON over
+  defaults (saved values win), reads `schemaVersion` from the saved file, and returns defaults with a
+  warning for an unknown newer version (real migrations are future work). `save` writes atomically
+  (temp file + `rename`).
+- `credentials.ts` — `FileCredentialStore` with `get`/`set`/`delete`, one plaintext file per
+  reference, `toString` masks secrets. Carries an explicit SECURITY WARNING comment: this is NOT
+  secure storage (ADR 0003's OS credential store remains the intended long-term backend).
+- `providers.ts` — `ProviderProtocol` (`openrouter` | `compatible`), built-in OpenRouter definition
+  (default base URL `https://openrouter.ai/api/v1/`, `OPENROUTER_API_KEY`), and
+  `PersistentProviderRegistry` wrapping a `ConfigStore` + `CredentialStore` with CRUD for custom
+  providers, credential resolution, and base-URL resolution (profile base URL first, then built-in
+  default, else `undefined`).
+- `config.ts` — `AppConfig` schema (schemaVersion 1, providers, activeProviderId,
+  defaultModelByProvider, selectedVariantByModel, theme, lastSessionId, colorEnabled) and
+  `AppConfigStore`.
+- `sessions.ts` — `SessionStore` with per-session JSON files, `listSessions` sorted by `updatedAt`
+  descending, atomic writes, defensive reads (missing/corrupt/unreadable files surface as `null`),
+  and `autoTitle` (first user message, 80 code points, ellipsis).
+
+### Verification
+
+All six npm gates plus `git diff --check` green on Node.js `v24.14.1`, Windows:
+
+```text
+npx vitest run test/config                                        # passed: 53 tests in 6 files
+npm test --workspace @researk/cli                                  # passed: 244 in 17 files
+npm run clean                                                      # passed: 7 workspace packages
+npm run build                                                      # passed: 7 workspace packages
+npm run typecheck                                                  # passed: 7 workspace packages
+npm test                                                           # passed: 376 in 25 files
+npm run lint                                                       # passed: 113 files, no warnings
+npm run format-check                                               # passed: 113 files
+git diff --check                                                   # passed: no whitespace errors
+```
+
+Repository totals behind the 376: `@researk/cli` 244 in 17 files (was 191 in 11; +53), plus
+`@researk/contracts` 10, `@researk/harness` 7, `@researk/latex-renderer` 97, `@researk/research` 2,
+`@researk/provider-openai-compatible` 12, and `@researk/provider-openrouter` 4. Within the new
+config suite: `paths` 9, `store` 8, `credentials` 7, `providers` 13, `sessions` 12, `config` 4.
+
+Tests use real `node:os.tmpdir()` fixtures cleaned in `afterEach`; `process.platform` and
+`process.env` are stubbed and restored around each `paths` test. The credential non-readable test is
+skipped on Windows (access control is not scriptable there).
+
+### Files changed
+
+- `packages/cli/src/config/paths.ts`
+- `packages/cli/src/config/store.ts`
+- `packages/cli/src/config/credentials.ts`
+- `packages/cli/src/config/providers.ts`
+- `packages/cli/src/config/config.ts`
+- `packages/cli/src/config/sessions.ts`
+- `packages/cli/test/config/paths.test.ts`
+- `packages/cli/test/config/store.test.ts`
+- `packages/cli/test/config/credentials.test.ts`
+- `packages/cli/test/config/providers.test.ts`
+- `packages/cli/test/config/sessions.test.ts`
+- `packages/cli/test/config/config.test.ts`
+- `docs/HANDOFF.md`
+
+### Remaining work / next steps
+
+- Wire the stores into the TUI (provider registry + app config on startup/shutdown, session
+  auto-save/resume, `/sessions` command).
+- Real schema migrations once version 2 of any schema is introduced; for now unknown versions
+  degrade to defaults with a warning.
+- The credential store is intentionally plaintext and documented as NOT secure; an OS-keychain
+  backend per ADR 0003 remains future work.
+
 ## 2026-08-09 TUI UX milestone
 
 Implemented a responsive centered shell capped at 112 columns, edge-to-edge narrow rendering,
@@ -1103,3 +1308,51 @@ the latex-renderer package `dist` by the normal TypeScript build and is included
 existing `dist` files list. Negative fixtures cover timeout, crash, protocol rejection/restart,
 cancellation, and response budgets. Targeted typechecks/builds and latex-renderer tests pass. The
 full gate suite has since been run green; see the worker-pool host-process blockers milestone above.
+
+## 2026-08-10 alpha.4 formula/TUI documentation milestone
+
+Documented the completed `0.1.0-alpha.4` formula and full-screen TUI behavior while preserving all
+prior handoff history.
+
+### Integrated behavior recorded
+
+- The argument-less TUI indexes assistant formulas from canonical source. Inline formulas are
+  promoted to dedicated rows, and inline/display previews use restricted local MathJax 4 → SVG →
+  resvg at fixed 2× scale with opaque-white PNG/RGBA output. Rendering performs no system-TeX,
+  network, file, shell, or helper-executable work.
+- Retained TUI graphics are emitted outside Ink after the matching frame flush. Pre-frame cleanup,
+  generation checks, terminal dimensions, clipping, scroll/resize handling, and stream failures
+  leave the exact source visible when a placement is not provably safe. Kitty requires an explicit
+  bounded query `OK`; Windows Terminal Sixel requires its `WT_SESSION` hint, DA1 parameter 4, and a
+  proven cell-pixel response. One-shot iTerm2 remains display-math support only.
+- `/formula` supports keyboard navigation, bounded OSC 52 copy of exact canonical source, local
+  draft edit/rerender, source toggling, and insertion of edited or canonical source. Assistant and
+  persisted session source remain immutable; no CAS simplify/differentiate operations are claimed.
+- TUI provider profiles, non-secret configuration, and sessions persist locally; credentials remain
+  ephemeral through environment-variable references because the OS credential backend is still
+  absent. README host notes link the official VS Code image/GPU and Windows ConPTY guidance without
+  promising every terminal version or profile.
+
+### Documentation files
+
+- `README.md`
+- `CHANGELOG.md`
+- `docs/CLI_RENDERING.md`
+- `docs/VISION.md`
+- `docs/HANDOFF.md`
+
+### Focused validation already passed
+
+```text
+npm test --workspace @researk/cli -- rendering-kitty.test.ts rendering-sixel.test.ts rendering-terminal-query.test.ts tui-clipboard.test.ts tui-formulas.test.ts tui-formula-renderer.test.ts tui-formula-overlay.test.tsx tui-graphics.test.tsx  # 8 files, 71 tests
+npm test --workspace @researk/latex-renderer                                                                                                      # 3 files, 115 tests
+npm run build --workspace @researk/cli
+npm run typecheck --workspace @researk/cli
+npm run release:verify-version -- --tag v0.1.0-alpha.4                                                                                           # 7 public packages
+```
+
+Markdown link targets were inspected against the official VS Code terminal documentation. The
+independent review and final full workspace gate set are still pending at the time of this write.
+Manual real-terminal visual smoke also remains relevant: exercise Kitty in a recent VS Code
+terminal with image/GPU support and the documented Windows ConPTY DLL setting when needed, and
+exercise Windows Terminal Sixel only on a terminal that actually advertises it.

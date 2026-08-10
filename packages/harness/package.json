@@ -1,6 +1,6 @@
 {
   "name": "@researk/harness",
-  "version": "0.1.0-alpha.3",
+  "version": "0.1.0-alpha.4",
   "description": "Provider-neutral orchestration harness for Researk",
   "license": "Apache-2.0",
   "repository": {
@@ -32,6 +32,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@researk/contracts": "0.1.0-alpha.3"
+    "@researk/contracts": "0.1.0-alpha.4"
   }
 }

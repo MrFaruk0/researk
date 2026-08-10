@@ -94,6 +94,10 @@ const malformedModes = [
   "png-not-uint8array",
   "png-shared-memory",
   "png-empty",
+  "pixels-not-uint8array",
+  "pixels-shared-memory",
+  "pixels-empty",
+  "pixels-wrong-length",
   // Dimensions
   "width-zero",
   "width-negative",
@@ -112,6 +116,10 @@ const pngOnlyModes = new Set<string>([
   "png-not-uint8array",
   "png-shared-memory",
   "png-empty",
+  "pixels-not-uint8array",
+  "pixels-shared-memory",
+  "pixels-empty",
+  "pixels-wrong-length",
   "width-zero",
   "width-negative",
   "width-fractional",
@@ -219,6 +227,13 @@ describe("parseWorkerResponse", () => {
     svg: "<svg/>",
     tex: "x^2",
   } as const;
+  const pngPayload = {
+    ...payload,
+    png: new Uint8Array([1, 2, 3]),
+    pixels: new Uint8Array(8 * 4 * 4),
+    width: 8,
+    height: 4,
+  } as const;
 
   it("accepts an exact in-contract result and error", () => {
     expect(parseWorkerResponse({ type: "result", id: 7, result: payload }, expected)).toMatchObject(
@@ -229,6 +244,15 @@ describe("parseWorkerResponse", () => {
     expect(
       parseWorkerResponse({ type: "error", id: 7, code: "unsafe_svg", message: "no" }, expected),
     ).toMatchObject({ code: "unsafe_svg" });
+  });
+
+  it("accepts a bounded RGBA pixel plane alongside a PNG result", () => {
+    expect(
+      parseWorkerResponse(
+        { type: "result", id: 7, result: pngPayload },
+        { ...expected, format: "png" },
+      ),
+    ).toMatchObject({ type: "result" });
   });
 
   it.each([undefined, null, 0, "result", [], () => undefined])(

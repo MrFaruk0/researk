@@ -2,18 +2,20 @@ import { Box, Text } from "ink";
 import type { ReactNode } from "react";
 import { SLASH_COMMANDS } from "../commands.js";
 import { HintLine, OptionRow, Panel } from "../components/Panel.js";
-import { displayText } from "../state.js";
-import { themeColor, type TuiTheme } from "../theme.js";
+import { paginateDisplayText } from "../layout.js";
+import { type TuiTheme, themeColor } from "../theme.js";
 
 const KEY_BINDINGS: readonly (readonly [string, string])[] = Object.freeze([
   ["Enter", "send prompt / submit overlay"],
   ["Ctrl+J", "newline in the composer"],
-  ["Up / Down", "history, overlay selection, or source line"],
-  ["PageUp / PageDown", "scroll conversation, or page source"],
+  ["Up / Down", "history, overlay selection, or source row"],
+  ["Wheel / PageUp / PageDown", "scroll conversation, or page source"],
+  ["Home / End", "oldest / live tail"],
   ["Tab / Shift+Tab", "move between form fields"],
   ["Esc", "close overlay"],
   ["Ctrl+X", "cancel an active run"],
   ["Ctrl+L", "clear conversation"],
+  ["Formula keys", "Up/Down or j/k · c copy · e edit · i insert · s source"],
 ]);
 
 /**
@@ -93,90 +95,144 @@ export function ReadOverlay(props: {
   );
 }
 
-/**
- * Rows the `/source` panel spends on things other than source: the top and bottom border, the
- * title and its margin, the range line, and the hint line with its margin.
- */
+/** Full `/source` panel chrome: borders, title, range, margins, and the hint. */
 const SOURCE_OVERLAY_CHROME_ROWS = 8;
-
-/** The smallest page worth drawing; below this the overlay would be unreadable rather than bounded. */
-const SOURCE_OVERLAY_MINIMUM_PAGE_LINES = 1;
+const SOURCE_OVERLAY_MINIMUM_PAGE_ROWS = 1;
+const SOURCE_OVERLAY_COMPACT_HEADER_ROWS = 1;
 
 /**
- * The number of source lines drawn in one page of the `/source` overlay.
- *
- * The overlay must give access to every line of a response of any length, but it also must not push
- * unbounded content into a retained Ink frame, which would break the layout. A page sized to the
- * region actually available satisfies both: the frame stays bounded, paging reaches the final line,
- * and the reported range always matches what is really on screen. Deriving it from the region
- * rather than fixing it is what keeps the range honest on a short terminal.
+ * Returns the number of rendered source rows in one page. The normal Panel is used only when its
+ * eight rows of chrome plus one source row can fit; otherwise a compact header is used.
  */
 export function sourceOverlayPageLines(regionHeight: number): number {
-  return Math.max(SOURCE_OVERLAY_MINIMUM_PAGE_LINES, regionHeight - SOURCE_OVERLAY_CHROME_ROWS);
+  const height = Math.max(1, Math.trunc(Number.isFinite(regionHeight) ? regionHeight : 1));
+  if (height >= SOURCE_OVERLAY_CHROME_ROWS + SOURCE_OVERLAY_MINIMUM_PAGE_ROWS) {
+    return Math.max(SOURCE_OVERLAY_MINIMUM_PAGE_ROWS, height - SOURCE_OVERLAY_CHROME_ROWS);
+  }
+  if (height > SOURCE_OVERLAY_COMPACT_HEADER_ROWS)
+    return height - SOURCE_OVERLAY_COMPACT_HEADER_ROWS;
+  return SOURCE_OVERLAY_MINIMUM_PAGE_ROWS;
 }
 
-/** Splits redacted canonical source into the lines the overlay pages through. */
+/** Splits canonical source by physical newline for compatibility; `/source` uses display rows. */
 export function sourceLines(source: string): readonly string[] {
   return source.split("\n");
 }
 
-/** Clamps a requested first-line offset so paging can never run past either end. */
-export function clampSourceOffset(offset: number, lineCount: number, pageLines: number): number {
-  const highest = Math.max(0, lineCount - pageLines);
+/** Clamps a requested first-display-row offset so paging cannot run past either end. */
+export function clampSourceOffset(offset: number, rowCount: number, pageRows: number): number {
+  const highest = Math.max(0, rowCount - pageRows);
   return Math.min(Math.max(offset, 0), highest);
 }
 
+/** Source text width inside a full Panel (two borders and two padding cells). */
+export function sourcePanelTextWidth(panelWidth: number): number {
+  return Math.max(1, Math.trunc(Number.isFinite(panelWidth) ? panelWidth : 1) - 4);
+}
+
+function rowText(row: string): string {
+  return row.length === 0 ? " " : row;
+}
+
+function keyedRows(
+  rows: readonly string[],
+  offset: number,
+): readonly { key: string; row: string }[] {
+  const occurrences = new Map<string, number>();
+  return rows.map((row) => {
+    const occurrence = occurrences.get(row) ?? 0;
+    occurrences.set(row, occurrence + 1);
+    return { key: `${offset}:${row}:${occurrence}`, row };
+  });
+}
+
 /**
- * Shows the redacted canonical source of the latest response, one bounded page at a time.
- *
- * Every line is reachable: the visible range and the total are always stated, and Up/Down, PageUp/
- * PageDown, and Home/End move the window, so the last line of an arbitrarily long response can be
- * read. The source is shown verbatim apart from the terminal-safe projection applied by
- * `displayText` at this rendering boundary, so LaTeX can be copied exactly while a control sequence
- * embedded in the response cannot reach the terminal.
+ * Shows the redacted canonical source one bounded display-row page at a time. Canonical bytes remain
+ * in state; only the terminal-safe projection and the visible page enter Ink.
  */
 export function SourceOverlay(props: {
   readonly theme: TuiTheme;
   readonly source: string | undefined;
+  /** First rendered display row, not a physical source-line offset. */
   readonly offset: number;
   readonly regionHeight: number;
+  /** Width of the overlay child after App's horizontal wrapper padding. */
+  readonly width?: number | undefined;
 }): ReactNode {
   const muted = themeColor(props.theme, "muted");
+  const panelWidth = Math.max(
+    1,
+    Math.trunc(Number.isFinite(props.width ?? 80) ? (props.width ?? 80) : 80),
+  );
+  const height = Math.max(
+    1,
+    Math.trunc(Number.isFinite(props.regionHeight) ? props.regionHeight : 1),
+  );
+  const compact = height < SOURCE_OVERLAY_CHROME_ROWS + SOURCE_OVERLAY_MINIMUM_PAGE_ROWS;
+  const pageRows = sourceOverlayPageLines(height);
 
   if (props.source === undefined) {
+    if (compact) {
+      return (
+        <Box flexDirection="column" width={panelWidth} height={height} overflow="hidden">
+          <Text wrap="truncate-end" {...(muted === undefined ? {} : { color: muted })}>
+            {height <= 1 ? "No assistant response yet." : "Canonical source · none"}
+          </Text>
+        </Box>
+      );
+    }
     return (
-      <Panel theme={props.theme} title="Canonical source">
+      <Panel theme={props.theme} title="Canonical source" width={panelWidth}>
         <Text {...(muted === undefined ? {} : { color: muted })}>No assistant response yet.</Text>
         <HintLine theme={props.theme} text={"Esc close"} />
       </Panel>
     );
   }
 
-  const lines = sourceLines(props.source);
-  const pageLines = sourceOverlayPageLines(props.regionHeight);
-  const offset = clampSourceOffset(props.offset, lines.length, pageLines);
-  const end = Math.min(lines.length, offset + pageLines);
-  const visible = lines.slice(offset, end);
-  const atStart = offset === 0;
-  const atEnd = end >= lines.length;
+  const page = paginateDisplayText(
+    props.source,
+    compact ? panelWidth : sourcePanelTextWidth(panelWidth),
+    props.offset,
+    pageRows,
+  );
+  const end = Math.min(page.totalRows, page.offset + page.rows.length);
+  const atStart = page.offset === 0;
+  const atEnd = end >= page.totalRows;
+  const range = `rows ${page.offset + 1}\u2013${end} of ${page.totalRows}${atEnd ? " \u00b7 end" : ""}`;
+
+  if (compact) {
+    return (
+      <Box flexDirection="column" width={panelWidth} height={height} overflow="hidden">
+        {height <= 1 ? null : (
+          <Text wrap="truncate-end" {...(muted === undefined ? {} : { color: muted })}>
+            {`Canonical source · ${range}`}
+          </Text>
+        )}
+        <Box flexDirection="column" height={pageRows} overflow="hidden">
+          {keyedRows(page.rows, page.offset).map((item) => (
+            <Text key={item.key}>{rowText(item.row)}</Text>
+          ))}
+        </Box>
+      </Box>
+    );
+  }
 
   return (
-    <Panel theme={props.theme} title="Canonical source">
+    <Panel theme={props.theme} title="Canonical source" width={panelWidth}>
       <Box>
-        <Text {...(muted === undefined ? {} : { color: muted })}>
-          {`lines ${offset + 1}\u2013${end} of ${lines.length}${atEnd ? " \u00b7 end" : ""}`}
-        </Text>
+        <Text {...(muted === undefined ? {} : { color: muted })}>{range}</Text>
       </Box>
       <Box flexDirection="column" marginTop={1}>
-        {/* One node per page keeps the shown range exact; Ink renders the newlines. */}
-        <Text>{displayText(visible.join("\n"))}</Text>
+        {keyedRows(page.rows, page.offset).map((item) => (
+          <Text key={item.key}>{rowText(item.row)}</Text>
+        ))}
       </Box>
       <HintLine
         theme={props.theme}
         text={
           atStart && atEnd
             ? "Esc close"
-            : "Up/Down line \u00b7 PageUp/PageDown page \u00b7 Home/End \u00b7 Esc close"
+            : "Up/Down row · PageUp/PageDown page · Home/End · Esc close"
         }
       />
     </Panel>
@@ -198,7 +254,7 @@ export function CommandOverlay(props: {
           selected={index === props.selected}
         />
       ))}
-      <HintLine theme={props.theme} text={"Up/Down \u00b7 Enter run \u00b7 Esc cancel"} />
+      <HintLine theme={props.theme} text={"Up/Down · Enter run · Esc cancel"} />
     </Panel>
   );
 }

@@ -5,9 +5,28 @@ import {
   LatexSvgRenderError,
   renderTexToValidatedSvgInWorker,
 } from "./core.js";
-import { isWorkerRenderRequest } from "./protocol.js";
+import {
+  isWorkerRenderRequest,
+  maximumPngBytes,
+  maximumRasterArea,
+  maximumRasterHeight,
+  maximumRasterWidth,
+  maximumRgbaBytes,
+} from "./protocol.js";
 
 if (parentPort === null) throw new Error("The LaTeX renderer must run as a worker thread.");
+
+/**
+ * Raster scale is deliberately fixed at 2x MathJax's natural SVG size. This keeps ordinary
+ * expressions close to their source dimensions while giving terminal protocols enough pixels for
+ * clean glyph edges (for example, the formula-example fixture is about 380px wide), and avoids
+ * stretching every short expression to one arbitrary 1200px canvas. The protocol ceilings remain
+ * authoritative for the resulting dimensions, area, and encoded payload.
+ */
+const rasterScale = 2;
+
+/** Fixed opaque raster margin, in final pixels, on every side of the formula canvas. */
+const rasterPadding = 4;
 
 /**
  * Decides whether a validated SVG can be rasterized without any font.
@@ -59,33 +78,62 @@ port.on("message", (value: unknown) => {
           "The expression requires font-backed text that the renderer cannot rasterize safely.",
         );
       }
-      const viewBox = /\bviewBox="[^" ]+ [^" ]+ ([^" ]+) ([^" ]+)"/u.exec(result.svg);
-      const sourceWidth = Number(viewBox?.[1]);
-      const sourceHeight = Number(viewBox?.[2]);
-      if (!(sourceWidth > 0) || !(sourceHeight > 0)) throw new Error("Invalid SVG dimensions.");
-      const targetWidth = 1200;
-      const targetHeight = Math.ceil((sourceHeight / sourceWidth) * targetWidth);
-      if (targetHeight > 2048 || targetWidth * targetHeight > 8_388_608) {
-        throw new Error("Raster dimensions exceed the renderer limit.");
-      }
       // The SVG is proven path-only above, so no font can participate in this image and disabling
       // system fonts is lossless: PNG output is byte-identical with enumeration on and off. It also
       // removes resvg's host-font enumeration, which is unbounded work charged to the per-render
       // timeout and is the platform-dependent cost that made rasterization fail on font-heavy hosts.
-      const image = new Resvg(result.svg, {
-        fitTo: { mode: "width", value: targetWidth },
+      // A white background is explicit because terminal image protocols otherwise preserve
+      // transparent pixels, which makes dark formula glyphs disappear into a dark TUI.
+      const rasterizer = new Resvg(result.svg, {
+        fitTo: { mode: "zoom", value: rasterScale },
+        background: "#ffffff",
         font: { loadSystemFonts: false },
-      }).render();
-      if (image.width > 4096 || image.height > 2048 || image.width * image.height > 8_388_608) {
-        throw new Error("Raster dimensions exceed the renderer limit.");
+      });
+      // Resvg's public width/height properties describe the unscaled SVG. Its normalized SVG
+      // serialization carries the fractional natural dimensions, so derive the exact rounded
+      // 2x source canvas before allocating any native pixel buffer.
+      const normalizedSvg = rasterizer.toString();
+      const naturalDimensions = readNormalizedDimensions(normalizedSvg);
+      const sourceWidth = scaleDimension(naturalDimensions.width);
+      const sourceHeight = scaleDimension(naturalDimensions.height);
+      const paddedWidth = sourceWidth + rasterPadding * 2;
+      const paddedHeight = sourceHeight + rasterPadding * 2;
+      assertRasterDimensions(sourceWidth, sourceHeight);
+      assertRasterDimensions(paddedWidth, paddedHeight);
+
+      // The nested SVG keeps the exact path geometry at its already selected natural scale. Only
+      // the outer viewport grows, so no expression is stretched to fill a larger canvas.
+      const paddedSvg = addRasterPadding(
+        normalizedSvg,
+        sourceWidth,
+        sourceHeight,
+        paddedWidth,
+        paddedHeight,
+      );
+      const paddedRasterizer = new Resvg(paddedSvg, {
+        fitTo: { mode: "original" },
+        background: "#ffffff",
+        font: { loadSystemFonts: false },
+      });
+      if (paddedRasterizer.width !== paddedWidth || paddedRasterizer.height !== paddedHeight) {
+        throw new Error("Raster dimensions changed while applying padding.");
       }
+      const image = paddedRasterizer.render();
+      assertRasterDimensions(image.width, image.height);
       const png = image.asPng();
-      if (png.byteLength > 8 * 1024 * 1024)
+      if (png.byteLength > maximumPngBytes)
         throw new Error("Raster payload exceeds the renderer limit.");
+      const pixels = new Uint8Array(image.pixels);
+      if (
+        pixels.byteLength > maximumRgbaBytes ||
+        pixels.byteLength !== image.width * image.height * 4
+      ) {
+        throw new Error("Raster pixel payload has an unexpected size.");
+      }
       port.postMessage({
         type: "result",
         id: value.id,
-        result: { ...result, png, width: image.width, height: image.height },
+        result: { ...result, png, pixels, width: image.width, height: image.height },
       });
     } else {
       port.postMessage({ type: "result", id: value.id, result });
@@ -100,3 +148,64 @@ port.on("message", (value: unknown) => {
   }
 });
 port.postMessage({ type: "ready" });
+
+interface NormalizedDimensions {
+  readonly height: number;
+  readonly width: number;
+}
+
+/** Reads dimensions only from Resvg's own normalized, already-validated SVG serialization. */
+function readNormalizedDimensions(svg: string): NormalizedDimensions {
+  const match = /^<svg\s+width="([0-9]+(?:\.[0-9]+)?)"\s+height="([0-9]+(?:\.[0-9]+)?)"/u.exec(svg);
+  const width = Number(match?.[1]);
+  const height = Number(match?.[2]);
+  if (!(width > 0) || !(height > 0) || !Number.isFinite(width) || !Number.isFinite(height)) {
+    throw new Error("Raster dimensions are invalid.");
+  }
+  return { height, width };
+}
+
+function scaleDimension(value: number): number {
+  const scaled = Math.round(value * rasterScale);
+  if (!Number.isSafeInteger(scaled) || scaled < 1) {
+    throw new Error("Raster dimensions are invalid.");
+  }
+  return scaled;
+}
+
+function assertRasterDimensions(width: number, height: number): void {
+  if (
+    width < 1 ||
+    height < 1 ||
+    width > maximumRasterWidth ||
+    height > maximumRasterHeight ||
+    width * height > maximumRasterArea
+  ) {
+    throw new Error("Raster dimensions exceed the renderer limit.");
+  }
+}
+
+/**
+ * Wraps Resvg's normalized path SVG in a larger opaque viewport. The inner dimensions are explicit
+ * pixels, preserving the selected scale; the caller's validated SVG is never altered or returned.
+ */
+function addRasterPadding(
+  svg: string,
+  sourceWidth: number,
+  sourceHeight: number,
+  paddedWidth: number,
+  paddedHeight: number,
+): string {
+  const openingEnd = svg.indexOf(">");
+  const closingStart = svg.lastIndexOf("</svg>");
+  if (openingEnd < 0 || closingStart <= openingEnd || !svg.startsWith("<svg")) {
+    throw new Error("Raster SVG has invalid root markup.");
+  }
+
+  const openingAttributes = svg
+    .slice("<svg".length, openingEnd)
+    .replace(/\s(?:width|height|x|y|preserveAspectRatio)="[^"]*"/gu, "");
+  const body = svg.slice(openingEnd + 1, closingStart);
+  const inner = `<svg${openingAttributes} x="${rasterPadding}" y="${rasterPadding}" width="${sourceWidth}" height="${sourceHeight}">${body}</svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${paddedWidth}" height="${paddedHeight}" viewBox="0 0 ${paddedWidth} ${paddedHeight}">${inner}</svg>`;
+}

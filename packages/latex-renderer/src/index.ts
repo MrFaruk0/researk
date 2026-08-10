@@ -499,6 +499,8 @@ export async function renderTexToSvg(
 
 export interface LatexPngRenderResult extends LatexSvgRenderResult {
   readonly png: Uint8Array;
+  /** RGBA pixels matching width × height, for bounded non-PNG terminal protocols. */
+  readonly pixels: Uint8Array;
   readonly width: number;
   readonly height: number;
 }
@@ -513,7 +515,12 @@ export async function renderTexToPng(
     options.signal,
     "png",
   );
-  if (result.png === undefined || result.width === undefined || result.height === undefined) {
+  if (
+    result.png === undefined ||
+    result.pixels === undefined ||
+    result.width === undefined ||
+    result.height === undefined
+  ) {
     throw new ManagedLatexRenderError("worker_failed", "Renderer returned an incomplete image.");
   }
   return result as LatexPngRenderResult;

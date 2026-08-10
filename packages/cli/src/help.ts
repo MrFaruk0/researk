@@ -1,4 +1,4 @@
-export const VERSION = "0.1.0-alpha.1";
+export const VERSION = "0.1.0-alpha.4";
 
 export const HELP = `Researk ${VERSION} (pre-alpha)
 
@@ -27,5 +27,5 @@ Examples:
   researk models --provider-id openrouter --api-key-env OPENROUTER_API_KEY
   researk chat --model openrouter:provider/model --reasoning auto "Summarize this result"
 
-No credentials are stored. Provider and document transmission is explicit in the interactive CLI.
+Provider profiles, sessions, and TUI configuration persist locally. API keys remain in memory and must be supplied through supported environment-variable references until an OS credential backend exists. One-shot commands never store credentials.
 `;

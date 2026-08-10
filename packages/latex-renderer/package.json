@@ -1,6 +1,6 @@
 {
   "name": "@researk/latex-renderer",
-  "version": "0.1.0-alpha.3",
+  "version": "0.1.0-alpha.4",
   "description": "Bounded MathJax SVG rendering for Researk presentation layers",
   "license": "Apache-2.0",
   "repository": {

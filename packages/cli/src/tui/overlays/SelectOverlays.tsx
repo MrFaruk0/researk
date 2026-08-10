@@ -1,6 +1,7 @@
 import { Box, Text } from "ink";
 import type { ReactNode } from "react";
 import type { ReasoningIntent } from "@researk/contracts";
+import type { SessionMeta } from "../../config/sessions.js";
 import type { ThemeName } from "../../theme.js";
 import { HintLine, OptionRow, Panel } from "../components/Panel.js";
 import { themeColor, type TuiTheme } from "../theme.js";
@@ -63,6 +64,46 @@ export function ThemeOverlay(props: {
         </Text>
       </Box>
       <HintLine theme={props.theme} text={"Up/Down preview \u00b7 Enter keep \u00b7 Esc cancel"} />
+    </Panel>
+  );
+}
+
+/**
+ * The saved-sessions browser. Each row shows the session title with a muted metadata hint; the
+ * workspace shown is the session's own workspace, because a session may have been created in a
+ * different workspace than the one currently open.
+ */
+export function SessionOverlay(props: {
+  readonly theme: TuiTheme;
+  readonly sessions: readonly SessionMeta[];
+  readonly selected: number;
+}): ReactNode {
+  const muted = themeColor(props.theme, "muted");
+  return (
+    <Panel theme={props.theme} title="Saved sessions">
+      {props.sessions.length === 0 ? (
+        <Box>
+          <Text {...(muted === undefined ? {} : { color: muted })}>
+            No saved sessions yet. Every completed exchange is persisted automatically.
+          </Text>
+        </Box>
+      ) : (
+        props.sessions.map((session, index) => (
+          <OptionRow
+            key={session.id}
+            theme={props.theme}
+            label={session.title}
+            hint={`${session.messageCount} msg \u00b7 ${session.workspace}`}
+            selected={index === props.selected}
+          />
+        ))
+      )}
+      <HintLine
+        theme={props.theme}
+        text={
+          props.sessions.length === 0 ? "Esc close" : "Up/Down \u00b7 Enter load \u00b7 Esc cancel"
+        }
+      />
     </Panel>
   );
 }

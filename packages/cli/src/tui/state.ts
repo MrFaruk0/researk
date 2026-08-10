@@ -1,4 +1,5 @@
 import type { ModelDescriptor, ReasoningIntent } from "@researk/contracts";
+import type { SessionMeta } from "../config/sessions.js";
 import { escapeUnsafeTerminalControls, neutralizeCarriageReturnsForDisplay } from "../safety.js";
 import type { ThemeName } from "../theme.js";
 import type { ProviderConnectionKind } from "../types.js";
@@ -10,6 +11,8 @@ export const MAX_CHAT_MESSAGE_CHARACTERS = 16_000_000;
 export const MAX_TUI_CONVERSATION_ENTRIES = 400;
 /** Bounds the composer's recallable command history. */
 export const MAX_COMMAND_HISTORY = 100;
+/** The title of a session that has not been loaded or renamed yet. */
+export const DEFAULT_SESSION_TITLE = "New session";
 
 export type MessageRole = "user" | "assistant" | "tool" | "system";
 
@@ -44,6 +47,22 @@ export interface ConversationEntry {
 }
 
 /**
+ * Returns the canonical source from the newest completed assistant entry.
+ *
+ * An empty completed response is still a valid canonical source, so this deliberately checks the
+ * entry's role and streaming state rather than filtering on source length.
+ */
+export function latestCompletedAssistantSource(
+  conversation: readonly ConversationEntry[],
+): string | undefined {
+  for (let index = conversation.length - 1; index >= 0; index -= 1) {
+    const entry = conversation[index];
+    if (entry?.role === "assistant" && !entry.streaming) return entry.source;
+  }
+  return undefined;
+}
+
+/**
  * Derives the terminal-safe display projection of a redacted canonical string.
  *
  * This is the rendering boundary named in the `ConversationEntry` contract. It neutralizes control
@@ -70,6 +89,16 @@ export interface ProviderConnection {
 export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "failed";
 
 export type RunStatus = "idle" | "starting" | "streaming" | "cancelling";
+
+/**
+ * Ephemeral presentation state for an operation that is about to cross the network boundary.
+ * The destination is deliberately a display-only description, never a credential or request URL.
+ */
+export interface ExternalActivity {
+  readonly kind: "catalog" | "prompt";
+  readonly destination: string;
+  readonly documentCount: number;
+}
 
 export interface StatusNotice {
   readonly id: string;
@@ -101,6 +130,11 @@ export type OverlayState =
   | { readonly kind: "model"; readonly query: string; readonly selected: number }
   | { readonly kind: "variant"; readonly selected: number }
   | { readonly kind: "theme"; readonly selected: number }
+  | {
+      readonly kind: "sessions";
+      readonly sessions: readonly SessionMeta[];
+      readonly selected: number;
+    }
   | { readonly kind: "read"; readonly value: string; readonly error?: string | undefined };
 
 export interface ComposerState {
@@ -118,6 +152,8 @@ export interface AppState {
   readonly workspaceRoot: string;
   readonly connection?: ProviderConnection;
   readonly connectionStatus: ConnectionStatus;
+  /** Ephemeral network activity disclosure; never persisted in sessions or configuration. */
+  readonly externalActivity?: ExternalActivity | undefined;
   /** Ephemeral credential values. Never written to disk, output, or events. */
   readonly credentialValues: Readonly<Record<string, string>>;
   readonly catalog: readonly ModelDescriptor[];
@@ -134,14 +170,22 @@ export interface AppState {
    * never rendered without `displayText`.
    */
   readonly latestAssistantSource?: string | undefined;
+  /** Identifier of the persisted session, set when one is loaded. */
+  readonly sessionId?: string;
+  /** Display title of the current session; a fresh session starts untitled. */
+  readonly sessionTitle: string;
+  /** ISO timestamp of the last persisted session change. */
+  readonly sessionUpdatedAt?: string;
   readonly overlay: OverlayState;
   readonly composer: ComposerState;
   readonly runStatus: RunStatus;
   readonly phase?: string | undefined;
   readonly notices: readonly StatusNotice[];
   readonly stagedDocuments: readonly WorkspaceDocument[];
-  /** Scroll offset in lines from the bottom. Zero follows the live stream. */
+  /** Scroll offset in rendered terminal rows from the bottom. Zero follows the live tail. */
   readonly scrollOffset: number;
+  /** Maximum rendered-row offset measured by the conversation viewport. */
+  readonly scrollMax: number;
   readonly exiting: boolean;
 }
 
@@ -154,12 +198,18 @@ export function createInitialState(
     model?: string;
     variant: ReasoningIntent;
     credentialValues?: Readonly<Record<string, string>>;
+    sessionId?: string;
+    sessionTitle?: string;
+    sessionUpdatedAt?: string;
+    conversation?: readonly ConversationEntry[];
   }>,
 ): AppState {
+  const conversation = options.conversation ?? [];
   return {
     workspaceRoot: options.workspaceRoot,
     ...(options.connection === undefined ? {} : { connection: options.connection }),
     connectionStatus: options.connection === undefined ? "disconnected" : "disconnected",
+    externalActivity: undefined,
     credentialValues: options.credentialValues ?? {},
     catalog: [],
     catalogLoading: false,
@@ -167,13 +217,20 @@ export function createInitialState(
     variant: options.variant,
     themeName: options.themeName,
     colorEnabled: options.colorEnabled,
-    conversation: [],
+    ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+    sessionTitle: options.sessionTitle ?? DEFAULT_SESSION_TITLE,
+    ...(options.sessionUpdatedAt === undefined
+      ? {}
+      : { sessionUpdatedAt: options.sessionUpdatedAt }),
+    conversation,
+    latestAssistantSource: latestCompletedAssistantSource(conversation),
     overlay: { kind: "none" },
     composer: { value: "", cursor: 0, history: [], draft: "" },
     runStatus: "idle",
     notices: [],
     stagedDocuments: [],
     scrollOffset: 0,
+    scrollMax: 0,
     exiting: false,
   };
 }

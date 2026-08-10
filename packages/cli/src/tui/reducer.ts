@@ -7,14 +7,17 @@ import {
   type ComposerState,
   type ConnectionStatus,
   type ConversationEntry,
+  DEFAULT_SESSION_TITLE,
+  type ExternalActivity,
+  latestCompletedAssistantSource,
   MAX_COMMAND_HISTORY,
   MAX_TUI_CONVERSATION_ENTRIES,
   type MessageRole,
   type OverlayState,
   type ProviderConnection,
   type RunStatus,
-  selectedDescriptor,
   type StatusNotice,
+  selectedDescriptor,
 } from "./state.js";
 
 const MAX_NOTICES = 5;
@@ -23,7 +26,7 @@ export type AppAction =
   | { readonly type: "overlay/open"; readonly overlay: OverlayState }
   | { readonly type: "overlay/close" }
   | { readonly type: "composer/set"; readonly value: string; readonly cursor: number }
-  | { readonly type: "composer/submit" }
+  | { readonly type: "composer/submit"; readonly historyValue?: string | undefined }
   | { readonly type: "composer/history-previous" }
   | { readonly type: "composer/history-next" }
   | { readonly type: "theme/set"; readonly name: ThemeName }
@@ -35,6 +38,8 @@ export type AppAction =
       readonly credentialValues: Readonly<Record<string, string>>;
     }
   | { readonly type: "connection/failed"; readonly message: string }
+  | { readonly type: "external/set"; readonly activity: ExternalActivity }
+  | { readonly type: "external/clear" }
   | { readonly type: "catalog/loading"; readonly loading: boolean }
   | { readonly type: "catalog/loaded"; readonly catalog: readonly ModelDescriptor[] }
   | { readonly type: "model/select"; readonly model: string }
@@ -44,13 +49,25 @@ export type AppAction =
   | { readonly type: "conversation/finish"; readonly id: string }
   | { readonly type: "conversation/remove"; readonly id: string }
   | { readonly type: "conversation/clear" }
+  | {
+      readonly type: "session/load";
+      readonly sessionId: string;
+      readonly title: string;
+      readonly updatedAt: string;
+      readonly conversation: ConversationEntry[];
+    }
+  | { readonly type: "session/title"; readonly title: string }
+  | { readonly type: "session/create" }
   | { readonly type: "run/status"; readonly status: RunStatus }
   | { readonly type: "run/phase"; readonly phase: string | undefined }
   | { readonly type: "notice/push"; readonly notice: StatusNotice }
   | { readonly type: "notice/dismiss"; readonly id: string }
+  | { readonly type: "notice/clear" }
   | { readonly type: "documents/stage"; readonly document: WorkspaceDocument }
   | { readonly type: "documents/consume" }
   | { readonly type: "scroll/by"; readonly lines: number }
+  | { readonly type: "scroll/range"; readonly maxRows: number }
+  | { readonly type: "scroll/oldest" }
   | { readonly type: "scroll/follow" }
   | { readonly type: "exit" };
 
@@ -78,7 +95,7 @@ export function reduce(state: AppState, action: AppAction): AppState {
         composer: {
           value: "",
           cursor: 0,
-          history: pushHistory(state.composer.history, state.composer.value),
+          history: pushHistory(state.composer.history, action.historyValue ?? state.composer.value),
           draft: "",
         },
       };
@@ -93,6 +110,11 @@ export function reduce(state: AppState, action: AppAction): AppState {
         ...state,
         connectionStatus: "connecting" satisfies ConnectionStatus,
         connection: action.connection,
+        catalog: [],
+        catalogLoading: true,
+        model: undefined,
+        variant: "auto",
+        ...clearExternalActivity(state, "catalog"),
       };
     case "connection/connected":
       return {
@@ -104,12 +126,17 @@ export function reduce(state: AppState, action: AppAction): AppState {
         catalogLoading: false,
         model: undefined,
         variant: "auto",
+        ...clearExternalActivity(state, "catalog"),
       };
     case "connection/failed":
       return {
         ...state,
         connectionStatus: "failed",
+        catalog: [],
         catalogLoading: false,
+        model: undefined,
+        variant: "auto",
+        ...clearExternalActivity(state, "catalog"),
         notices: pushNotice(state.notices, {
           id: `connection-${state.notices.length}-${action.message.length}`,
           level: "error",
@@ -117,18 +144,30 @@ export function reduce(state: AppState, action: AppAction): AppState {
           createdAt: 0,
         }),
       };
+    case "external/set":
+      return { ...state, externalActivity: normalizeExternalActivity(action.activity) };
+    case "external/clear":
+      return { ...state, externalActivity: undefined };
     case "catalog/loading":
-      return { ...state, catalogLoading: action.loading };
+      return {
+        ...state,
+        catalogLoading: action.loading,
+        ...(action.loading ? {} : clearExternalActivity(state, "catalog")),
+      };
     case "catalog/loaded":
-      return { ...state, catalog: action.catalog, catalogLoading: false };
+      return {
+        ...state,
+        catalog: action.catalog,
+        catalogLoading: false,
+        ...clearExternalActivity(state, "catalog"),
+      };
     case "model/select":
       return applyModelSelection(state, action.model);
     case "variant/select":
       return { ...state, variant: action.variant };
     case "conversation/append":
-      // Appending happens on submit, so following the live tail is the intended behaviour. The
-      // offset is still re-clamped rather than assumed, because the bounded window may have
-      // dropped the oldest entry in the same step.
+      // A newly submitted prompt should be visible immediately. The measured rendered-row range
+      // remains authoritative and will be refreshed by the conversation viewport after the append.
       return {
         ...state,
         conversation: boundConversation([...state.conversation, action.entry]),
@@ -163,7 +202,6 @@ export function reduce(state: AppState, action: AppAction): AppState {
       return {
         ...state,
         conversation,
-        scrollOffset: clamp(state.scrollOffset, 0, Math.max(0, conversation.length - 1)),
       };
     }
     case "conversation/clear":
@@ -172,12 +210,44 @@ export function reduce(state: AppState, action: AppAction): AppState {
         conversation: [],
         latestAssistantSource: undefined,
         scrollOffset: 0,
+        scrollMax: 0,
+        externalActivity: undefined,
       };
+    case "session/load": {
+      const conversation = boundConversation(action.conversation);
+      return {
+        ...state,
+        sessionId: action.sessionId,
+        sessionTitle: action.title,
+        sessionUpdatedAt: action.updatedAt,
+        conversation,
+        latestAssistantSource: latestCompletedAssistantSource(conversation),
+        scrollOffset: 0,
+        scrollMax: 0,
+        externalActivity: undefined,
+      };
+    }
+    case "session/title":
+      return { ...state, sessionTitle: action.title };
+    case "session/create": {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { sessionId: _sid, sessionUpdatedAt: _sup, ...rest } = state;
+      return {
+        ...rest,
+        sessionTitle: DEFAULT_SESSION_TITLE,
+        conversation: [],
+        latestAssistantSource: undefined,
+        scrollOffset: 0,
+        scrollMax: 0,
+        externalActivity: undefined,
+      };
+    }
     case "run/status":
       return {
         ...state,
         runStatus: action.status,
         ...(action.status === "idle" ? { phase: undefined } : {}),
+        ...(action.status === "idle" ? { externalActivity: undefined } : {}),
       };
     case "run/phase":
       return { ...state, phase: action.phase };
@@ -185,6 +255,8 @@ export function reduce(state: AppState, action: AppAction): AppState {
       return { ...state, notices: pushNotice(state.notices, action.notice) };
     case "notice/dismiss":
       return { ...state, notices: state.notices.filter((item) => item.id !== action.id) };
+    case "notice/clear":
+      return { ...state, notices: [] };
     case "documents/stage":
       return {
         ...state,
@@ -198,17 +270,25 @@ export function reduce(state: AppState, action: AppAction): AppState {
     case "documents/consume":
       return { ...state, stagedDocuments: [] };
     case "scroll/by":
-      // The offset counts retained entries away from the newest. Clamping to the retained count
-      // keeps at least the oldest message on screen, so scrollback cannot run past the transcript
-      // into an empty view that reports no hidden messages in either direction.
       return {
         ...state,
-        scrollOffset: clamp(
-          state.scrollOffset + action.lines,
-          0,
-          Math.max(0, state.conversation.length - 1),
+        scrollOffset: clampScrollOffset(
+          state.scrollOffset + normalizeScrollDelta(action.lines),
+          state.scrollMax,
         ),
       };
+    case "scroll/range": {
+      const scrollMax = normalizeNonNegativeInteger(action.maxRows);
+      const delta = scrollMax - state.scrollMax;
+      return {
+        ...state,
+        scrollMax,
+        scrollOffset:
+          state.scrollOffset === 0 ? 0 : clampScrollOffset(state.scrollOffset + delta, scrollMax),
+      };
+    }
+    case "scroll/oldest":
+      return { ...state, scrollOffset: state.scrollMax };
     case "scroll/follow":
       return { ...state, scrollOffset: 0 };
     case "exit":
@@ -255,6 +335,40 @@ function pushHistory(history: readonly string[], value: string): readonly string
   const withoutDuplicate = history.filter((item) => item !== trimmed);
   const next = [...withoutDuplicate, trimmed];
   return next.length <= MAX_COMMAND_HISTORY ? next : next.slice(next.length - MAX_COMMAND_HISTORY);
+}
+
+function normalizeExternalActivity(activity: ExternalActivity): ExternalActivity {
+  return {
+    kind: activity.kind,
+    destination: activity.destination,
+    documentCount: normalizeNonNegativeInteger(activity.documentCount),
+  };
+}
+
+function clearExternalActivity(
+  state: AppState,
+  kind?: ExternalActivity["kind"],
+): { readonly externalActivity?: undefined } {
+  if (state.externalActivity === undefined) return {};
+  if (kind !== undefined && state.externalActivity.kind !== kind) return {};
+  return { externalActivity: undefined };
+}
+
+function normalizeNonNegativeInteger(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.trunc(value)));
+}
+
+function normalizeScrollDelta(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  const integer = Math.trunc(value);
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.max(-Number.MAX_SAFE_INTEGER, integer));
+}
+
+function clampScrollOffset(value: number, maximum: number): number {
+  const max = normalizeNonNegativeInteger(maximum);
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(max, Math.max(0, Math.trunc(value)));
 }
 
 function recallHistory(composer: ComposerState, direction: -1 | 1): ComposerState {

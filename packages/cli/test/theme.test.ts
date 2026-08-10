@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createTheme, THEME_NAMES } from "../src/theme.js";
 
 describe("CLI themes", () => {
-  it("offers the original built-in themes", () => {
+  it("offers the complete built-in theme list", () => {
     expect(THEME_NAMES).toEqual([
       "system",
       "dark",
@@ -13,11 +13,15 @@ describe("CLI themes", () => {
       "dracula",
       "solarized-dark",
       "gruvbox",
+      "tokyo-night",
+      "catppuccin",
+      "rose-pine",
+      "everforest",
     ]);
   });
 
   it("never emits ANSI controls outside an interactive color-enabled terminal", () => {
-    const noColor = createTheme("dark", { isTTY: true, env: { NO_COLOR: "1" } });
+    const noColor = createTheme("tokyo-night", { isTTY: true, env: { NO_COLOR: "1" } });
     const nonTty = createTheme("light", { isTTY: false, env: {} });
     const raw = createTheme("high-contrast", { isTTY: true, env: {}, plain: true });
 

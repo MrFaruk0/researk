@@ -3,8 +3,9 @@
 Researk is an open-source, local-first harness and command-line interface for scientific
 research and scientific writing.
 
-> **Pre-alpha:** a runnable source build exists. There is no installable GitHub Release or
-> native package yet. Interfaces and behavior can change without a compatibility guarantee.
+> **0.1.0-alpha.4 source milestone:** a runnable source build exists. There is no published
+> GitHub Release or native package yet. Interfaces and behavior can change without a compatibility
+> guarantee.
 
 ## Available from source
 
@@ -16,14 +17,31 @@ The current vertical slice provides:
 - an experimental generic OpenAI-compatible adapter with model discovery and JSON or SSE chat;
 - a bounded Research Domain with workflow and publication-profile metadata; and
 - a `researk` CLI with `help`, `version`, `doctor`, `models`, and `chat`, including raw and JSON
-  output and a TTY chat loop.
+  output, a one-shot TTY chat loop, and an argument-less full-screen TUI with local provider,
+  configuration, and session persistence.
 
-In a positively detected iTerm2 TTY, the interactive CLI can render display math through its local
-MathJax SVG backend, rasterize it in memory with resvg, and emit it with the iTerm2 inline-image
-protocol. Inline math and all unsupported, non-TTY, accessible, raw, JSON, or failed-render paths
-preserve exact LaTeX source. Kitty and Sixel graphics are not supported. The Research Domain can
-describe LaTeX authoring and export workflows, but it does not yet provide manuscript export or APA
-7 and IEEE citation processors.
+The CLI has two graphical math paths. One-shot `chat` can render display math in a positively
+detected iTerm2 TTY; iTerm2 is not used for retained TUI overlays. The full-screen TUI probes before
+Ink mounts, then renders assistant inline math (promoted to its own row) and display math through
+Kitty only after an explicit bounded query succeeds, or through Sixel only when the `WT_SESSION`
+Windows Terminal hint, DA1 parameter 4, and a valid cell-pixel response all prove support. The common local backend is
+restricted MathJax 4 → SVG → resvg at fixed 2× scale, producing opaque-white PNG/RGBA data; it does
+not execute system TeX, network requests, or files. Unsupported, inaccessible, raw, JSON, non-TTY,
+clipped, stale, or failed-render paths preserve exact LaTeX source.
+
+For Kitty images in VS Code, use a recent integrated terminal with
+[`terminal.integrated.enableImages`](https://code.visualstudio.com/docs/terminal/advanced#_image-support)
+enabled and GPU support (`terminal.integrated.gpuAcceleration` set to `on` or `auto`); the current
+[Kitty graphics guidance](https://code.visualstudio.com/updates/v1_110#_kitty-graphics-protocol)
+notes that Windows may also need `terminal.integrated.windowsUseConptyDll`. The documented setting
+may be required on a given Windows installation; Researk does not promise every VS Code version or
+terminal profile. Windows Terminal Sixel is used only when the terminal actually advertises it.
+
+The TUI `/formula` overlay supports keyboard navigation, exact canonical-source copy through bounded
+OSC 52, local draft edit and rerender, source toggling, and insertion of either the edited or original
+formula. Assistant and persisted session source remain immutable; no simplify or differentiate (CAS)
+operations are claimed. The Research Domain can describe LaTeX authoring and export workflows, but
+it does not yet provide manuscript export or APA 7 and IEEE citation processors.
 
 ## Build and test
 
@@ -78,8 +96,9 @@ node packages/cli/dist/bin.js models --provider-id custom --base-url https://exa
 node packages/cli/dist/bin.js chat --provider-id custom --base-url https://example.invalid/v1 --api-key-env PROVIDER_API_KEY --model custom:model-id "Test prompt"
 ```
 
-The current CLI does not persist credentials. Operating-system credential storage is not
-implemented.
+The normal TUI persists provider profiles, non-secret configuration, and sessions locally. API keys
+remain memory-only and must be supplied through supported environment-variable references; an
+operating-system credential backend is not implemented. One-shot commands never store credentials.
 
 ## Architecture
 
@@ -104,9 +123,9 @@ separate presentation concern and never changes stored source.
 The source build does not yet provide:
 
 - an installable GitHub Release or native packaging;
-- persistent configuration, sessions, cache, migrations, or operating-system keychain access;
-- Kitty, Sixel, or other terminal graphics protocols beyond positively detected iTerm2 display
-  math;
+- a persistent model-catalog cache, schema migrations, or operating-system keychain access;
+- unrestricted terminal graphics: iTerm2 is one-shot display-math support, while retained TUI
+  graphics require the bounded Kitty or Windows Terminal Sixel capability evidence described above;
 - CSL-backed APA 7 or IEEE processing and manuscript export;
 - scholarly or general web-research tools;
 - a paper-reproduction runner; or

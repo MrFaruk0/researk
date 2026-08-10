@@ -1,59 +1,49 @@
 import { Box, Text } from "ink";
 import type { ReactNode } from "react";
-import type { StatusNotice } from "../state.js";
-import { themeColor, type TuiTheme, type TuiThemeToken } from "../theme.js";
+import { displayText, type StatusNotice } from "../state.js";
+import { type TuiTheme, themeColor } from "../theme.js";
 
-function levelToken(level: StatusNotice["level"]): TuiThemeToken {
-  switch (level) {
-    case "error":
-      return "error";
-    case "warning":
-      return "warning";
-    case "success":
-      return "success";
-    case "info":
-      return "muted";
+function latestActionable(notices: readonly StatusNotice[]): StatusNotice | undefined {
+  let latest: StatusNotice | undefined;
+  for (const notice of notices) {
+    if (notice.level !== "warning" && notice.level !== "error") continue;
+    if (latest === undefined || notice.createdAt >= latest.createdAt) latest = notice;
   }
-}
-
-function levelPrefix(level: StatusNotice["level"]): string {
-  switch (level) {
-    case "error":
-      return "error";
-    case "warning":
-      return "warning";
-    case "success":
-      return "ok";
-    case "info":
-      return "info";
-  }
+  return latest;
 }
 
 /**
- * Renders diagnostics, errors, and external-I/O disclosure inside the TUI. Messages arrive already
- * redacted and neutralized, and no stack trace is ever shown.
+ * Renders only the newest actionable diagnostic. Messages arrive redacted and terminal-neutralized
+ * from App; the display projection is retained here as a final rendering-boundary guard.
  */
 export function Notices(props: {
   readonly theme: TuiTheme;
   readonly notices: readonly StatusNotice[];
   readonly width: number;
 }): ReactNode {
-  if (props.notices.length === 0) return null;
+  const notice = latestActionable(props.notices);
+  if (notice === undefined) return null;
+
+  const color = themeColor(props.theme, notice.level === "error" ? "error" : "warning");
+  const surface = themeColor(props.theme, "surfaceMuted");
+  const icon = notice.level === "error" ? "×" : "!";
   return (
-    <Box flexDirection="column" paddingX={1} width={props.width}>
-      {props.notices.map((notice) => {
-        const color = themeColor(props.theme, levelToken(notice.level));
-        return (
-          <Box key={notice.id}>
-            <Text {...(color === undefined ? {} : { color })}>
-              {`${levelPrefix(notice.level)}: `}
-            </Text>
-            <Text {...(color === undefined ? {} : { color })} wrap="truncate-end">
-              {notice.message}
-            </Text>
-          </Box>
-        );
-      })}
+    <Box
+      flexDirection="row"
+      borderStyle="single"
+      borderTop={false}
+      borderRight={false}
+      borderBottom={false}
+      borderLeft
+      paddingX={1}
+      width={props.width}
+      {...(color === undefined ? {} : { borderColor: color })}
+      {...(surface === undefined ? {} : { backgroundColor: surface })}
+    >
+      <Text {...(color === undefined ? {} : { color })}>{`${icon} `}</Text>
+      <Text wrap="truncate-end" {...(color === undefined ? {} : { color })}>
+        {displayText(notice.message)}
+      </Text>
     </Box>
   );
 }

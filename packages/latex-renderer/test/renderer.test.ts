@@ -24,6 +24,37 @@ async function waitForExit(worker: Worker): Promise<void> {
 }
 
 describe("renderTexToSvg", () => {
+  const typesetFixtures = [
+    [
+      "aligned multi-line equation",
+      String.raw`\begin{aligned}
+        a &= b + c \\
+        d &= e - f
+      \end{aligned}`,
+    ],
+    ["cases", String.raw`\begin{cases}x^2 & x > 0 \\ 0 & x \le 0\end{cases}`],
+    ["matrix", String.raw`\begin{pmatrix}a & b \\ c & d\end{pmatrix}`],
+    ["operatorname", String.raw`\operatorname{rank}(A) = n`],
+    ["sum with bounds", String.raw`\sum_{\pi\in C_t} \operatorname{sgn}(\pi)\varphi^\lambda_\pi`],
+    ["quadratic", `2x^{2}-4x-6=0`],
+    ["fraction and square root", String.raw`x=\frac{-(-4)\pm\sqrt{64}}{2(2)}`],
+    ["quadratic roots", String.raw`x=\frac{12}{4}=3\quad\text{or}\quad x=\frac{-4}{4}=-1`],
+  ] as const;
+
+  it.each(typesetFixtures)("produces actual bounded typeset pixels for %s", async (_label, tex) => {
+    const svg = await renderTexToSvg({ tex });
+    expect(svg.svg).toContain("<path");
+    expect(svg.svg).not.toMatch(/data-mjx-error|<text\b/iu);
+
+    const image = await renderTexToPng({ tex });
+    expect(image.width).toBeGreaterThan(1);
+    expect(image.height).toBeGreaterThan(1);
+    // Natural 2x raster scale: no expression is stretched to the former fixed 1200px width.
+    expect(image.width).toBeLessThan(1200);
+    expect(image.pixels.byteLength).toBe(image.width * image.height * 4);
+    expect(image.png.byteLength).toBeGreaterThan(0);
+  });
+
   it("renders a real MathJax SVG artifact in a worker", async () => {
     const result = await renderTexToSvg({
       tex: "\\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}",
@@ -80,6 +111,49 @@ describe("renderTexToSvg", () => {
     expect(result.png?.byteLength).toBeGreaterThan(0);
     expect(result.width).toBeGreaterThan(0);
     expect(result.height).toBeGreaterThan(0);
+  });
+
+  it("returns opaque white RGBA pixels with visible dark formula glyphs", async () => {
+    const result = await renderTexToPng({ tex: String.raw`\frac{-b\pm\sqrt{b^2-4ac}}{2a}` });
+    let hasWhite = false;
+    let hasDarkInk = false;
+    for (let index = 0; index < result.pixels.length; index += 4) {
+      const red = result.pixels[index];
+      const green = result.pixels[index + 1];
+      const blue = result.pixels[index + 2];
+      const alpha = result.pixels[index + 3];
+      expect(alpha).toBe(255);
+      if (red === 255 && green === 255 && blue === 255) hasWhite = true;
+      if (red < 100 && green < 100 && blue < 100) hasDarkInk = true;
+    }
+    expect(hasWhite).toBe(true);
+    expect(hasDarkInk).toBe(true);
+  });
+
+  it("keeps a deterministic opaque-white margin around the rasterized ink", async () => {
+    const result = await renderTexToPng({ tex: `x^2` });
+    expect(result.width).toBeGreaterThan(8);
+    expect(result.height).toBeGreaterThan(8);
+
+    const edgePixels: number[] = [];
+    for (let x = 0; x < result.width; x += 1) {
+      edgePixels.push(x, 0, x, result.height - 1);
+    }
+    for (let y = 1; y < result.height - 1; y += 1) {
+      edgePixels.push(0, y, result.width - 1, y);
+    }
+    for (let index = 0; index < edgePixels.length; index += 2) {
+      const x = edgePixels[index];
+      const y = edgePixels[index + 1];
+      const pixel = (y * result.width + x) * 4;
+      expect(Array.from(result.pixels.slice(pixel, pixel + 4))).toEqual([255, 255, 255, 255]);
+    }
+  });
+
+  it("preserves the input ceiling before entering the padded raster path", async () => {
+    await expect(
+      renderTexToPng({ tex: "x".repeat(latexSvgRendererLimits.maximumInputBytes + 1) }),
+    ).rejects.toMatchObject({ code: "input_limit" });
   });
 
   /**
@@ -139,6 +213,15 @@ describe("renderTexToSvg", () => {
     // A real glyph run, proven structurally: an actual `<text>` element is present.
     expect(svgResult.svg).toMatch(/<text\b/iu);
 
+    await expect(renderTexToPng({ tex })).rejects.toMatchObject({ code: "render_failed" });
+  });
+
+  it.each([
+    ["require package loading", String.raw`\require{html}x`],
+    ["HTML macro", String.raw`\htmlClass{evil}{x}`],
+    ["URL macro", String.raw`\url{https://example.invalid}`],
+    ["undefined macro", String.raw`\notarealmacro{x}`],
+  ])("fails closed for %s instead of rasterizing unsafe input", async (_label, tex) => {
     await expect(renderTexToPng({ tex })).rejects.toMatchObject({ code: "render_failed" });
   });
 

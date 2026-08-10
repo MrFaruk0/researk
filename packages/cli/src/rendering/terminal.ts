@@ -3,7 +3,7 @@ import type { Writable } from "node:stream";
 import { type LatexRenderBudget, renderTexToPng } from "@researk/latex-renderer";
 import type { MarkdownRenderEvent, MathRenderEvent } from "./parser.js";
 
-export type TerminalGraphicsProtocol = "iterm2" | "kitty" | "unsupported";
+export type TerminalGraphicsProtocol = "iterm2" | "kitty" | "sixel" | "unsupported";
 
 export interface TerminalCapability {
   readonly protocol: TerminalGraphicsProtocol;
@@ -12,7 +12,8 @@ export interface TerminalCapability {
 
 /**
  * Capability detection is deliberately conservative. iTerm's documented identity is sufficient
- * for its inline-image protocol; kitty is not enabled until its bounded query/reply broker exists.
+ * for its inline-image protocol. Kitty and Sixel are selected only by the separate bounded
+ * startup probe; this synchronous helper intentionally performs no terminal I/O.
  */
 export function detectTerminalCapability(
   stdout: { readonly isTTY?: boolean },
@@ -22,7 +23,12 @@ export function detectTerminalCapability(
   if (env.TERM === "dumb" || env.CI !== undefined) {
     return { protocol: "unsupported", reason: "non-interactive terminal environment" };
   }
-  if (env.TMUX !== undefined || env.STY !== undefined) {
+  if (
+    env.TMUX !== undefined ||
+    env.STY !== undefined ||
+    env.TERM === "screen" ||
+    env.TERM?.startsWith("screen-")
+  ) {
     return { protocol: "unsupported", reason: "multiplexer passthrough is not verified" };
   }
   const itermVersion = env.TERM_PROGRAM_VERSION ?? env.LC_TERMINAL_VERSION;

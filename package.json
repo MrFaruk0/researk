@@ -1,6 +1,6 @@
 {
   "name": "researk",
-  "version": "0.1.0-alpha.3",
+  "version": "0.1.0-alpha.4",
   "private": true,
   "description": "Local-first scientific research harness and CLI",
   "license": "Apache-2.0",

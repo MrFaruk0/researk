@@ -28,6 +28,9 @@ export const maximumRasterHeight = 2048;
 
 export const maximumRasterArea = 8_388_608;
 
+/** A raw RGBA plane is bounded by the same raster area, at four bytes per pixel. */
+export const maximumRgbaBytes = maximumRasterArea * 4;
+
 export const rendererIdentity = "mathjax-4.1.3";
 
 /**
@@ -64,6 +67,7 @@ export interface WorkerRenderPayload {
   readonly svg: string;
   readonly tex: string;
   readonly png?: Uint8Array;
+  readonly pixels?: Uint8Array;
   readonly width?: number;
   readonly height?: number;
 }
@@ -104,6 +108,7 @@ const pngPayloadKeys: ReadonlySet<string> = new Set([
   "svg",
   "tex",
   "png",
+  "pixels",
   "width",
   "height",
 ]);
@@ -172,7 +177,10 @@ function isValidRenderPayload(value: unknown, expected: ExpectedResponse): boole
   if (value.png.byteLength < 1 || value.png.byteLength > maximumPngBytes) return false;
   if (!isPositiveIntegerWithin(value.width, maximumRasterWidth)) return false;
   if (!isPositiveIntegerWithin(value.height, maximumRasterHeight)) return false;
-  return value.width * value.height <= maximumRasterArea;
+  if (value.width * value.height > maximumRasterArea) return false;
+  if (!isPlainUint8Array(value.pixels)) return false;
+  if (value.pixels.byteLength > maximumRgbaBytes) return false;
+  return value.pixels.byteLength === value.width * value.height * 4;
 }
 
 /**

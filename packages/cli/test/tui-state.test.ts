@@ -17,7 +17,7 @@ import {
   MAX_TUI_CONVERSATION_ENTRIES,
   selectedDescriptor,
 } from "../src/tui/state.js";
-import { createTuiTheme, themeColor, TUI_THEME_TOKENS, tuiThemeNames } from "../src/tui/theme.js";
+import { createTuiTheme, TUI_THEME_TOKENS, themeColor, tuiThemeNames } from "../src/tui/theme.js";
 
 function baseState(): AppState {
   return createInitialState({
@@ -77,6 +77,8 @@ describe("slash command discovery and routing", () => {
       "/model",
       "/variant",
       "/themes",
+      "/sessions",
+      "/new",
       "/help",
       "/clear",
       "/exit",
@@ -211,13 +213,53 @@ describe("provider-driven variants", () => {
 });
 
 describe("semantic theme tokens", () => {
-  it("resolves every documented token for every theme", () => {
+  it("offers the complete built-in theme list", () => {
+    expect(tuiThemeNames()).toEqual([
+      "system",
+      "dark",
+      "light",
+      "high-contrast",
+      "mono",
+      "nord",
+      "dracula",
+      "solarized-dark",
+      "gruvbox",
+      "tokyo-night",
+      "catppuccin",
+      "rose-pine",
+      "everforest",
+    ]);
+  });
+
+  it("resolves content colors and optional surfaces for every theme", () => {
+    const inheritableTokens = new Set([
+      "background",
+      "surface",
+      "surfaceMuted",
+      "userSurface",
+      "assistantSurface",
+    ]);
     for (const name of tuiThemeNames()) {
       const theme = createTuiTheme(name, { colorEnabled: true });
       for (const token of TUI_THEME_TOKENS) {
-        if (token === "background") continue;
-        expect(themeColor(theme, token), `${name}.${token}`).toBeTypeOf("string");
+        const color = themeColor(theme, token);
+        if (inheritableTokens.has(token)) {
+          expect(color === undefined || typeof color === "string", `${name}.${token}`).toBe(true);
+        } else {
+          expect(color, `${name}.${token}`).toBeTypeOf("string");
+        }
       }
+    }
+  });
+
+  it("creates the colorful palettes with dedicated content colors", () => {
+    for (const name of ["tokyo-night", "catppuccin", "rose-pine", "everforest"] as const) {
+      const theme = createTuiTheme(name, { colorEnabled: true });
+      expect(theme.palette.surface, `${name}.surface`).toBeTypeOf("string");
+      expect(theme.palette.surfaceMuted, `${name}.surfaceMuted`).toBeTypeOf("string");
+      expect(themeColor(theme, "math"), `${name}.math`).toBeTypeOf("string");
+      expect(themeColor(theme, "code"), `${name}.code`).toBeTypeOf("string");
+      expect(themeColor(theme, "citation"), `${name}.citation`).toBeTypeOf("string");
     }
   });
 
@@ -237,6 +279,29 @@ describe("semantic theme tokens", () => {
 });
 
 describe("conversation state", () => {
+  it("derives the newest completed assistant source from restored initial history", () => {
+    const state = createInitialState({
+      workspaceRoot: "/workspace",
+      themeName: "system",
+      colorEnabled: true,
+      variant: "auto",
+      conversation: [
+        { id: "a-old", role: "assistant", source: "older", streaming: false, createdAt: 0 },
+        { id: "tool", role: "tool", source: "tool output", streaming: false, createdAt: 0 },
+        { id: "a-empty", role: "assistant", source: "", streaming: false, createdAt: 0 },
+        {
+          id: "a-streaming",
+          role: "assistant",
+          source: "partial placeholder",
+          streaming: true,
+          createdAt: 0,
+        },
+        { id: "system", role: "system", source: "metadata", streaming: false, createdAt: 0 },
+      ],
+    });
+    expect(state.latestAssistantSource).toBe("");
+  });
+
   it("streams deltas into one assistant entry in place", () => {
     let state = reduce(baseState(), {
       type: "conversation/append",
@@ -293,7 +358,133 @@ describe("conversation state", () => {
   });
 });
 
-describe("composer history and scrolling", () => {
+describe("session metadata", () => {
+  it("starts every session untitled and unbound to a persisted session", () => {
+    const state = baseState();
+    expect(state.sessionId).toBeUndefined();
+    expect(state.sessionTitle).toBe("New session");
+    expect(state.sessionUpdatedAt).toBeUndefined();
+  });
+
+  it("loads a session with its metadata and replaces the conversation", () => {
+    const state = reduce(baseState(), {
+      type: "conversation/append",
+      entry: { id: "a1", role: "assistant", source: "old", streaming: false, createdAt: 0 },
+    });
+    const loaded = reduce(state, {
+      type: "session/load",
+      sessionId: "session-abc",
+      title: "My research",
+      updatedAt: "2026-08-10T12:00:00.000Z",
+      conversation: [
+        { id: "u1", role: "user", source: "new question", streaming: false, createdAt: 0 },
+      ],
+    });
+    expect(loaded.sessionId).toBe("session-abc");
+    expect(loaded.sessionTitle).toBe("My research");
+    expect(loaded.sessionUpdatedAt).toBe("2026-08-10T12:00:00.000Z");
+    expect(loaded.conversation).toHaveLength(1);
+    expect(loaded.conversation[0]?.source).toBe("new question");
+    // A replaced conversation must not retain the previous assistant source.
+    expect(loaded.latestAssistantSource).toBeUndefined();
+    expect(loaded.scrollOffset).toBe(0);
+  });
+
+  it("bounds an over-large loaded conversation to the retained window", () => {
+    const loaded = reduce(baseState(), {
+      type: "session/load",
+      sessionId: "session-big",
+      title: "Big session",
+      updatedAt: "2026-08-10T12:00:00.000Z",
+      conversation: Array.from({ length: MAX_TUI_CONVERSATION_ENTRIES + 25 }, (_value, index) => ({
+        id: `m${index}`,
+        role: "user" as const,
+        source: `message ${index}`,
+        streaming: false,
+        createdAt: 0,
+      })),
+    });
+    expect(loaded.conversation).toHaveLength(MAX_TUI_CONVERSATION_ENTRIES);
+    expect(loaded.conversation.at(-1)?.id).toBe(`m${MAX_TUI_CONVERSATION_ENTRIES + 24}`);
+  });
+
+  it("derives the latest completed assistant source after bounding loaded history", () => {
+    const loaded = reduce(baseState(), {
+      type: "session/load",
+      sessionId: "session-source",
+      title: "Source session",
+      updatedAt: "2026-08-10T12:00:00.000Z",
+      conversation: [
+        { id: "trimmed", role: "assistant", source: "trimmed", streaming: false, createdAt: 0 },
+        ...Array.from({ length: MAX_TUI_CONVERSATION_ENTRIES }, (_value, index) => ({
+          id: `u${index}`,
+          role: "user" as const,
+          source: `question ${index}`,
+          streaming: false,
+          createdAt: 0,
+        })),
+        {
+          id: "latest",
+          role: "assistant" as const,
+          source: "retained canonical source",
+          streaming: false,
+          createdAt: 0,
+        },
+        {
+          id: "tool-tail",
+          role: "tool" as const,
+          source: "tool output",
+          streaming: false,
+          createdAt: 0,
+        },
+        {
+          id: "stream-tail",
+          role: "assistant" as const,
+          source: "unfinished",
+          streaming: true,
+          createdAt: 0,
+        },
+      ],
+    });
+    expect(loaded.conversation).toHaveLength(MAX_TUI_CONVERSATION_ENTRIES);
+    expect(loaded.conversation[0]?.id).toBe("u3");
+    expect(loaded.conversation.at(-1)?.id).toBe("stream-tail");
+    expect(loaded.latestAssistantSource).toBe("retained canonical source");
+  });
+
+  it("updates only the session title in place", () => {
+    const state = reduce(baseState(), {
+      type: "session/load",
+      sessionId: "session-abc",
+      title: "Original",
+      updatedAt: "2026-08-10T12:00:00.000Z",
+      conversation: [{ id: "u1", role: "user", source: "keep me", streaming: false, createdAt: 0 }],
+    });
+    const renamed = reduce(state, { type: "session/title", title: "Renamed" });
+    expect(renamed.sessionTitle).toBe("Renamed");
+    expect(renamed.sessionId).toBe("session-abc");
+    expect(renamed.sessionUpdatedAt).toBe("2026-08-10T12:00:00.000Z");
+    expect(renamed.conversation[0]?.source).toBe("keep me");
+  });
+
+  it("creates a new session that resets metadata and clears the conversation", () => {
+    let state = reduce(baseState(), {
+      type: "session/load",
+      sessionId: "session-abc",
+      title: "My research",
+      updatedAt: "2026-08-10T12:00:00.000Z",
+      conversation: [{ id: "u1", role: "user", source: "old", streaming: false, createdAt: 0 }],
+    });
+    state = reduce(state, { type: "session/create" });
+    expect(state.sessionId).toBeUndefined();
+    expect(state.sessionTitle).toBe("New session");
+    expect(state.sessionUpdatedAt).toBeUndefined();
+    expect(state.conversation).toEqual([]);
+    expect(state.latestAssistantSource).toBeUndefined();
+  });
+});
+
+describe("composer history and rendered-row scrolling", () => {
   it("recalls submitted entries with up and returns to the live draft with down", () => {
     let state = baseState();
     for (const value of ["first", "second"]) {
@@ -320,49 +511,196 @@ describe("composer history and scrolling", () => {
     expect(state.composer.history).toHaveLength(MAX_COMMAND_HISTORY);
   });
 
-  it("never scrolls past the newest message and can resume following", () => {
-    // Scrollback is bounded by the retained transcript, so an empty conversation has nothing to
-    // scroll back through.
-    let state = reduce(baseState(), { type: "scroll/by", lines: 3 });
-    expect(state.scrollOffset).toBe(0);
+  it("recalls the redacted history value supplied for a submitted prompt", () => {
+    let state = reduce(baseState(), {
+      type: "composer/set",
+      value: "prompt synthetic-secret",
+      cursor: "prompt synthetic-secret".length,
+    });
+    state = reduce(state, {
+      type: "composer/submit",
+      historyValue: "prompt [REDACTED]",
+    });
+    state = reduce(state, { type: "composer/history-previous" });
+    expect(state.composer.value).toBe("prompt [REDACTED]");
+    expect(state.composer.value).not.toContain("synthetic-secret");
+  });
 
-    // With four retained entries, at most three can be scrolled away from the newest.
-    let populated = baseState();
-    for (const id of ["a", "b", "c", "d"]) {
-      populated = reduce(populated, {
-        type: "conversation/append",
-        entry: { id, role: "user", source: id, streaming: false, createdAt: 0 },
-      });
-    }
-    state = reduce(populated, { type: "scroll/by", lines: 3 });
-    expect(state.scrollOffset).toBe(3);
-    state = reduce(state, { type: "scroll/by", lines: -10 });
+  it("clears stale model and catalog state while a provider is connecting", () => {
+    const connection = {
+      providerId: "compatible",
+      baseUrl: "https://example.test/v1/",
+      apiKeyEnvironmentVariable: "TEST_KEY",
+      kind: "compatible" as const,
+    };
+    const start: AppState = {
+      ...baseState(),
+      connection,
+      connectionStatus: "connected",
+      catalog: [descriptor("compatible:old", ["high"])],
+      model: "compatible:old",
+      variant: "high",
+    };
+    const connecting = reduce(start, { type: "connection/connecting", connection });
+    expect(connecting.connectionStatus).toBe("connecting");
+    expect(connecting.model).toBeUndefined();
+    expect(connecting.variant).toBe("auto");
+    expect(connecting.catalog).toEqual([]);
+    expect(connecting.catalogLoading).toBe(true);
+  });
+
+  it("initializes and normalizes the measured rendered-row range", () => {
+    let state = baseState();
     expect(state.scrollOffset).toBe(0);
-    state = reduce(state, { type: "scroll/by", lines: 2 });
+    expect(state.scrollMax).toBe(0);
+    state = reduce(state, { type: "scroll/range", maxRows: 7.8 });
+    expect(state.scrollMax).toBe(7);
+    expect(state.scrollOffset).toBe(0);
+    state = reduce(state, { type: "scroll/range", maxRows: Number.NaN });
+    expect(state.scrollMax).toBe(0);
+    state = reduce(state, { type: "scroll/range", maxRows: -10 });
+    expect(state.scrollMax).toBe(0);
+  });
+
+  it("pages by rendered rows in both directions and clamps to the measured range", () => {
+    let state = reduce(baseState(), { type: "scroll/range", maxRows: 8 });
+    state = reduce(state, { type: "scroll/by", lines: 3 });
+    expect(state.scrollOffset).toBe(3);
+    state = reduce(state, { type: "scroll/by", lines: -1.8 });
+    expect(state.scrollOffset).toBe(2);
+    state = reduce(state, { type: "scroll/by", lines: Number.POSITIVE_INFINITY });
+    expect(state.scrollOffset).toBe(2);
+    state = reduce(state, { type: "scroll/by", lines: 500 });
+    expect(state.scrollOffset).toBe(8);
+    state = reduce(state, { type: "scroll/by", lines: -500 });
+    expect(state.scrollOffset).toBe(0);
+  });
+
+  it("follows the tail and can jump to the oldest rendered row", () => {
+    let state = reduce(baseState(), { type: "scroll/range", maxRows: 4 });
+    state = reduce(state, { type: "scroll/oldest" });
+    expect(state.scrollOffset).toBe(4);
     state = reduce(state, { type: "scroll/follow" });
     expect(state.scrollOffset).toBe(0);
   });
 
-  it("clamps scrollback so the oldest retained message stays reachable", () => {
-    let state = baseState();
-    for (const id of ["a", "b", "c"]) {
-      state = reduce(state, {
-        type: "conversation/append",
-        entry: { id, role: "user", source: id, streaming: false, createdAt: 0 },
-      });
-    }
-    state = reduce(state, { type: "scroll/by", lines: 500 });
-    // Without the clamp the offset would run far past the transcript and blank the view.
-    expect(state.scrollOffset).toBe(2);
+  it("keeps the same visible content anchored as the measured range changes", () => {
+    let state = reduce(baseState(), { type: "scroll/range", maxRows: 10 });
+    state = reduce(state, { type: "scroll/by", lines: 4 });
+    state = reduce(state, { type: "scroll/range", maxRows: 16 });
+    expect(state.scrollOffset).toBe(10);
+    state = reduce(state, { type: "scroll/range", maxRows: 7 });
+    expect(state.scrollOffset).toBe(1);
+    state = reduce(state, { type: "scroll/range", maxRows: 20 });
+    expect(state.scrollOffset).toBe(14);
+    state = reduce(state, { type: "scroll/follow" });
+    state = reduce(state, { type: "scroll/range", maxRows: 30 });
+    expect(state.scrollOffset).toBe(0);
   });
 
-  it("returns to following when a new message arrives", () => {
-    let state = reduce(baseState(), { type: "scroll/by", lines: 4 });
+  it("does not reset manual scroll for deltas, while a new entry follows the prompt", () => {
+    let state = reduce(baseState(), { type: "scroll/range", maxRows: 12 });
+    state = reduce(state, { type: "scroll/by", lines: 5 });
     state = reduce(state, {
       type: "conversation/append",
-      entry: { id: "u1", role: "user", source: "hi", streaming: false, createdAt: 0 },
+      entry: { id: "a1", role: "assistant", source: "partial", streaming: true, createdAt: 0 },
     });
     expect(state.scrollOffset).toBe(0);
+    state = reduce(state, { type: "scroll/by", lines: 5 });
+    state = reduce(state, { type: "conversation/append-delta", id: "a1", delta: " text" });
+    expect(state.scrollOffset).toBe(5);
+    state = reduce(state, {
+      type: "conversation/append",
+      entry: { id: "u1", role: "user", source: "new prompt", streaming: false, createdAt: 0 },
+    });
+    expect(state.scrollOffset).toBe(0);
+  });
+
+  it("lets measured geometry, rather than entry count, govern removal and resets clear paths", () => {
+    let state = reduce(baseState(), { type: "scroll/range", maxRows: 12 });
+    state = reduce(state, { type: "scroll/by", lines: 5 });
+    state = reduce(state, {
+      type: "conversation/append",
+      entry: { id: "u1", role: "user", source: "prompt", streaming: false, createdAt: 0 },
+    });
+    state = reduce(state, { type: "scroll/by", lines: 5 });
+    state = reduce(state, { type: "conversation/remove", id: "u1" });
+    expect(state.scrollOffset).toBe(5);
+    expect(state.scrollMax).toBe(12);
+
+    state = reduce(state, { type: "conversation/clear" });
+    expect(state.scrollOffset).toBe(0);
+    expect(state.scrollMax).toBe(0);
+    state = reduce(state, { type: "scroll/range", maxRows: 9 });
+    state = reduce(state, {
+      type: "session/load",
+      sessionId: "s1",
+      title: "Loaded",
+      updatedAt: "2026-08-10T12:00:00.000Z",
+      conversation: [],
+    });
+    expect(state.scrollOffset).toBe(0);
+    expect(state.scrollMax).toBe(0);
+    state = reduce(state, { type: "scroll/range", maxRows: 9 });
+    state = reduce(state, { type: "session/create" });
+    expect(state.scrollOffset).toBe(0);
+    expect(state.scrollMax).toBe(0);
+  });
+});
+
+describe("external activity and notices", () => {
+  const catalogActivity = {
+    kind: "catalog" as const,
+    destination: "OpenRouter catalog",
+    documentCount: 0,
+  };
+
+  it("sets and clears ephemeral external activity without changing contracts", () => {
+    let state = reduce(baseState(), { type: "external/set", activity: catalogActivity });
+    expect(state.externalActivity).toEqual(catalogActivity);
+    state = reduce(state, { type: "external/clear" });
+    expect(state.externalActivity).toBeUndefined();
+  });
+
+  it("clears catalog activity on connection/catalog completion and prompt activity on idle", () => {
+    let state = reduce(baseState(), { type: "external/set", activity: catalogActivity });
+    state = reduce(state, { type: "catalog/loaded", catalog: [] });
+    expect(state.externalActivity).toBeUndefined();
+
+    state = reduce(state, { type: "external/set", activity: catalogActivity });
+    state = reduce(state, { type: "connection/failed", message: "unavailable" });
+    expect(state.externalActivity).toBeUndefined();
+
+    state = reduce(state, { type: "external/set", activity: catalogActivity });
+    state = reduce(state, {
+      type: "connection/connected",
+      connection: {
+        providerId: "openrouter",
+        apiKeyEnvironmentVariable: "OPENROUTER_API_KEY",
+        kind: "openrouter",
+      },
+      catalog: [],
+      credentialValues: {},
+    });
+    expect(state.externalActivity).toBeUndefined();
+
+    state = reduce(state, {
+      type: "external/set",
+      activity: { kind: "prompt", destination: "provider endpoint", documentCount: 2 },
+    });
+    state = reduce(state, { type: "run/status", status: "streaming" });
+    expect(state.externalActivity?.kind).toBe("prompt");
+    state = reduce(state, { type: "run/status", status: "idle" });
+    expect(state.externalActivity).toBeUndefined();
+  });
+
+  it("clears all notices when a new attempt starts", () => {
+    let state = reduce(baseState(), {
+      type: "notice/push",
+      notice: { id: "n1", level: "error", message: "try again", createdAt: 0 },
+    });
+    state = reduce(state, { type: "notice/clear" });
+    expect(state.notices).toEqual([]);
   });
 });
 

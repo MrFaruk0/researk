@@ -1,6 +1,6 @@
 {
   "name": "@researk/cli",
-  "version": "0.1.0-alpha.3",
+  "version": "0.1.0-alpha.4",
   "description": "Terminal client for the Researk Harness",
   "license": "Apache-2.0",
   "repository": {
@@ -36,14 +36,15 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@researk/contracts": "0.1.0-alpha.3",
-    "@researk/harness": "0.1.0-alpha.3",
-    "@researk/latex-renderer": "0.1.0-alpha.3",
-    "@researk/provider-openai-compatible": "0.1.0-alpha.3",
-    "@researk/provider-openrouter": "0.1.0-alpha.3",
-    "@researk/research": "0.1.0-alpha.3",
+    "@researk/contracts": "0.1.0-alpha.4",
+    "@researk/harness": "0.1.0-alpha.4",
+    "@researk/latex-renderer": "0.1.0-alpha.4",
+    "@researk/provider-openai-compatible": "0.1.0-alpha.4",
+    "@researk/provider-openrouter": "0.1.0-alpha.4",
+    "@researk/research": "0.1.0-alpha.4",
     "ink": "7.1.1",
-    "react": "19.2.8"
+    "react": "19.2.8",
+    "string-width": "8.2.2"
   },
   "devDependencies": {
     "@types/react": "19.2.8",

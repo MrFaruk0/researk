@@ -77,12 +77,18 @@ Researk succeeds when its released behavior can be demonstrated, not merely clai
 
 ## Current status
 
-Researk is pre-alpha. A runnable source build provides the Harness, a CLI, a Harness-level offline
-fake provider, an experimental generic OpenAI-compatible adapter, and publication-profile metadata.
-The fake adapter is not exposed through `RESEARK_FAKE_PROVIDER`, `fake:paper`, or any other CLI fake
-mode. Interactive display math can use a bounded local MathJax SVG backend, in-memory resvg
-rasterization, and the iTerm2 inline-image protocol only when iTerm2 support is positively detected;
-exact source is used everywhere else, and Kitty and Sixel are unsupported. There is no installable
-GitHub Release, native packaging, persistent state, CSL processor, scholarly web tooling,
-reproduction runner, or verified native provider support yet. The remaining product description is
-a target until each capability exists and is tested.
+The current source milestone is `0.1.0-alpha.4`. A runnable source build provides the Harness, the
+CLI, a Harness-level offline fake provider, an experimental generic OpenAI-compatible adapter,
+publication-profile metadata, and an argument-less full-screen TUI with local provider,
+configuration, and session persistence. The fake adapter is not exposed through
+`RESEARK_FAKE_PROVIDER`, `fake:paper`, or any other CLI fake mode.
+
+The TUI renders assistant inline math (promoted to a row) and display math with restricted local
+MathJax 4 → SVG → resvg 2× opaque-white PNG/RGBA output. Retained graphics require a bounded Kitty
+query with explicit success or Windows Terminal Sixel evidence (`WT_SESSION`, DA1 parameter 4, and
+a proven cell-pixel response). One-shot iTerm2 remains display-math support only;
+it is not a retained TUI overlay protocol. Exact source is used for unsupported, inaccessible,
+raw, JSON, non-TTY, clipped, stale, and failed paths. There is no published GitHub Release, native
+packaging, operating-system credential backend, persistent model-catalog cache, CSL processor,
+scholarly web tooling, reproduction runner, or verified native provider support yet. The remaining
+product description is a target until each capability exists and is tested.

@@ -2,7 +2,30 @@
 
 All notable changes to Researk will be documented in this file.
 
-The project intends to follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Researk is pre-alpha; no versioned release or compatibility guarantee exists yet.
+The project intends to follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Researk is pre-release; no published release or compatibility guarantee exists yet.
+
+## [0.1.0-alpha.4] - 2026-08-10
+
+### Added
+
+- A full-screen TUI formula browser with keyboard navigation, exact-source reveal, bounded OSC 52
+  copy, local draft editing/rerendering, and canonical or edited insertion without mutating
+  assistant/session source.
+- Retained TUI formula graphics for inline (promoted to a row) and display math through bounded
+  Kitty or Windows Terminal Sixel capability detection, plus local provider/configuration/session
+  persistence that keeps credentials ephemeral.
+
+### Changed
+
+- Formula images use restricted local MathJax 4 → SVG → resvg at fixed 2× scale with opaque-white
+  PNG/RGBA output. Graphics are emitted outside Ink after frame flush; unsupported, inaccessible,
+  raw, JSON, non-TTY, clipped, stale, or failed paths show exact source. One-shot iTerm2 display-math
+  support remains separate from retained TUI overlays.
+
+### Security
+
+- Rendering remains offline and file/process-free: no system TeX, network, or file execution. No CAS
+  simplify/differentiate operations are exposed by the formula overlay.
 
 ## [Unreleased]
 
@@ -24,7 +47,7 @@ The project intends to follow [Keep a Changelog](https://keepachangelog.com/en/1
 ### Changed
 
 - Published Researk as an Apache-2.0 local-first scientific research harness and CLI.
-- Replaced planning-only status language with the verified pre-alpha source-build status and
+- Replaced planning-only status language with the verified alpha source-build status and
   explicit limits.
 
 ### Security

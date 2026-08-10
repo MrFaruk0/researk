@@ -2,12 +2,14 @@
 
 ## Status
 
-This document defines the normative rendering contract for the Researk CLI. The current pre-alpha
-implementation includes local MathJax SVG generation, in-memory resvg rasterization, and display
-math emission in positively detected iTerm2 TTYs. Exact source is used everywhere else. Kitty and
-Sixel are currently unsupported. Sections that explicitly describe planned command-line or
-configuration options are future contract requirements, not claims that those options are accepted
-by the current CLI.
+This document defines the normative rendering contract for the Researk CLI. The current
+`0.1.0-alpha.4` source build includes restricted local MathJax 4 SVG generation, in-memory resvg
+rasterization, one-shot display-math emission in positively detected iTerm2 TTYs, and retained
+formula graphics in the full-screen TUI. The TUI uses Kitty only after an explicit bounded query
+succeeds and Windows Terminal Sixel only after its advertised capability and cell-pixel response
+are proven. Exact source is used everywhere else. Sections that explicitly describe planned
+command-line or configuration options are future contract requirements, not claims that those
+options are accepted by the current CLI.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** describe requirements for implementations of the official CLI and compatible clients.
 
@@ -96,7 +98,7 @@ The runtime owns the canonical response stream. The Research Domain may validate
 
 Sessions MUST persist the canonical source and relevant runtime diagnostics. They MUST NOT persist terminal escape sequences or rendered SVG and raster artifacts. A rendering cache is disposable and MUST NOT become session state.
 
-When a graphic is shown in place of a math span, the CLI MUST retain a direct, documented way to reveal and copy that span's exact source without OCR or reverse conversion. The current interactive implementation provides `/source`; raw, accessible, Markdown, and JSON output provide exact source directly. The planned `--math source` mode MUST do the same when that option is implemented. Any interactive source-view or copy action MUST copy the canonical event source rather than text extracted from the rendered image.
+When a graphic is shown in place of a math span, the CLI MUST retain a direct, documented way to reveal and copy that span's exact source without OCR or reverse conversion. The current full-screen TUI provides `/source` and `/formula`: `/formula` can navigate indexed assistant formulas, toggle exact source, and copy the canonical event source through bounded OSC 52 when explicitly eligible. Raw, accessible, Markdown, and JSON output provide exact source directly. The planned `--math source` mode MUST do the same when that option is implemented. Any interactive source-view, copy, edit, or insert action MUST start from the canonical event source rather than text extracted from a rendered image.
 
 ---
 
@@ -212,7 +214,7 @@ render(tex, display_mode, container_width, scale, theme, macro_set)
     → rendered artifact and diagnostics
 ```
 
-The initial bundled implementation is:
+The current bundled image implementation is:
 
 ```text
 MathJax 4 TeX input
@@ -221,9 +223,9 @@ standalone SVG
         ↓
 SVG validation and sanitization
         ↓
-resvg rasterization
+resvg rasterization at fixed 2× scale
         ↓
-transparent RGBA or PNG
+opaque-white RGBA pixels and PNG
 ```
 
 The initial backend MUST:
@@ -237,6 +239,11 @@ The initial backend MUST:
 - avoid system TeX installations,
 - avoid invoking `latex`, `pdflatex`, `xelatex`, `lualatex`, `tectonic`, `kitten`, `imgcat`, `chafa`, or any other external executable,
 - produce deterministic output for the same input, backend version, configuration, width, scale, and theme.
+
+The TUI formula path uses this same restricted MathJax 4 → SVG → resvg pipeline for both display
+math and inline math promoted to a dedicated row. The fixed opaque-white background keeps glyphs
+visible in dark terminals; the rasterizer returns both PNG and raw RGBA data for the terminal
+protocol emitters. No path executes system TeX, accesses files, or makes network requests.
 
 Renderer isolation MAY use a worker thread or another embedded, terminable worker supplied with Researk. It MUST NOT invoke an external rendering subprocess.
 
@@ -252,9 +259,10 @@ Dependency versions, licenses, notices, and the software bill of materials MUST 
 
 ## 7.1 Automatic behavior
 
-The current CLI automatically selects terminal presentation only for an interactive TTY and uses
-automatic math capability detection. The named `auto` values below describe the planned explicit
-output and math option contract.
+The current CLI selects terminal presentation only for an interactive TTY. One-shot `chat` uses
+non-I/O iTerm2 identity detection for display math; the argument-less full-screen TUI performs its
+bounded Kitty/Sixel capability probe before Ink mounts. The named `auto` values below describe the
+planned explicit output and math option contract.
 
 When standard output is an interactive TTY, the CLI SHOULD use terminal presentation and SHOULD render math graphically only when a supported graphics protocol has been positively detected.
 
@@ -311,11 +319,21 @@ The following options define planned contract behavior. They are not accepted by
 
 `source` is the default fallback. `error` is intended for strict one-shot commands and automated checks.
 
-Raster output SHOULD use a transparent background. `auto` theme selection may use a trusted terminal foreground query or known terminal metadata. If color cannot be determined safely, the renderer MUST use the configured fallback theme and MUST retain sufficient contrast.
+The current TUI raster output uses an opaque-white background at fixed 2× scale so formula glyphs
+remain visible on dark surfaces. Future theme options MAY choose another safe background, but they
+MUST retain sufficient contrast and MUST NOT weaken exact-source fallback.
 
-## 7.5 Planned persistent configuration
+## 7.5 Local persistence boundary
 
-Persistent configuration is not currently implemented. Its planned equivalents are:
+The full-screen TUI currently persists non-secret provider profiles, selected model/reasoning/theme
+configuration, and bounded canonical sessions in the platform's local data directories. It restores
+the selected workspace session when the saved workspace matches the current directory. Normal TUI
+startup deliberately uses a non-persistent credential store: API keys remain in memory and are
+resolved through environment-variable references. An operating-system credential backend remains
+future work. Rendered protocol bytes and raster cache entries are never session state.
+
+The following equivalents remain planned command-line/configuration contract values rather than
+accepted current CLI flags:
 
 ```toml
 [output]
@@ -326,64 +344,94 @@ math_theme = "auto"
 accessible = false
 ```
 
-When persistent configuration and the corresponding command-line flags are implemented,
-command-line flags MUST override workspace configuration, which MUST override user configuration,
-which MUST override built-in defaults.
+When the planned persistent configuration flags are implemented, command-line flags MUST override
+workspace configuration, which MUST override user configuration, which MUST override built-in
+defaults.
 
 ---
 
 # 8. Terminal Graphics
 
-The currently supported graphics protocol is:
+The current source build has two deliberately separate graphics paths:
 
-1. iTerm2 inline-image protocol
+1. **One-shot `chat`:** positively identified iTerm2 TTYs may receive display-math images through
+   the iTerm2 inline-image protocol. Inline math remains exact source in this path. iTerm2 is not a
+   retained full-screen TUI overlay protocol.
+2. **Full-screen TUI:** argument-less interactive TTY startup probes before Ink mounts. Assistant
+   display math and inline math promoted to a dedicated row may use retained Kitty or Windows
+   Terminal Sixel placements after the evidence gates in Section 8.1. The common image backend is
+   restricted MathJax 4 → SVG → resvg at fixed 2× scale, returning opaque-white PNG/RGBA data.
 
-Kitty and Sixel support are planned but MUST be reported as unsupported until their emitters,
-capability detection, layout, and cleanup behavior pass the required conformance tests. The current
-implementation performs no Kitty or Sixel capability probe.
+The CLI MUST emit protocol bytes directly from its trusted terminal backend. It MUST NOT depend on
+helper executables. Unsupported, inaccessible, raw, JSON, non-TTY, renderer-failure, clipped,
+scrolled, resized, or stale-frame paths MUST show the exact source.
 
-The CLI MUST emit protocol bytes directly from its trusted terminal backend. It MUST NOT depend on helper executables.
+When a graphical TUI formula is placeable, its source MUST be omitted from that visual slot to avoid
+duplicate visible content; the canonical assistant/session source remains immutable and available
+through `/source` and `/formula`. If the image cannot be rasterized, reserved, contained, or emitted
+without corrupting layout, `FormulaGraphic` MUST keep its exact source projection instead.
 
-Display math SHOULD be rendered graphically when a backend is available. Inline math may be rendered graphically only when the layout engine can reserve the required cell rectangle, preserve the surrounding text order, and reflow or redraw it correctly. If it cannot do so, that inline expression MUST fall back to exact source even when display math uses graphics.
+The TUI graphics runtime emits after the matching Ink frame has flushed, outside the Ink tree. Before
+each frame it synchronously clears prior placements. Generation checks, serialized writes, stream
+failure handling, terminal dimensions, clipping, and the reserved final scroll row prevent stale or
+misplaced images from surviving a redraw. Dispose, cancellation, resize, and exit clear or disable
+placements before terminal restoration.
 
-When the interactive REPL successfully presents display math graphically, it MUST omit the
-corresponding raw LaTeX from normal visible output to avoid duplicate content. The exact canonical
-response remains available through the `/source` REPL command, which writes the latest assistant
-response as source text for direct inspection or copying. Unsupported terminals and graphics
-failures MUST continue to show the exact source inline.
+The `/formula` overlay provides keyboard navigation (Up/Down or `j`/`k`), exact canonical-source
+copy through bounded OSC 52 (`c`), local draft editing and rerendering (`e`, then Enter), source
+toggle (`s`), and insertion (`i`) of either the edited draft or the original canonical formula.
+Copy is an explicit eligible-TTY action; when it is unavailable, the overlay keeps source visible
+and reports the bounded fallback reason. Formula drafts belong only to the overlay, and assistant
+conversation/session source is never rewritten. The overlay exposes no CAS simplify or differentiate
+operation.
 
 ## 8.1 Capability detection
 
-Capability detection proceeds in this order:
+For the retained TUI path, capability detection proceeds before Ink mounts:
 
-1. Confirm stdout is a TTY.
-2. Reject `TERM=dumb` and known non-interactive environments.
-3. Disable graphics when accessible mode is active.
-4. Detect a supported terminal protocol.
-5. Verify multiplexer passthrough when a multiplexer is present.
-6. Cache the result for the process.
+1. Confirm stdin and stdout are TTYs and the invocation is interactive.
+2. Reject `TERM=dumb`, CI/non-interactive environments, accessible/raw/JSON paths, and unverified
+   `tmux`, `screen`, or other multiplexer sessions.
+3. Send one bounded Kitty graphics query together with DA1 and cell-pixel queries. The input broker
+   waits no longer than 100 milliseconds, accepts Kitty only after query id `31` receives the
+   explicit protocol `OK`, and replays bytes that were not positively identified as replies.
+4. Select Windows Terminal Sixel only when `WT_SESSION` is non-empty, the DA1 response includes
+   parameter `4`, and a valid bounded `CSI 6;<height>;<width>t` cell-pixel response is present.
+5. Otherwise use source fallback. A trusted iTerm2 identity may enable the one-shot path, but it does
+   not enable retained TUI placements.
 
-Future Kitty support MUST be established with its graphics query and a terminal device-attributes response, not solely with environment variables. The query wait MUST be bounded to 100 milliseconds. A missing, malformed, or late response means unsupported for that process. Until that bounded query/reply broker is implemented and tested, Kitty MUST remain unsupported.
-
-iTerm2 support may use its documented terminal identity and version metadata. Inside `tmux`, `screen`, or another multiplexer, it MUST remain disabled until passthrough is explicitly recognized and covered by integration tests.
-
-The terminal input broker MUST distinguish capability replies from user keystrokes. A probe MUST NOT consume user input, insert response bytes into the prompt, or hang startup.
-
-No capability query may be emitted in Markdown, JSON, accessible, or non-TTY output.
+No capability query may be emitted in Markdown, JSON, accessible, raw, or non-TTY output. A missing,
+malformed, late, or oversized response means unsupported for that process. Bytes that are not
+positively identified as protocol replies are replayed before Ink consumes input; user keystrokes
+must not be consumed or inserted into the prompt.
 
 ## 8.2 Layout and lifecycle
 
-The terminal backend MUST:
+The retained TUI backend MUST:
 
-- constrain images to the available terminal width,
-- preserve aspect ratio,
-- reserve the correct rows and columns,
-- move the cursor according to the selected protocol,
-- clean up placements during redraw, resize, cancellation, and exit,
-- fall back to source when resize or redraw cannot remain correct,
-- avoid corrupting scrollback or the input prompt.
+- constrain images to the available terminal width and measured cell-pixel size,
+- preserve aspect ratio and reserve the correct rows and columns,
+- emit Kitty or Sixel bytes only after the corresponding Ink frame flush,
+- synchronously clear old placements before a new frame and on dispose,
+- fall back to exact source when resize, scroll, clipping, stale generation, or redraw cannot remain
+  correct,
+- serialize writes and disable graphics after a stream failure, and
+- avoid corrupting scrollback, the alternate screen, or the input prompt.
 
-Terminal resize invalidates width-dependent cache entries and layout. It does not invalidate canonical source.
+Terminal resize invalidates layout and width-dependent raster placement decisions. It does not
+invalidate canonical source or assistant/session persistence.
+
+## 8.3 Host notes
+
+Kitty output in VS Code requires a recent integrated terminal with
+[`terminal.integrated.enableImages`](https://code.visualstudio.com/docs/terminal/advanced#_image-support)
+enabled and GPU support (`terminal.integrated.gpuAcceleration` set to `on` or `auto`). The official
+[Kitty graphics protocol notes](https://code.visualstudio.com/updates/v1_110#_kitty-graphics-protocol)
+also document `terminal.integrated.windowsUseConptyDll` for Windows; the setting may be required on
+an individual installation. These notes do not promise every VS Code version or profile. Windows
+Terminal Sixel is selected only when the running terminal actually advertises support, not from a
+profile name alone. See the official [ConPTY DLL setting guidance](https://code.visualstudio.com/updates/v1_93/#_conpty-shipping-in-product)
+for the current Windows-specific setting.
 
 ---
 
@@ -497,7 +545,7 @@ The initial implementation MUST enforce all of these ceilings:
 | Raster height | 2,048 px |
 | Raster area | 8,388,608 px |
 | Encoded image/protocol payload | 8 MiB |
-| In-memory render cache | 64 MiB or 512 entries, whichever is reached first |
+| In-memory TUI formula cache | 64 MiB or 32 entries by default (bounded configuration maximum 256) |
 
 Reaching a ceiling is a typed rendering failure. With the default fallback, the expression is shown as exact source. Limits may become configurable only within conservative compiled minimum and maximum bounds; unbounded values are forbidden.
 
@@ -605,17 +653,19 @@ The renderer MUST have:
 
 Terminal tests MUST cover:
 
-- future Kitty query success, rejection, malformed reply, and timeout before Kitty support is
-  enabled,
-- iTerm2 positive and negative identification,
-- redirected stdout and stderr,
-- `TERM=dumb`, CI, SSH, `tmux`, and `screen`,
-- resize, cancellation, redraw, scrollback, and clean exit,
-- protocol byte snapshots and incomplete-write recovery,
-- user keystrokes arriving during a capability probe,
-- inline fallback when correct cell layout is impossible.
+- bounded Kitty query success only after the matching explicit `OK`, rejection, malformed reply,
+  timeout, and replay of user bytes,
+- Windows Terminal Sixel gating by `WT_SESSION`, DA1 parameter 4, and valid cell-pixel response,
+- iTerm2 positive and negative identity for the one-shot display-math path,
+- redirected stdout and stderr, `TERM=dumb`, CI, SSH, `tmux`, and `screen`,
+- resize, cancellation, redraw, scrollback, stale-generation, clipping, and clean exit,
+- protocol byte snapshots, pre-frame cleanup, outside-Ink emission ordering, and incomplete-write
+  recovery,
+- user keystrokes arriving during a capability probe, and
+- exact-source fallback when correct cell layout or frame freshness is impossible.
 
-Until Kitty or Sixel passes its equivalent suite, it MUST remain planned rather than supported.
+The retained TUI may use Kitty or Sixel only after its corresponding bounded capability and layout
+tests pass. iTerm2 remains a one-shot display-math protocol, not a retained TUI overlay protocol.
 
 ## 15.4 Output and accessibility tests
 
@@ -645,9 +695,14 @@ CLI rendering is complete for its initial release only when all of the following
 - Parser results are independent of streaming chunk boundaries.
 - Supported display math renders through the bundled MathJax-to-SVG and resvg pipeline while offline.
 - iTerm2 renders representative display equations without corrupting the prompt, cursor, resize
-  behavior, or scrollback.
-- Kitty and Sixel remain unsupported until each satisfies the corresponding protocol, capability,
-  layout, and lifecycle criteria.
+  behavior, or scrollback in one-shot `chat`.
+- The full-screen TUI renders inline (promoted to a row) and display formulas through the restricted
+  MathJax 4 → SVG → resvg 2× opaque-white PNG/RGBA path when retained Kitty or Sixel capability and
+  layout criteria pass.
+- Retained TUI graphics are emitted outside Ink after frame flush with pre-frame cleanup; scroll,
+  resize, clipping, stale generations, and failures fall back to exact source.
+- `/formula` navigates, copies canonical source through bounded OSC 52, locally edits/rerenders,
+  toggles source, and inserts edited or canonical source without mutating assistant/session source.
 - Unsupported terminals receive exact source automatically and without installation steps.
 - Redirected output contains no terminal control or graphics protocol bytes.
 - Accessible mode provides stable, linear, exact-source math output.

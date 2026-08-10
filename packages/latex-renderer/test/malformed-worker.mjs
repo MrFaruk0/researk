@@ -34,7 +34,13 @@ function validPayload(request) {
     tex: request.tex,
   };
   if (request.format !== "png") return base;
-  return { ...base, png: new Uint8Array([1, 2, 3, 4]), width: 8, height: 4 };
+  return {
+    ...base,
+    png: new Uint8Array([1, 2, 3, 4]),
+    pixels: new Uint8Array(8 * 4 * 4),
+    width: 8,
+    height: 4,
+  };
 }
 
 function malformed(request) {
@@ -113,10 +119,16 @@ function malformed(request) {
       return {
         type: "result",
         id,
-        result: { ...payload, png: new Uint8Array([1]), width: 8, height: 4 },
+        result: {
+          ...payload,
+          png: new Uint8Array([1]),
+          pixels: new Uint8Array(8 * 4 * 4),
+          width: 8,
+          height: 4,
+        },
       };
     case "png-request-without-raster": {
-      const { png: _png, width: _width, height: _height, ...rest } = payload;
+      const { png: _png, pixels: _pixels, width: _width, height: _height, ...rest } = payload;
       return { type: "result", id, result: rest };
     }
 
@@ -129,6 +141,16 @@ function malformed(request) {
     }
     case "png-empty":
       return { type: "result", id, result: { ...payload, png: new Uint8Array(0) } };
+    case "pixels-not-uint8array":
+      return { type: "result", id, result: { ...payload, pixels: [1, 2, 3, 4] } };
+    case "pixels-shared-memory": {
+      const shared = new Uint8Array(new SharedArrayBuffer(8 * 4 * 4));
+      return { type: "result", id, result: { ...payload, pixels: shared } };
+    }
+    case "pixels-empty":
+      return { type: "result", id, result: { ...payload, pixels: new Uint8Array(0) } };
+    case "pixels-wrong-length":
+      return { type: "result", id, result: { ...payload, pixels: new Uint8Array(4) } };
     case "png-too-large":
       return {
         type: "result",
@@ -160,7 +182,16 @@ function malformed(request) {
 
     // Boundary that must be accepted rather than rejected.
     case "raster-at-ceiling":
-      return { type: "result", id, result: { ...payload, width: 4096, height: 2048 } };
+      return {
+        type: "result",
+        id,
+        result: {
+          ...payload,
+          pixels: new Uint8Array(4096 * 2048 * 4),
+          width: 4096,
+          height: 2048,
+        },
+      };
 
     default:
       throw new Error(`Unknown malformed-worker mode: ${String(mode)}`);

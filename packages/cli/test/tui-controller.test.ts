@@ -5,13 +5,18 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { RunEvent } from "@researk/contracts";
 import { afterEach, describe, expect, it } from "vitest";
-import type { CliHarness } from "../src/types.js";
+import { type AppConfig, AppConfigStore, DEFAULT_APP_CONFIG } from "../src/config/config.js";
+import { FileCredentialStore } from "../src/config/credentials.js";
+import { PersistentProviderRegistry } from "../src/config/providers.js";
+import { type Session, SessionStore } from "../src/config/sessions.js";
+import { type ConfigStore, FileConfigStore } from "../src/config/store.js";
 import { composePrompt, TuiController, validateProviderEndpoint } from "../src/tui/controller.js";
 import {
   displayText,
   MAX_CHAT_MESSAGE_CHARACTERS,
   type ProviderConnection,
 } from "../src/tui/state.js";
+import type { CliHarness } from "../src/types.js";
 import { openWorkspace } from "../src/workspace.js";
 
 const cleanupPaths: string[] = [];
@@ -236,6 +241,53 @@ describe("TUI controller streaming", () => {
     expect(outcome.failed).toBe(true);
     expect(events.join("|")).toContain("[REDACTED]");
     expect(events.join("|")).not.toContain(secret);
+  });
+
+  it("flushes a safe tail before a thrown provider failure without leaking a secret prefix", async () => {
+    const secret = "synthetic-tail-secret-throw";
+    const harness: CliHarness = {
+      run(): AsyncIterable<RunEvent> {
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield event({ type: "text_delta", delta: `safe ${secret.slice(0, -1)}` }, 0);
+            throw new Error(`provider failed ${secret}`);
+          },
+        };
+      },
+      async listModels() {
+        return [];
+      },
+    };
+    const controller = await makeController(harness);
+    const { outcome, events } = await collect(controller, {
+      credentialValues: { TEST_KEY: secret },
+    });
+
+    expect(outcome.text).toBe("safe [REDACTED]");
+    expect(outcome.failed).toBe(true);
+    expect(events).toEqual(["delta:safe ", "delta:[REDACTED]", "error:provider failed [REDACTED]"]);
+    expect(events.join("|")).not.toContain(secret);
+    expect(events.join("|")).not.toContain(secret.slice(0, -1));
+  });
+
+  it("flushes a safe tail before a cancellation event without leaking a secret prefix", async () => {
+    const secret = "synthetic-tail-secret-cancel";
+    const controller = await makeController(
+      harnessOf([
+        event({ type: "text_delta", delta: `safe ${secret.slice(0, -1)}` }, 0),
+        event({ type: "cancelled" }, 1),
+      ]),
+    );
+
+    const { outcome, events } = await collect(controller, {
+      credentialValues: { TEST_KEY: secret },
+    });
+
+    expect(outcome.text).toBe("safe [REDACTED]");
+    expect(outcome.cancelled).toBe(true);
+    expect(events).toEqual(["delta:safe ", "delta:[REDACTED]", "cancelled"]);
+    expect(events.join("|")).not.toContain(secret);
+    expect(events.join("|")).not.toContain(secret.slice(0, -1));
   });
 });
 
@@ -463,6 +515,36 @@ describe("TUI controller provider configuration", () => {
   });
 });
 
+describe("TUI controller Harness credential rotation", () => {
+  it("rebuilds for a rotated effective credential and reuses an unchanged one", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "researk-tui-rotation-"));
+    cleanupPaths.push(root);
+    const workspace = await openWorkspace(root);
+    const harnesses: CliHarness[] = [];
+    const resolvedCredentials: string[] = [];
+    const controller = new TuiController({
+      dependencies: {
+        createHarness: async (_configuration, credentials) => {
+          resolvedCredentials.push(credentials.TEST_KEY ?? "");
+          const harness = harnessOf([]);
+          harnesses.push(harness);
+          return harness;
+        },
+      },
+      env: {},
+      workspace,
+    });
+
+    await controller.connect(connection, { TEST_KEY: "synthetic-key-a" });
+    await controller.connect(connection, { TEST_KEY: "synthetic-key-a" });
+    await controller.connect(connection, { TEST_KEY: "synthetic-key-b" });
+
+    expect(harnesses).toHaveLength(2);
+    expect(harnesses[0]).not.toBe(harnesses[1]);
+    expect(resolvedCredentials).toEqual(["synthetic-key-a", "synthetic-key-b"]);
+  });
+});
+
 describe("TUI controller workspace boundary", () => {
   it("stages a supported document and rejects traversal", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "researk-tui-ws-"));
@@ -535,5 +617,257 @@ describe("TUI controller live catalog", () => {
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+});
+
+describe("TUI controller persistence", () => {
+  interface StorageFixture {
+    directory: string;
+    controller: TuiController;
+    configStore: AppConfigStore;
+    sessionStore: SessionStore;
+  }
+
+  function cloneConfig(config: AppConfig): AppConfig {
+    return {
+      ...config,
+      providers: config.providers.map((provider) => ({ ...provider })),
+      defaultModelByProvider: { ...config.defaultModelByProvider },
+      selectedVariantByModel: { ...config.selectedVariantByModel },
+    };
+  }
+
+  class ControlledConfigStore implements ConfigStore<AppConfig> {
+    #config = cloneConfig(DEFAULT_APP_CONFIG);
+    #firstSave = true;
+    #releaseFirstSave!: () => void;
+    #shouldFailNextSave = false;
+    readonly firstSaveStarted: Promise<void>;
+
+    constructor() {
+      this.firstSaveStarted = new Promise<void>((resolve) => {
+        this.#releaseFirstSave = resolve;
+      });
+    }
+
+    failNextSave(): void {
+      this.#shouldFailNextSave = true;
+    }
+
+    releaseFirstSave(): void {
+      this.#releaseFirstSave();
+    }
+
+    current(): AppConfig {
+      return cloneConfig(this.#config);
+    }
+
+    async load(defaults: AppConfig): Promise<AppConfig> {
+      await Promise.resolve();
+      return cloneConfig(this.#config ?? defaults);
+    }
+
+    async save(value: AppConfig): Promise<void> {
+      if (this.#firstSave) {
+        this.#firstSave = false;
+        this.#releaseFirstSave();
+        await new Promise<void>((resolve) => {
+          this.#releaseFirstSave = resolve;
+        });
+      }
+      if (this.#shouldFailNextSave) {
+        this.#shouldFailNextSave = false;
+        throw new Error("synthetic config write failure");
+      }
+      this.#config = cloneConfig(value);
+    }
+  }
+
+  async function makeStorageController(): Promise<StorageFixture> {
+    const directory = await mkdtemp(path.join(tmpdir(), "researk-tui-store-"));
+    cleanupPaths.push(directory);
+    const workspace = await openWorkspace(directory);
+    const configStore = new AppConfigStore(new FileConfigStore(directory, "app"));
+    const credStore = new FileCredentialStore(path.join(directory, "credentials"));
+    const providerRegistry = new PersistentProviderRegistry(
+      new FileConfigStore(directory, "providers"),
+      credStore,
+    );
+    const sessionStore = new SessionStore(path.join(directory, "sessions"));
+    const controller = new TuiController({
+      dependencies: { harness: harnessOf([]) },
+      env: {},
+      workspace,
+      storage: { configStore, sessionStore, providerRegistry, credentialStore: credStore },
+    });
+    return { directory, controller, configStore, sessionStore };
+  }
+
+  it("loads persisted app config and null when nothing is saved", async () => {
+    const { controller, configStore } = await makeStorageController();
+    expect(await controller.loadConfig()).toEqual(await configStore.loadConfig());
+    await configStore.saveConfig({ ...(await configStore.loadConfig()), theme: "nord" });
+    expect((await controller.loadConfig())?.theme).toBe("nord");
+  });
+
+  it("persists connection, model, variant, theme and session id through saveConfig", async () => {
+    const { controller } = await makeStorageController();
+    await controller.saveConfig({
+      connection: {
+        providerId: "compatible",
+        baseUrl: "https://example.test/v1/",
+        apiKeyEnvironmentVariable: "TEST_KEY",
+        kind: "compatible",
+      },
+      model: "compatible:science",
+      variant: "high",
+      themeName: "dracula",
+      sessionId: "session-abc",
+    });
+    const loaded = await controller.loadConfig();
+    expect(loaded?.activeProviderId).toBe("compatible");
+    expect(loaded?.defaultModelByProvider).toEqual({ compatible: "compatible:science" });
+    expect(loaded?.selectedVariantByModel).toEqual({ "compatible:science": "high" });
+    expect(loaded?.theme).toBe("dracula");
+    expect(loaded?.lastSessionId).toBe("session-abc");
+  });
+
+  it("keeps a persisted model when saving only a theme", async () => {
+    const { controller } = await makeStorageController();
+    await controller.saveConfig({
+      connection: {
+        providerId: "compatible",
+        baseUrl: "https://example.test/v1/",
+        apiKeyEnvironmentVariable: "TEST_KEY",
+        kind: "compatible",
+      },
+      model: "compatible:science",
+    });
+    await controller.saveConfig({ themeName: "light" });
+    const loaded = await controller.loadConfig();
+    expect(loaded?.theme).toBe("light");
+    expect(loaded?.defaultModelByProvider.compatible).toBe("compatible:science");
+  });
+
+  it("serializes concurrent partial config writes and recovers after a failed write", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "researk-tui-queue-"));
+    cleanupPaths.push(directory);
+    const workspace = await openWorkspace(directory);
+    const controlled = new ControlledConfigStore();
+    const controller = new TuiController({
+      dependencies: { harness: harnessOf([]) },
+      env: {},
+      workspace,
+      storage: { configStore: new AppConfigStore(controlled) },
+    });
+
+    const connection: ProviderConnection = {
+      providerId: "compatible",
+      baseUrl: "https://example.test/v1/",
+      apiKeyEnvironmentVariable: "TEST_KEY",
+      kind: "compatible",
+    };
+    const first = controller.saveConfig({ themeName: "nord" });
+    await controlled.firstSaveStarted;
+    const second = controller.saveConfig({ sessionId: "session-queued" });
+    const third = controller.saveConfig({ connection, model: "compatible:science" });
+    controlled.releaseFirstSave();
+    await Promise.all([first, second, third]);
+
+    expect(controlled.current()).toMatchObject({
+      theme: "nord",
+      lastSessionId: "session-queued",
+      activeProviderId: "compatible",
+      defaultModelByProvider: { compatible: "compatible:science" },
+    });
+
+    controlled.failNextSave();
+    await Promise.all([
+      controller.saveConfig({ themeName: "dark" }),
+      controller.saveConfig({ sessionId: "session-after-failure" }),
+    ]);
+    expect(controlled.current().lastSessionId).toBe("session-after-failure");
+
+    await controller.saveConfig({ themeName: "light" });
+    expect(controlled.current().theme).toBe("light");
+  });
+
+  it("clears the last session id with an explicit null", async () => {
+    const { controller } = await makeStorageController();
+    await controller.saveConfig({ sessionId: "session-abc" });
+    await controller.saveConfig({ sessionId: null });
+    expect((await controller.loadConfig())?.lastSessionId).toBeNull();
+  });
+
+  it("lists, loads, saves and deletes sessions through the controller", async () => {
+    const { controller, sessionStore } = await makeStorageController();
+    const session: Session = {
+      schemaVersion: 1,
+      id: "session-1",
+      title: "Hypothesis",
+      createdAt: "2026-08-10T10:00:00.000Z",
+      updatedAt: "2026-08-10T10:00:00.000Z",
+      workspace: "/workspace",
+      providerId: "compatible",
+      modelId: "compatible:science",
+      variantId: "auto",
+      messages: [
+        { role: "user", content: "Question" },
+        { role: "assistant", content: "Answer" },
+      ],
+    };
+    await controller.saveSession(session);
+    expect((await controller.listSessions()).map((entry) => entry.id)).toEqual(["session-1"]);
+    expect(await controller.loadSession("session-1")).toEqual(session);
+    await controller.deleteSession("session-1");
+    expect(await controller.loadSession("session-1")).toBeNull();
+    expect(await sessionStore.listSessions()).toHaveLength(0);
+  });
+
+  it("titles a conversation from its first user message", () => {
+    return makeStorageController().then(async ({ controller }) => {
+      expect(controller.autoTitle([{ role: "user", content: "Refine the null hypothesis" }])).toBe(
+        "Refine the null hypothesis",
+      );
+      expect(controller.autoTitle([])).toBe("New session");
+    });
+  });
+
+  it("persists a provider profile and resolves its credential", async () => {
+    const { controller } = await makeStorageController();
+    await controller.persistProvider(
+      {
+        providerId: "compatible",
+        baseUrl: "https://example.test/v1/",
+        apiKeyEnvironmentVariable: "TEST_KEY",
+        kind: "compatible",
+      },
+      { TEST_KEY: "synthetic-secret" },
+    );
+    const profile = await controller.getProvider("compatible");
+    expect(profile?.protocol).toBe("compatible");
+    expect(profile?.baseUrl).toBe("https://example.test/v1/");
+    if (profile === undefined) throw new Error("provider profile missing");
+    expect(controller.resolveBaseUrl(profile)).toBe("https://example.test/v1/");
+    expect(await controller.resolveCredential("compatible")).toBe("synthetic-secret");
+  });
+
+  it("no-ops every storage method when no stores are injected", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "researk-tui-nostore-"));
+    cleanupPaths.push(root);
+    const workspace = await openWorkspace(root);
+    const controller = new TuiController({
+      dependencies: { harness: harnessOf([]) },
+      env: {},
+      workspace,
+    });
+    expect(await controller.loadConfig()).toBeNull();
+    await expect(controller.saveConfig({ themeName: "dark" })).resolves.toBeUndefined();
+    expect(await controller.listSessions()).toEqual([]);
+    expect(await controller.loadSession("nope")).toBeNull();
+    await expect(controller.deleteSession("nope")).resolves.toBeUndefined();
+    expect(controller.autoTitle([{ role: "user", content: "x" }])).toBe("x");
+    expect(await controller.getProvider("openrouter")).toBeUndefined();
+    expect(await controller.resolveCredential("openrouter")).toBeNull();
   });
 });

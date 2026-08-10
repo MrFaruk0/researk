@@ -9,9 +9,17 @@ export interface ContentSegment {
 
 export type ContentBlock =
   | { readonly kind: "paragraph"; readonly segments: readonly ContentSegment[] }
-  | { readonly kind: "heading"; readonly level: number; readonly text: string }
-  | { readonly kind: "list-item"; readonly marker: string; readonly text: string }
-  | { readonly kind: "quote"; readonly text: string }
+  | {
+      readonly kind: "heading";
+      readonly level: number;
+      readonly segments: readonly ContentSegment[];
+    }
+  | {
+      readonly kind: "list-item";
+      readonly marker: string;
+      readonly segments: readonly ContentSegment[];
+    }
+  | { readonly kind: "quote"; readonly segments: readonly ContentSegment[] }
   | { readonly kind: "code-block"; readonly language: string; readonly lines: readonly string[] }
   | { readonly kind: "display-math"; readonly source: string; readonly tex: string }
   | { readonly kind: "blank" };
@@ -78,30 +86,49 @@ export function classifyContent(source: string): readonly ContentBlock[] {
 function classifyLine(segments: readonly ContentSegment[]): readonly ContentBlock[] {
   const first = segments[0];
   if (first !== undefined && first.kind === "text") {
-    const heading = /^(#{1,6})\s+(.*)$/u.exec(first.text);
-    if (heading !== null && segments.length === 1) {
-      return [{ kind: "heading", level: heading[1]?.length ?? 1, text: heading[2] ?? "" }];
+    const heading = /^(#{1,6})[ \t]+/u.exec(first.text);
+    if (heading !== null) {
+      return [
+        {
+          kind: "heading",
+          level: heading[1]?.length ?? 1,
+          segments: withCitations(withoutPrefix(segments, heading[0].length)),
+        },
+      ];
     }
-    const quote = /^>\s?(.*)$/u.exec(first.text);
-    if (quote !== null && segments.length === 1) {
-      return [{ kind: "quote", text: quote[1] ?? "" }];
+    const quote = /^>[ \t]?/u.exec(first.text);
+    if (quote !== null) {
+      return [{ kind: "quote", segments: withCitations(withoutPrefix(segments, quote[0].length)) }];
     }
-    const list = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/u.exec(first.text);
+    const list = /^(\s*)([-*+]|\d+[.)])[ \t]+/u.exec(first.text);
     if (list !== null) {
-      const rest = [
-        { kind: "text" as const, text: list[3] ?? "" },
-        ...segments.slice(1),
-      ] satisfies ContentSegment[];
       return [
         {
           kind: "list-item",
           marker: `${list[1] ?? ""}${list[2] ?? "-"}`,
-          text: rest.map((segment) => segment.text).join(""),
+          segments: withCitations(withoutPrefix(segments, list[0].length)),
         },
       ];
     }
   }
   return [{ kind: "paragraph", segments: withCitations(segments) }];
+}
+
+/**
+ * Removes a Markdown structural prefix from only the first text segment. Inline code, math, and
+ * citation segments remain separate, so a heading/list/quote never loses its semantic styling.
+ */
+function withoutPrefix(
+  segments: readonly ContentSegment[],
+  prefixLength: number,
+): readonly ContentSegment[] {
+  const first = segments[0];
+  if (first === undefined || first.kind !== "text") return segments;
+  const remainder = first.text.slice(prefixLength);
+  const result: ContentSegment[] = [];
+  if (remainder.length > 0) result.push({ kind: "text", text: remainder });
+  result.push(...segments.slice(1));
+  return result;
 }
 
 /**

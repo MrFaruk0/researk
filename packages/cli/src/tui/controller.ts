@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   type ChatMessage,
   type ModelDescriptor,
@@ -8,10 +8,21 @@ import {
   splitCanonicalModelId,
 } from "@researk/contracts";
 import { parseModelIdentity } from "../args.js";
+import type { AppConfig, AppConfigStore } from "../config/config.js";
+import type { CredentialStore } from "../config/credentials.js";
+import type { PersistentProviderRegistry, ProviderProfile } from "../config/providers.js";
+import {
+  autoTitle,
+  type Session,
+  type SessionMessage,
+  type SessionMeta,
+  type SessionStore,
+} from "../config/sessions.js";
+import { createInProcessHarness } from "../run.js";
 import {
   configuredSecretValues,
-  safeErrorMessage,
   StreamingSecretRedactor,
+  safeErrorMessage,
   safeTerminalText,
 } from "../safety.js";
 import type { CliDependencies, CliHarness, ProviderConnectionKind } from "../types.js";
@@ -22,7 +33,6 @@ import {
   type Workspace,
   type WorkspaceDocument,
 } from "../workspace.js";
-import { createInProcessHarness } from "../run.js";
 import { MAX_CHAT_MESSAGE_CHARACTERS, type ProviderConnection } from "./state.js";
 
 export const OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1/";
@@ -75,6 +85,11 @@ export class TuiController {
   readonly #dependencies: CliDependencies;
   readonly #env: Readonly<Record<string, string | undefined>>;
   readonly #workspace: Workspace;
+  readonly #configStore: AppConfigStore | undefined;
+  readonly #sessionStore: SessionStore | undefined;
+  readonly #providerRegistry: PersistentProviderRegistry | undefined;
+  readonly #credentialStore: CredentialStore | undefined;
+  #configSaveQueue: Promise<void> = Promise.resolve();
   #harness: CliHarness | undefined;
   #harnessKey: string | undefined;
 
@@ -83,11 +98,21 @@ export class TuiController {
       dependencies: CliDependencies;
       env: Readonly<Record<string, string | undefined>>;
       workspace: Workspace;
+      storage?: Readonly<{
+        configStore?: AppConfigStore;
+        sessionStore?: SessionStore;
+        providerRegistry?: PersistentProviderRegistry;
+        credentialStore?: CredentialStore;
+      }>;
     }>,
   ) {
     this.#dependencies = options.dependencies;
     this.#env = options.env;
     this.#workspace = options.workspace;
+    this.#configStore = options.storage?.configStore;
+    this.#sessionStore = options.storage?.sessionStore;
+    this.#providerRegistry = options.storage?.providerRegistry;
+    this.#credentialStore = options.storage?.credentialStore;
     this.#harness = options.dependencies.harness;
     this.#harnessKey = options.dependencies.harness === undefined ? undefined : "injected";
   }
@@ -96,7 +121,161 @@ export class TuiController {
     return this.#workspace.root;
   }
 
-  /** A human description of the external endpoint, safe to display and free of credentials. */
+  // --- Persistence -------------------------------------------------------------
+  //
+  // Every method degrades to a no-op (null / empty array / void) when the matching store was not
+  // injected, so the controller stays fully usable in tests and in non-TUI contexts that never
+  // construct the storage layer. Callers must treat these as best-effort: persistence failures
+  // surface as warning notices, never as crashes.
+
+  /** Loads the persisted app configuration, or `null` when no store is injected or nothing is saved. */
+  async loadConfig(): Promise<AppConfig | null> {
+    if (this.#configStore === undefined) return null;
+    try {
+      return await this.#configStore.loadConfig();
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Builds a partial `AppConfig` from the passed state, merges it over the currently persisted
+   * config, and saves it. Undefined fields are left untouched, so callers can persist only what
+   * changed. Failures are swallowed: config writes are best-effort and must never break the TUI.
+   */
+  async saveConfig(
+    state: Readonly<{
+      connection?: ProviderConnection;
+      model?: string;
+      variant?: ReasoningIntent;
+      themeName?: string;
+      colorEnabled?: boolean;
+      sessionId?: string | null;
+    }>,
+  ): Promise<void> {
+    if (this.#configStore === undefined) return;
+    const queued = this.#configSaveQueue.then(async () => {
+      try {
+        const existing = await this.#configStore?.loadConfig();
+        if (existing === undefined) return;
+        const partial = buildAppConfigPartial(state, existing);
+        await this.#configStore?.saveConfig({ ...existing, ...partial });
+      } catch {
+        // Best-effort persistence: a failed save never interrupts the UI. Keeping this failure
+        // inside the queued operation lets later invocations continue in order.
+      }
+    });
+    this.#configSaveQueue = queued.catch(() => undefined);
+    await queued;
+  }
+
+  /** Lists persisted sessions, or an empty array when no store is injected. */
+  async listSessions(): Promise<SessionMeta[]> {
+    if (this.#sessionStore === undefined) return [];
+    try {
+      return await this.#sessionStore.listSessions();
+    } catch {
+      return [];
+    }
+  }
+
+  /** Loads one persisted session, or `null` when it does not exist / the store is absent. */
+  async loadSession(id: string): Promise<Session | null> {
+    if (this.#sessionStore === undefined) return null;
+    try {
+      return await this.#sessionStore.loadSession(id);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Persists one session, silently ignoring failures. */
+  async saveSession(session: Session): Promise<void> {
+    if (this.#sessionStore === undefined) return;
+    try {
+      await this.#sessionStore.saveSession(session);
+    } catch {
+      // Best-effort persistence: a failed save never interrupts the UI.
+    }
+  }
+
+  /** Deletes one persisted session, silently ignoring failures. */
+  async deleteSession(id: string): Promise<void> {
+    if (this.#sessionStore === undefined) return;
+    try {
+      await this.#sessionStore.deleteSession(id);
+    } catch {
+      // Best-effort persistence: a failed delete never interrupts the UI.
+    }
+  }
+
+  /**
+   * Plain-title generator for a conversation, delegating to the sessions module. Accepts the
+   * session message shape directly, so callers can title a session from the exact messages they
+   * are about to persist.
+   */
+  autoTitle(messages: readonly SessionMessage[]): string {
+    return autoTitle(messages);
+  }
+
+  /** Resolves the persisted base URL for a provider profile. */
+  resolveBaseUrl(profile: ProviderProfile): string | undefined {
+    if (this.#providerRegistry === undefined) return undefined;
+    return this.#providerRegistry.resolveBaseUrl(profile);
+  }
+
+  /** Resolves the persisted credential for a provider profile, or `null`. */
+  async resolveCredential(providerId: string): Promise<string | null> {
+    if (this.#providerRegistry === undefined) return null;
+    try {
+      return await this.#providerRegistry.resolveCredential(providerId);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Looks up a persisted provider profile, or `undefined` when it is not persisted. */
+  async getProvider(id: string): Promise<ProviderProfile | undefined> {
+    if (this.#providerRegistry === undefined) return undefined;
+    try {
+      return await this.#providerRegistry.getProvider(id);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Persists the active provider as a custom profile so a later session can restore non-secret
+   * connection metadata. Credential writes go only to the injected backend; normal TUI startup
+   * supplies a non-persistent backend, so keys remain in memory until an OS credential backend
+   * exists. The built-in OpenRouter definition is never duplicated into the custom list.
+   */
+  async persistProvider(
+    connection: ProviderConnection,
+    credentialValues: Readonly<Record<string, string>>,
+  ): Promise<void> {
+    if (this.#providerRegistry === undefined || this.#credentialStore === undefined) return;
+    try {
+      const profile: ProviderProfile = {
+        id: connection.providerId,
+        name: connection.providerId,
+        protocol: connection.kind === "openrouter" ? "openrouter" : "compatible",
+        ...(connection.kind === "openrouter" ? {} : { baseUrl: connection.baseUrl ?? "" }),
+        credentialRef: connection.apiKeyEnvironmentVariable,
+      };
+      if (connection.kind !== "openrouter") {
+        await this.#providerRegistry.addCustomProvider(profile);
+      }
+      const secret = credentialValues[connection.apiKeyEnvironmentVariable];
+      if (secret !== undefined && secret.length > 0) {
+        await this.#credentialStore.set(connection.apiKeyEnvironmentVariable, secret);
+      }
+    } catch {
+      // Best-effort persistence: a failed provider write never interrupts the UI.
+    }
+  }
+
+  /** Description of a human-readable connection endpoint, free of credentials. */
   describeConnection(connection: ProviderConnection): string {
     const profile = connection.kind === "openrouter" ? "OpenRouter" : connection.providerId;
     const raw =
@@ -217,11 +396,18 @@ export class TuiController {
     let text = "";
     let failed = false;
     let cancelled = false;
+    let redactorFinalized = false;
 
     const emitText = (value: string): void => {
       if (value.length === 0) return;
       text += value;
       options.onEvent({ type: "delta", delta: value });
+    };
+
+    const finalizeRedactor = (): void => {
+      if (redactorFinalized) return;
+      redactorFinalized = true;
+      emitText(redactFinalTail(redactor.finish(), secrets));
     };
 
     try {
@@ -300,6 +486,7 @@ export class TuiController {
             break;
           case "error":
             failed = true;
+            finalizeRedactor();
             options.onEvent({
               type: "error",
               message: safeTerminalText(event.error.message, secrets),
@@ -307,6 +494,7 @@ export class TuiController {
             break;
           case "cancelled":
             cancelled = true;
+            finalizeRedactor();
             options.onEvent({ type: "cancelled" });
             break;
           case "completed":
@@ -314,8 +502,9 @@ export class TuiController {
             break;
         }
       }
-      emitText(redactor.finish());
+      finalizeRedactor();
     } catch (error) {
+      finalizeRedactor();
       if (options.signal.aborted) {
         cancelled = true;
         options.onEvent({ type: "cancelled" });
@@ -333,11 +522,14 @@ export class TuiController {
     credentialValues: Readonly<Record<string, string>>,
   ): Promise<CliHarness> {
     if (this.#dependencies.harness !== undefined) return this.#dependencies.harness;
+    const effectiveCredential =
+      credentialValues[connection.apiKeyEnvironmentVariable] ??
+      this.#env[connection.apiKeyEnvironmentVariable];
     const key = JSON.stringify([
       connection.providerId,
       connection.baseUrl ?? "",
       connection.apiKeyEnvironmentVariable,
-      Object.keys(credentialValues).sort(),
+      credentialFingerprint(effectiveCredential),
     ]);
     if (this.#harness !== undefined && this.#harnessKey === key) return this.#harness;
     const configuration = {
@@ -354,6 +546,27 @@ export class TuiController {
     this.#harnessKey = key;
     return harness;
   }
+}
+
+/**
+ * Produces a private cache fingerprint for the credential selected by a connection. Only this
+ * one-way digest is included in the private cache key; the raw value never enters diagnostics,
+ * events, or errors. The presence marker keeps an explicitly empty credential distinct from a
+ * missing one without exposing either value.
+ */
+function credentialFingerprint(value: string | undefined): string {
+  const hash = createHash("sha256");
+  hash.update(value === undefined ? "0" : "1");
+  if (value !== undefined) hash.update(value);
+  return hash.digest("hex");
+}
+
+/** Keeps an unfinished configured-secret prefix out of canonical source at stream termination. */
+function redactFinalTail(value: string, secrets: readonly string[]): string {
+  if (value.length === 0) return "";
+  return secrets.some((secret) => secret.length > value.length && secret.startsWith(value))
+    ? "[REDACTED]"
+    : value;
 }
 
 export function validateProviderEndpoint(value: string): void {
@@ -405,4 +618,50 @@ export function composePrompt(prompt: string, documents: readonly WorkspaceDocum
     );
   }
   return result;
+}
+
+/**
+ * Builds the partial `AppConfig` fields a `saveConfig` call carries, merging over the currently
+ * persisted config so a model-only write does not wipe the persisted provider mapping.
+ *
+ * The `connection` contributes the active provider. A bare `model` is attributed to the active
+ * provider when one is known (from this write or from the persisted config), so
+ * `defaultModelByProvider` always keeps the provider key it belongs to.
+ */
+function buildAppConfigPartial(
+  state: Readonly<{
+    connection?: ProviderConnection;
+    model?: string;
+    variant?: ReasoningIntent;
+    themeName?: string;
+    colorEnabled?: boolean;
+    sessionId?: string | null;
+  }>,
+  existing: AppConfig,
+): Partial<AppConfig> {
+  const partial: Partial<AppConfig> = {};
+  const providerId = state.connection?.providerId ?? existing.activeProviderId ?? undefined;
+
+  if (state.connection !== undefined) {
+    partial.activeProviderId = state.connection.providerId;
+  }
+  if (state.model !== undefined && providerId !== undefined) {
+    partial.defaultModelByProvider = {
+      ...existing.defaultModelByProvider,
+      [providerId]: state.model,
+    };
+  }
+  if (state.variant !== undefined) {
+    const modelKey = state.model ?? providerId;
+    if (modelKey !== undefined) {
+      partial.selectedVariantByModel = {
+        ...existing.selectedVariantByModel,
+        [modelKey]: state.variant,
+      };
+    }
+  }
+  if (state.themeName !== undefined) partial.theme = state.themeName;
+  if (state.colorEnabled !== undefined) partial.colorEnabled = state.colorEnabled;
+  if (state.sessionId !== undefined) partial.lastSessionId = state.sessionId;
+  return partial;
 }

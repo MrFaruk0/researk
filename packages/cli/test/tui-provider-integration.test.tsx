@@ -46,7 +46,26 @@ afterEach(async () => {
 interface ProviderFixture {
   readonly baseUrl: string;
   readonly chatRequests: unknown[];
+  readonly catalogStarted: Promise<void>;
+  releaseCatalog(): void;
+  releaseChat(): void;
   close(): Promise<void>;
+}
+
+interface Deferred {
+  readonly promise: Promise<void>;
+  resolve(): void;
+}
+
+function deferred(): Deferred {
+  let resolvePromise: (() => void) | undefined;
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    resolve: () => resolvePromise?.(),
+  };
 }
 
 /**
@@ -54,14 +73,19 @@ interface ProviderFixture {
  * Harness, adapter, and streaming path rather than a stubbed harness.
  */
 async function startProvider(
-  options: Readonly<{ output?: string }> = {},
+  options: Readonly<{ output?: string; holdCatalog?: boolean; holdChat?: boolean }> = {},
 ): Promise<ProviderFixture> {
   const chatRequests: unknown[] = [];
   const output = options.output ?? "Hello";
+  const catalogStarted = deferred();
+  const catalogGate = options.holdCatalog === true ? deferred() : undefined;
+  const chatGate = options.holdChat === true ? deferred() : undefined;
 
   const server = createServer(async (request, response) => {
     const url = request.url ?? "";
     if (url === "/v1/models" && request.method === "GET") {
+      catalogStarted.resolve();
+      if (catalogGate !== undefined) await catalogGate.promise;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ data: [{ id: "science" }] }));
       return;
@@ -70,6 +94,7 @@ async function startProvider(
       let body = "";
       for await (const chunk of request) body += Buffer.from(chunk).toString("utf8");
       chatRequests.push(JSON.parse(body) as unknown);
+      if (chatGate !== undefined) await chatGate.promise;
       response.writeHead(200, { "content-type": "text/event-stream" });
       // Split the payload mid-token to cover chunk-boundary handling.
       const first = JSON.stringify({
@@ -100,6 +125,9 @@ async function startProvider(
   return {
     baseUrl: `http://127.0.0.1:${address.port}/v1/`,
     chatRequests,
+    catalogStarted: catalogStarted.promise,
+    releaseCatalog: () => catalogGate?.resolve(),
+    releaseChat: () => chatGate?.resolve(),
     close: async () => {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error === undefined ? resolve() : reject(error)));
@@ -113,66 +141,123 @@ async function mount(
 ) {
   const root = await mkdtemp(path.join(tmpdir(), "researk-tui-live-"));
   cleanupPaths.push(root);
-  for (const [name, content] of Object.entries(options.files ?? {})) {
-    await writeFile(path.join(root, name), content, "utf8");
-  }
-  const workspace = await openWorkspace(root);
-  // Empty dependencies force the controller to build the real in-process Harness and adapter.
-  const controller = new TuiController({
-    dependencies: {},
-    env: options.env ?? {},
-    workspace,
-  });
-  const instance = render(
-    React.createElement(App, {
-      controller,
-      initialState: createInitialState({
-        workspaceRoot: workspace.root,
-        themeName: "dark",
-        colorEnabled: false,
-        variant: "auto",
+  let instance: ReturnType<typeof render> | undefined;
+  let mounted = false;
+  try {
+    for (const [name, content] of Object.entries(options.files ?? {})) {
+      await writeFile(path.join(root, name), content, "utf8");
+    }
+    const workspace = await openWorkspace(root);
+    // Empty dependencies force the controller to build the real in-process Harness and adapter.
+    const controller = new TuiController({
+      dependencies: {},
+      env: options.env ?? {},
+      workspace,
+    });
+    instance = render(
+      React.createElement(App, {
+        controller,
+        initialState: createInitialState({
+          workspaceRoot: workspace.root,
+          themeName: "dark",
+          colorEnabled: false,
+          variant: "auto",
+        }),
+        onExit: () => undefined,
       }),
-      onExit: () => undefined,
-    }),
-  );
+    );
 
-  /**
-   * Lets Ink flush the render it scheduled for the keystroke just written. Four macrotask hops are
-   * enough for a synchronous reducer update plus its commit; anything that awaits the Harness is
-   * covered by `waitFor` instead, so this no longer has to be padded to cover network latency.
-   */
-  const settle = async (): Promise<void> => {
-    for (let index = 0; index < 4; index += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-  };
-  const type = async (value: string): Promise<void> => {
-    instance.stdin.write(value);
+    /**
+     * Lets Ink flush the render it scheduled for the keystroke just written. Four macrotask hops are
+     * enough for a synchronous reducer update plus its commit; anything that awaits the Harness is
+     * covered by `waitFor` instead, so this no longer has to be padded to cover network latency.
+     */
+    const settle = async (): Promise<void> => {
+      for (let index = 0; index < 4; index += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+    };
+    const type = async (value: string): Promise<void> => {
+      instance?.stdin.write(value);
+      await settle();
+    };
+    /**
+     * Waits for a rendered condition instead of assuming a fixed number of settle rounds is enough.
+     * Keystroke handling is synchronous in Ink, but anything that awaits the Harness - connecting,
+     * loading the catalog, streaming a response - completes on its own schedule, and a fixed sleep
+     * either wastes time or is too short on a loaded runner. Polling keeps the fast path fast and
+     * still bounds the wait, and the caller's own assertion is left untouched: on timeout this
+     * returns normally so the real `expect` reports the actual frame.
+     */
+    const waitFor = async (predicate: () => boolean, budgetMs = 10_000): Promise<void> => {
+      const deadline = Date.now() + budgetMs;
+      while (!predicate() && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 12));
+      }
+    };
     await settle();
-  };
-  /**
-   * Waits for a rendered condition instead of assuming a fixed number of settle rounds is enough.
-   * Keystroke handling is synchronous in Ink, but anything that awaits the Harness - connecting,
-   * loading the catalog, streaming a response - completes on its own schedule, and a fixed sleep
-   * either wastes time or is too short on a loaded runner. Polling keeps the fast path fast and
-   * still bounds the wait, and the caller's own assertion is left untouched: on timeout this
-   * returns normally so the real `expect` reports the actual frame.
-   */
-  const waitFor = async (predicate: () => boolean, budgetMs = 10_000): Promise<void> => {
-    const deadline = Date.now() + budgetMs;
-    while (!predicate() && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 12));
+    const mountedApp = {
+      ...instance,
+      settle,
+      type,
+      waitFor,
+      workspaceRoot: workspace.root,
+      frame: () => instance?.lastFrame() ?? "",
+    };
+    mounted = true;
+    return mountedApp;
+  } finally {
+    if (!mounted) {
+      try {
+        instance?.unmount();
+      } finally {
+        const cleanupIndex = cleanupPaths.indexOf(root);
+        if (cleanupIndex >= 0) cleanupPaths.splice(cleanupIndex, 1);
+        await rm(root, { recursive: true, force: true });
+      }
     }
-  };
-  await settle();
-  return {
-    ...instance,
-    settle,
-    type,
-    waitFor,
-    workspaceRoot: workspace.root,
-    frame: () => instance.lastFrame() ?? "",
-  };
+  }
+}
+
+const ANSI_ESCAPE_SEQUENCE = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, "gu");
+
+function visibleFrame(frame: string): string {
+  return frame.replace(ANSI_ESCAPE_SEQUENCE, "");
+}
+
+function headerLine(frame: string): string {
+  return (
+    visibleFrame(frame)
+      .split(/\r?\n/u)
+      .find((line) => line.includes("Researk")) ?? ""
+  );
+}
+
+function expectExternalDisclosure(
+  frame: string,
+  kind: "catalog" | "prompt",
+  documentCount = 0,
+): void {
+  const header = headerLine(frame);
+  expect(header).toContain(kind);
+  expect(header).toContain("compatible");
+  // Ink truncates the right side on the default test width; the protocol and loopback identity are
+  // the stable safe destination prefix, while the port is intentionally layout-dependent.
+  expect(header).toMatch(/http:\/\/127\./u);
+  if (documentCount > 0) expect(header).toContain(`+ ${documentCount} docs`);
+  expect(frame).not.toMatch(/OPENAI_API_KEY|OPENROUTER_API_KEY|test-secret/u);
+  expectNoRoutineStatusFeed(frame);
+}
+
+function expectNoRoutineStatusFeed(frame: string): void {
+  const normalized = visibleFrame(frame).replace(/[│┃║]/gu, " ");
+  expect(normalized).not.toMatch(/(?:^|\n)\s*(?:ready|streaming|info:|\[external\])(?:\s|$)/iu);
+}
+
+function expectExternalActivityGone(frame: string): void {
+  const header = headerLine(frame);
+  expect(header).not.toMatch(/\b(?:catalog|prompt)\b/iu);
+  expectNoRoutineStatusFeed(frame);
 }
 
 /** Drives the real provider overlay form for the OpenAI-compatible adapter. */
@@ -180,6 +265,7 @@ async function connect(
   app: Awaited<ReturnType<typeof mount>>,
   baseUrl: string,
   key: Readonly<{ secret?: string }> = {},
+  options: Readonly<{ catalogActivity?: ProviderFixture }> = {},
 ): Promise<void> {
   await app.type("/provider");
   await app.type(KEYS.enter);
@@ -193,58 +279,87 @@ async function connect(
     await app.type(key.secret);
   }
   await app.type(KEYS.enter);
+  if (options.catalogActivity !== undefined) {
+    await options.catalogActivity.catalogStarted;
+    await app.waitFor(() => headerLine(app.frame()).includes("catalog"));
+    expectExternalDisclosure(app.frame(), "catalog");
+    options.catalogActivity.releaseCatalog();
+  }
   // Submitting the form performs the real catalog request against the loopback server. The footer
   // is the durable signal that the connection landed: notices are capped and truncated for display,
   // so matching their text would be brittle.
-  await app.waitFor(() => /provider\s+compatible/u.test(app.frame()));
+  await app.waitFor(
+    () =>
+      /provider\s+compatible/u.test(app.frame()) &&
+      !app.frame().includes("OpenAI-compatible connection"),
+  );
 }
 
 async function selectFirstModel(app: Awaited<ReturnType<typeof mount>>): Promise<void> {
   await app.type("/model");
   await app.type(KEYS.enter);
+  await app.waitFor(() => app.frame().includes("Select a model"));
   // The overlay opens before the catalog is loaded, so wait for a selectable row to exist rather
   // than pressing Enter into an empty list.
   await app.waitFor(() => app.frame().includes("science"));
   await app.type(KEYS.enter);
   // The footer shows the selected model once the overlay has committed the choice.
   await app.waitFor(() => /model\s+compatible:science/u.test(app.frame()));
+  expect(app.frame()).toMatch(/model\s+compatible:science/u);
 }
 
 describe("TUI over the actual provider path", () => {
   it(
     "stages a workspace document and sends it as untrusted content with the prompt",
     async () => {
-      const provider = await startProvider({ output: "A safe answer" });
+      const provider = await startProvider({
+        output: "A safe answer",
+        holdCatalog: true,
+        holdChat: true,
+      });
       let app: Awaited<ReturnType<typeof mount>> | undefined;
       try {
         app = await mount({
           files: { "paper.tex": "\\section{Methods}\n$E=mc^2$" },
           env: { OPENAI_API_KEY: "test-secret" },
         });
-        await connect(app, provider.baseUrl);
+        await connect(app, provider.baseUrl, {}, { catalogActivity: provider });
         await selectFirstModel(app);
-        await app.type("/read paper.tex");
+        await app.type("/read");
         await app.type(KEYS.enter);
-        // Staging reads the file from disk, so the confirmation is awaited rather than assumed.
-        const staged = app;
-        await staged.waitFor(() => staged.frame().includes("paper.tex"));
-        expect(app.frame()).toContain("paper.tex");
+        await app.waitFor(() => app.frame().includes("Stage a workspace document"));
+        await app.type("paper.tex");
+        await app.type(KEYS.enter);
+        // Staging reads the file from disk; the prompt disclosure below proves the staged document
+        // reached the outbound request without requiring a document-name log line in the shell.
+        await app.waitFor(() => !app.frame().includes("Stage a workspace document"));
 
         await app.type("Explain the formula");
         await app.type(KEYS.enter);
         await app.waitFor(() => provider.chatRequests.length > 0);
-
         expect(provider.chatRequests).toHaveLength(1);
+        await app.waitFor(() => headerLine(app.frame()).includes("prompt"));
+        expectExternalDisclosure(app.frame(), "prompt", 1);
+
         const request = provider.chatRequests[0] as { messages: Array<{ content: string }> };
         const content = request.messages.at(-1)?.content ?? "";
         expect(content).toContain("BEGIN UNTRUSTED WORKSPACE DOCUMENT: paper.tex");
         expect(content).toContain("\\section{Methods}");
         expect(content).toContain("Explain the formula");
+        provider.releaseChat();
+        await app.waitFor(() => app.frame().includes("A safe answer"));
+        expect(app.frame()).toContain("A safe answer");
+        expectExternalActivityGone(app.frame());
       } finally {
         // Unmounting in `finally` keeps a failed assertion from leaving a live Ink instance and its
         // stdin listener attached for the remainder of the file.
-        app?.unmount();
-        await provider.close();
+        provider.releaseCatalog();
+        provider.releaseChat();
+        try {
+          app?.unmount();
+        } finally {
+          await provider.close();
+        }
       }
     },
     PROVIDER_SUITE_TIMEOUT_MS,
@@ -265,10 +380,15 @@ describe("TUI over the actual provider path", () => {
         await rendered.waitFor(() => rendered.frame().includes("Streamed provider answer"));
 
         expect(app.frame()).toContain("Streamed provider answer");
-        expect(app.frame()).toMatch(/ready/u);
+        expectExternalActivityGone(app.frame());
       } finally {
-        app?.unmount();
-        await provider.close();
+        provider.releaseCatalog();
+        provider.releaseChat();
+        try {
+          app?.unmount();
+        } finally {
+          await provider.close();
+        }
       }
     },
     PROVIDER_SUITE_TIMEOUT_MS,
@@ -297,8 +417,13 @@ describe("TUI over the actual provider path", () => {
         // The overlay shows the byte-exact canonical source, delimiters included.
         expect(app.frame()).toContain(String.raw`\[E = mc^2\]`);
       } finally {
-        app?.unmount();
-        await provider.close();
+        provider.releaseCatalog();
+        provider.releaseChat();
+        try {
+          app?.unmount();
+        } finally {
+          await provider.close();
+        }
       }
     },
     PROVIDER_SUITE_TIMEOUT_MS,
@@ -328,8 +453,13 @@ describe("TUI over the actual provider path", () => {
         // The entered credential is never written back to the environment.
         expect(process.env.OPENAI_API_KEY).toBeUndefined();
       } finally {
-        app?.unmount();
-        await provider.close();
+        provider.releaseCatalog();
+        provider.releaseChat();
+        try {
+          app?.unmount();
+        } finally {
+          await provider.close();
+        }
       }
     },
     PROVIDER_SUITE_TIMEOUT_MS,
@@ -354,8 +484,13 @@ describe("TUI over the actual provider path", () => {
         expect(app.frame()).toContain("Parent-directory traversal is not allowed");
         expect(provider.chatRequests).toHaveLength(0);
       } finally {
-        app?.unmount();
-        await provider.close();
+        provider.releaseCatalog();
+        provider.releaseChat();
+        try {
+          app?.unmount();
+        } finally {
+          await provider.close();
+        }
       }
     },
     PROVIDER_SUITE_TIMEOUT_MS,
