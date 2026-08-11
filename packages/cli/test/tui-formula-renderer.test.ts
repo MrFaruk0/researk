@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createFormulaRasterCache,
   FormulaRasterCache,
+  type FormulaRasterCacheStore,
   type FormulaRasterRenderer,
   type FormulaRasterRequest,
+  type FormulaRenderStyle,
 } from "../src/tui/formula-renderer.js";
 
 function request(tex: string, display = true): FormulaRasterRequest {
@@ -65,6 +67,83 @@ describe("FormulaRasterCache", () => {
 
     expect(renderer).toHaveBeenCalledTimes(3);
     expect(cache.getStats().entries).toBe(3);
+  });
+
+  it("includes every pixel-affecting style and renderer version in the key", async () => {
+    const renderer = vi.fn<FormulaRasterRenderer>(async () => raster());
+    const cache = new FormulaRasterCache(renderer);
+    const base = {
+      background: "#101010",
+      dpi: 144,
+      fontScale: 1.25,
+      foreground: "#f0f0f0",
+      rendererVersion: "math-pipeline-1",
+    } as const;
+
+    await cache.render({ display: true, style: base, tex: "\\frac{a}{b}" });
+    await cache.render({ display: true, style: { ...base }, tex: "\\frac{a}{b}" });
+    await cache.render({
+      display: true,
+      style: { ...base, background: "#202020" },
+      tex: "\\frac{a}{b}",
+    });
+    await cache.render({
+      display: true,
+      style: { ...base, dpi: 150 },
+      tex: "\\frac{a}{b}",
+    });
+    await cache.render({
+      display: true,
+      style: { ...base, fontScale: 1.5 },
+      tex: "\\frac{a}{b}",
+    });
+    await cache.render({
+      display: true,
+      style: { ...base, foreground: "#ffffff" },
+      tex: "\\frac{a}{b}",
+    });
+    await cache.render({
+      display: true,
+      style: { ...base, rendererVersion: "math-pipeline-2" },
+      tex: "\\frac{a}{b}",
+    });
+
+    expect(renderer).toHaveBeenCalledTimes(6);
+  });
+
+  it("rejects unknown style fields before invoking an injected renderer", async () => {
+    const renderer = vi.fn<FormulaRasterRenderer>(async () => raster());
+    const cache = new FormulaRasterCache(renderer);
+    await expect(
+      cache.render({
+        display: true,
+        style: { foreground: "#fff", unsafe: "value" } as FormulaRenderStyle,
+        tex: "x",
+      }),
+    ).resolves.toEqual({ ok: false, reason: "invalid_request" });
+    expect(renderer).not.toHaveBeenCalled();
+  });
+
+  it("loads a successful raster from an injected persistent store", async () => {
+    const stored = new Map<string, ReturnType<typeof raster>>();
+    const persistentStore: FormulaRasterCacheStore = {
+      delete: async (key) => {
+        stored.delete(key);
+      },
+      get: async (key) => stored.get(key),
+      set: async (key, value) => {
+        stored.set(key, value);
+      },
+    };
+    const firstRenderer = vi.fn<FormulaRasterRenderer>(async () => raster());
+    const first = new FormulaRasterCache(firstRenderer, { persistentStore });
+    await first.render({ display: true, tex: "x+y" });
+    expect(firstRenderer).toHaveBeenCalledTimes(1);
+
+    const secondRenderer = vi.fn<FormulaRasterRenderer>(async () => raster());
+    const second = new FormulaRasterCache(secondRenderer, { persistentStore });
+    await expect(second.render({ display: true, tex: "x+y" })).resolves.toMatchObject({ ok: true });
+    expect(secondRenderer).not.toHaveBeenCalled();
   });
 
   it("evicts least-recently-used entries by count and total PNG+RGBA bytes", async () => {

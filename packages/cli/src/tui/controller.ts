@@ -9,8 +9,13 @@ import {
 } from "@researk/contracts";
 import { parseModelIdentity } from "../args.js";
 import type { AppConfig, AppConfigStore } from "../config/config.js";
-import type { CredentialStore } from "../config/credentials.js";
-import type { PersistentProviderRegistry, ProviderProfile } from "../config/providers.js";
+import { type CredentialStore, CredentialStoreUnavailableError } from "../config/credentials.js";
+import {
+  type PersistentProviderRegistry,
+  type ProviderProfile,
+  providerCredentialEnvironmentRef,
+  providerCredentialStoreRef,
+} from "../config/providers.js";
 import {
   autoTitle,
   type Session,
@@ -21,6 +26,7 @@ import {
 import { createInProcessHarness } from "../run.js";
 import {
   configuredSecretValues,
+  redactSecrets,
   StreamingSecretRedactor,
   safeErrorMessage,
   safeTerminalText,
@@ -75,6 +81,36 @@ export interface ChatOutcome {
   readonly text: string;
   readonly failed: boolean;
   readonly cancelled: boolean;
+}
+
+/** Result of saving a provider profile and its credential without exposing the credential value. */
+export interface ProviderPersistenceResult {
+  readonly ok: boolean;
+  readonly message?: string;
+}
+
+/** Result of a session write. Callers must not advance the config pointer when `ok` is false. */
+export interface SessionPersistenceResult {
+  readonly ok: boolean;
+  readonly message?: string;
+}
+
+/** Result of a queued config write; backend details are intentionally never exposed to callers. */
+export interface ConfigPersistenceResult {
+  readonly ok: boolean;
+  readonly message?: string;
+}
+
+/**
+ * A provider profile resolved for live use. The credential map is intentionally ephemeral: it is
+ * suitable for Harness construction, but it is never part of a session, config object, or event.
+ */
+export interface ResolvedProvider {
+  readonly profile: ProviderProfile;
+  readonly connection: ProviderConnection;
+  readonly credentialValues: Readonly<Record<string, string>>;
+  /** False means the profile exists, but neither secure storage nor its explicit env fallback had a value. */
+  readonly credentialAvailable: boolean;
 }
 
 /**
@@ -141,7 +177,7 @@ export class TuiController {
   /**
    * Builds a partial `AppConfig` from the passed state, merges it over the currently persisted
    * config, and saves it. Undefined fields are left untouched, so callers can persist only what
-   * changed. Failures are swallowed: config writes are best-effort and must never break the TUI.
+   * changed. The queue remains best-effort, but callers receive a safe success/failure result.
    */
   async saveConfig(
     state: Readonly<{
@@ -152,28 +188,47 @@ export class TuiController {
       colorEnabled?: boolean;
       sessionId?: string | null;
     }>,
-  ): Promise<void> {
-    if (this.#configStore === undefined) return;
-    const queued = this.#configSaveQueue.then(async () => {
+  ): Promise<ConfigPersistenceResult> {
+    if (this.#configStore === undefined) {
+      return { ok: false, message: "Configuration persistence is unavailable." };
+    }
+    const queued = this.#configSaveQueue.then(async (): Promise<ConfigPersistenceResult> => {
       try {
         const existing = await this.#configStore?.loadConfig();
-        if (existing === undefined) return;
+        if (existing === undefined) {
+          return { ok: false, message: "Configuration persistence is unavailable." };
+        }
         const partial = buildAppConfigPartial(state, existing);
         await this.#configStore?.saveConfig({ ...existing, ...partial });
+        return { ok: true };
       } catch {
         // Best-effort persistence: a failed save never interrupts the UI. Keeping this failure
-        // inside the queued operation lets later invocations continue in order.
+        // inside the queued operation lets later invocations continue in order, while the caller
+        // receives only a generic result rather than backend paths or secret-bearing errors.
+        return { ok: false, message: "Could not save configuration." };
       }
     });
-    this.#configSaveQueue = queued.catch(() => undefined);
-    await queued;
+    this.#configSaveQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued.catch(() => ({ ok: false, message: "Could not save configuration." }));
   }
 
   /** Lists persisted sessions, or an empty array when no store is injected. */
   async listSessions(): Promise<SessionMeta[]> {
     if (this.#sessionStore === undefined) return [];
     try {
-      return await this.#sessionStore.listSessions();
+      const sessions = await this.#sessionStore.listSessions();
+      // Titles are derived from untrusted transcript text. Resolve only the provider-scoped
+      // credential needed for each title and redact it before the session browser can render it.
+      return await Promise.all(
+        sessions.map(async (session) => {
+          const secrets = await this.#sessionSecrets(session.providerId);
+          if (secrets.length === 0) return session;
+          return { ...session, title: redactSecrets(session.title, secrets) };
+        }),
+      );
     } catch {
       return [];
     }
@@ -183,19 +238,33 @@ export class TuiController {
   async loadSession(id: string): Promise<Session | null> {
     if (this.#sessionStore === undefined) return null;
     try {
-      return await this.#sessionStore.loadSession(id);
+      const session = await this.#sessionStore.loadSession(id);
+      if (session === null) return null;
+      const secrets = await this.#sessionSecrets(session.providerId);
+      if (secrets.length === 0) return session;
+      return {
+        ...session,
+        title: redactSecrets(session.title, secrets),
+        messages: session.messages.map((message) => ({
+          ...message,
+          content: redactSecrets(message.content, secrets),
+        })),
+      };
     } catch {
       return null;
     }
   }
 
-  /** Persists one session, silently ignoring failures. */
-  async saveSession(session: Session): Promise<void> {
-    if (this.#sessionStore === undefined) return;
+  /** Persists one session and reports failure without exposing filesystem or secret details. */
+  async saveSession(session: Session): Promise<SessionPersistenceResult> {
+    if (this.#sessionStore === undefined) {
+      return { ok: false, message: "Session persistence is unavailable." };
+    }
     try {
       await this.#sessionStore.saveSession(session);
+      return { ok: true };
     } catch {
-      // Best-effort persistence: a failed save never interrupts the UI.
+      return { ok: false, message: "Could not save the session." };
     }
   }
 
@@ -228,10 +297,59 @@ export class TuiController {
   async resolveCredential(providerId: string): Promise<string | null> {
     if (this.#providerRegistry === undefined) return null;
     try {
-      return await this.#providerRegistry.resolveCredential(providerId);
+      return await this.#providerRegistry.resolveCredential(providerId, this.#env);
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Resolves one persisted profile into the connection identity and an ephemeral credential map.
+   * This performs no provider network request; callers can load a transcript without fetching a
+   * catalog. Invalid or missing profiles return `null`, while a profile with no available
+   * credential is returned with `credentialAvailable: false` so the UI can explain the next step.
+   */
+  async resolveProvider(providerId: string): Promise<ResolvedProvider | null> {
+    if (this.#providerRegistry === undefined || !ProviderIdSchema.safeParse(providerId).success) {
+      return null;
+    }
+    const profile = await this.getProvider(providerId);
+    if (profile === undefined || !isSafeProviderProfile(profile)) return null;
+
+    const baseUrl = this.#providerRegistry.resolveBaseUrl(profile);
+    if (profile.protocol === "compatible" && baseUrl === undefined) return null;
+    if (baseUrl !== undefined) {
+      try {
+        validateProviderEndpoint(baseUrl);
+      } catch {
+        return null;
+      }
+    }
+    const kind: ProviderConnectionKind =
+      profile.protocol === "openrouter" ? "openrouter" : "compatible";
+    const environmentVariable = providerCredentialEnvironmentRef(profile);
+    const connection: ProviderConnection = {
+      providerId: profile.id,
+      ...(baseUrl === undefined ? {} : { baseUrl }),
+      apiKeyEnvironmentVariable: environmentVariable,
+      kind,
+    };
+    const secret = await this.resolveCredential(profile.id);
+    const credentialValues: Record<string, string> = {};
+    if (secret !== null) credentialValues[environmentVariable] = secret;
+    return {
+      profile,
+      connection,
+      credentialValues,
+      credentialAvailable: secret !== null,
+    };
+  }
+
+  /** Resolves only the provider-scoped secret needed to redact a persisted transcript. */
+  async #sessionSecrets(providerId: string | null): Promise<readonly string[]> {
+    if (providerId === null || !ProviderIdSchema.safeParse(providerId).success) return [];
+    const resolved = await this.resolveProvider(providerId);
+    return resolved === null ? [] : this.secretsFor(resolved.connection, resolved.credentialValues);
   }
 
   /** Looks up a persisted provider profile, or `undefined` when it is not persisted. */
@@ -246,32 +364,91 @@ export class TuiController {
 
   /**
    * Persists the active provider as a custom profile so a later session can restore non-secret
-   * connection metadata. Credential writes go only to the injected backend; normal TUI startup
-   * supplies a non-persistent backend, so keys remain in memory until an OS credential backend
-   * exists. The built-in OpenRouter definition is never duplicated into the custom list.
+   * connection metadata. Credentials use a stable provider-scoped secure reference and are never
+   * copied into the provider config. The built-in OpenRouter definition is never duplicated into
+   * the custom list.
    */
   async persistProvider(
     connection: ProviderConnection,
     credentialValues: Readonly<Record<string, string>>,
-  ): Promise<void> {
-    if (this.#providerRegistry === undefined || this.#credentialStore === undefined) return;
+  ): Promise<ProviderPersistenceResult> {
+    if (this.#providerRegistry === undefined || this.#credentialStore === undefined) {
+      return {
+        ok: false,
+        message: "Provider persistence is unavailable; the credential remains session-only.",
+      };
+    }
+    const secret = credentialValues[connection.apiKeyEnvironmentVariable];
+    if (secret === undefined || secret.length === 0) {
+      // A connection restored from an environment variable has no secret to persist. Keep the
+      // profile metadata, but report the fact so the UI can explain why a restart may need env.
+      try {
+        if (connection.kind !== "openrouter") {
+          await this.#providerRegistry.addCustomProvider({
+            id: connection.providerId,
+            name: connection.providerId,
+            protocol: "compatible",
+            baseUrl: connection.baseUrl ?? "",
+            credentialRef: providerCredentialStoreRef(connection.providerId),
+            credentialEnvironmentVariable: connection.apiKeyEnvironmentVariable,
+          });
+        }
+        return {
+          ok: false,
+          message: "No interactive credential was supplied; provider metadata was saved only.",
+        };
+      } catch {
+        return { ok: false, message: "Provider metadata could not be saved." };
+      }
+    }
+
+    const secureRef = providerCredentialStoreRef(connection.providerId);
+    let previousSecret: string | null;
+    try {
+      const stored = await this.#credentialStore.get(secureRef);
+      previousSecret = stored === null || stored.length === 0 ? null : stored;
+    } catch (error) {
+      if (error instanceof CredentialStoreUnavailableError) {
+        return { ok: false, message: error.message };
+      }
+      return { ok: false, message: "Provider credential could not be persisted." };
+    }
+    let credentialWritten = false;
     try {
       const profile: ProviderProfile = {
         id: connection.providerId,
         name: connection.providerId,
         protocol: connection.kind === "openrouter" ? "openrouter" : "compatible",
         ...(connection.kind === "openrouter" ? {} : { baseUrl: connection.baseUrl ?? "" }),
-        credentialRef: connection.apiKeyEnvironmentVariable,
+        credentialRef: secureRef,
+        credentialEnvironmentVariable: connection.apiKeyEnvironmentVariable,
       };
+      // Write the key before the profile so an unavailable backend cannot leave a profile that
+      // falsely implies a persisted credential. Any profile-write failure removes the orphaned
+      // secure entry best-effort.
+      await this.#credentialStore.set(secureRef, secret);
+      credentialWritten = true;
       if (connection.kind !== "openrouter") {
         await this.#providerRegistry.addCustomProvider(profile);
       }
-      const secret = credentialValues[connection.apiKeyEnvironmentVariable];
-      if (secret !== undefined && secret.length > 0) {
-        await this.#credentialStore.set(connection.apiKeyEnvironmentVariable, secret);
+      return { ok: true };
+    } catch (error) {
+      if (credentialWritten) {
+        // A profile write can fail after the secure entry has been replaced. Restore the prior
+        // value when one existed; only remove the entry when this was a first-time write. Neither
+        // rollback path includes a credential in its result or error handling.
+        try {
+          if (previousSecret === null) await this.#credentialStore.delete(secureRef);
+          else await this.#credentialStore.set(secureRef, previousSecret);
+        } catch {
+          // Rollback failures are deliberately normalized below. The caller must never receive
+          // backend details or either credential value.
+        }
       }
-    } catch {
-      // Best-effort persistence: a failed provider write never interrupts the UI.
+      if (error instanceof CredentialStoreUnavailableError) {
+        return { ok: false, message: error.message };
+      }
+      return { ok: false, message: "Provider credential could not be persisted." };
     }
   }
 
@@ -321,7 +498,10 @@ export class TuiController {
         kind: "openrouter",
       };
     }
-    const reference = "OPENAI_API_KEY";
+    const reference = input.apiKeyEnvironmentVariable.trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(reference)) {
+      throw new Error("Credential environment variable names must use shell-safe identifiers.");
+    }
     const providerId = ProviderIdSchema.parse(input.providerId.trim());
     if (providerId === "openrouter") {
       throw new Error("Use the OpenRouter profile for the openrouter provider identity.");
@@ -559,6 +739,32 @@ function credentialFingerprint(value: string | undefined): string {
   hash.update(value === undefined ? "0" : "1");
   if (value !== undefined) hash.update(value);
   return hash.digest("hex");
+}
+
+/** Validates provider metadata loaded from disk before it can become live TUI state. */
+function isSafeProviderProfile(value: ProviderProfile): boolean {
+  if (
+    typeof value.id !== "string" ||
+    !ProviderIdSchema.safeParse(value.id).success ||
+    typeof value.name !== "string" ||
+    (value.protocol !== "openrouter" && value.protocol !== "compatible") ||
+    typeof value.credentialRef !== "string"
+  ) {
+    return false;
+  }
+  if (value.protocol === "openrouter" && value.id !== "openrouter") return false;
+  if (value.protocol === "compatible" && typeof value.baseUrl !== "string") return false;
+  const environmentVariable = providerCredentialEnvironmentRef(value);
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(environmentVariable)) return false;
+  if (value.credentialEnvironmentVariable !== undefined) {
+    if (
+      typeof value.credentialEnvironmentVariable !== "string" ||
+      !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(value.credentialEnvironmentVariable)
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Keeps an unfinished configured-secret prefix out of canonical source at stream termination. */

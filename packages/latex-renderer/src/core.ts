@@ -8,6 +8,7 @@ import { TeX } from "@mathjax/src/js/input/tex.js";
 import "@mathjax/src/js/input/tex/ams/AmsConfiguration.js";
 import { mathjax } from "@mathjax/src/js/mathjax.js";
 import { SVG } from "@mathjax/src/js/output/svg.js";
+import { type LatexRenderStyle, normalizeLatexRenderStyle } from "./style.js";
 
 const maximumInputBytes = 16 * 1024;
 const maximumOutputBytes = 1024 * 1024;
@@ -21,6 +22,7 @@ const safeAttributeNames = new Set([
   "aria-hidden",
   "aria-label",
   "class",
+  "color",
   "data-c",
   "data-latex",
   "data-mml-node",
@@ -71,6 +73,8 @@ export class LatexSvgRenderError extends Error {
 
 export interface LatexSvgRenderRequest {
   readonly display?: boolean;
+  /** Optional pixel-affecting style. Omission preserves the legacy SVG/raster defaults. */
+  readonly style?: LatexRenderStyle;
   readonly tex: string;
 }
 
@@ -145,6 +149,14 @@ export function renderTexToValidatedSvgInWorker(request: LatexSvgRenderRequest):
   const display = request.display ?? true;
 
   try {
+    let style: ReturnType<typeof normalizeLatexRenderStyle>;
+    try {
+      style = normalizeLatexRenderStyle(request.style);
+    } catch (error) {
+      throw new LatexSvgRenderError("invalid_input", "LaTeX render style is invalid.", {
+        cause: error,
+      });
+    }
     const activeRenderer = getRenderer();
     const node = activeRenderer.document.convert(request.tex, { display });
     const svgNode = activeRenderer.adaptor.tags(node, "svg")[0];
@@ -155,12 +167,14 @@ export function renderTexToValidatedSvgInWorker(request: LatexSvgRenderRequest):
 
     const serialized = activeRenderer.adaptor.serializeXML(svgNode);
     const validated = validateSvg(serialized);
+    const styledSvg =
+      style === undefined ? validated.svg : applySvgForeground(validated.svg, style.foreground);
 
     return {
       result: {
         display,
         renderer: "mathjax-4.1.3",
-        svg: validated.svg,
+        svg: styledSvg,
         tex: request.tex,
       },
       structure: validated.structure,
@@ -174,6 +188,23 @@ export function renderTexToValidatedSvgInWorker(request: LatexSvgRenderRequest):
       cause: error,
     });
   }
+}
+
+/**
+ * MathJax's path groups use `currentColor`. A validated root `color` presentation attribute applies
+ * the caller's semantic foreground without rewriting glyph paths or embedding theme decisions in
+ * this package. The color grammar in `style.ts` excludes quotes and control bytes, but the root is
+ * still checked structurally before this attribute is inserted.
+ */
+function applySvgForeground(svg: string, foreground: string): string {
+  const openingEnd = svg.indexOf(">");
+  if (openingEnd < 0 || !svg.startsWith("<svg")) {
+    throw new LatexSvgRenderError("unsafe_svg", "Rendered SVG has an invalid root element.");
+  }
+
+  const opening = svg.slice(0, openingEnd);
+  const withoutColor = opening.replace(/\scolor="[^"]*"/u, "");
+  return `${withoutColor} color="${foreground}"${svg.slice(openingEnd)}`;
 }
 
 function getRenderer(): Renderer {

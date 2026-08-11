@@ -1,16 +1,31 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  CanonicalModelIdSchema,
+  ModelIdSchema,
+  ProviderIdSchema,
+  ReasoningIntentSchema,
+} from "@researk/contracts";
 import { dataDirs } from "./paths.js";
 
 export const SESSION_SCHEMA_VERSION = 1;
 export const AUTO_TITLE_MAX_CHARACTERS = 80;
 
+/** Defensive limits for untrusted session files. These bounds apply before records enter TUI state. */
+export const MAX_SESSION_FILE_BYTES = 32 * 1024 * 1024;
+export const MAX_SESSION_MESSAGES = 100;
+export const MAX_SESSION_ID_CHARACTERS = 128;
+export const MAX_SESSION_TITLE_CHARACTERS = 256;
+export const MAX_SESSION_WORKSPACE_CHARACTERS = 4_096;
+export const MAX_SESSION_METADATA_CHARACTERS = 512;
+export const MAX_SESSION_MESSAGE_CHARACTERS = 16 * 1024 * 1024;
+
 /** Queues writes/deletes by their final session path while leaving unrelated sessions independent. */
 const writeQueues = new Map<string, Promise<void>>();
 
 export interface SessionMessage {
-  readonly role: string;
+  readonly role: "user" | "assistant" | "tool" | "system";
   readonly content: string;
 }
 
@@ -77,10 +92,12 @@ export class SessionStore {
   }
 
   async loadSession(id: string): Promise<Session | null> {
+    if (!isBoundedMetadataString(id, MAX_SESSION_ID_CHARACTERS, false)) return null;
     return this.#readSession(sessionFileName(id));
   }
 
   async saveSession(session: Session): Promise<void> {
+    if (!isSession(session)) throw new Error("Invalid session record.");
     const fileName = sessionFileName(session.id);
     const filePath = path.join(this.#directory, fileName);
     return enqueueWrite(filePath, () => writeSessionAtomically(filePath, session));
@@ -107,6 +124,13 @@ export class SessionStore {
   }
 
   async #readSession(fileName: string): Promise<Session | null> {
+    try {
+      const details = await stat(path.join(this.#directory, fileName));
+      if (!details.isFile() || details.size > MAX_SESSION_FILE_BYTES) return null;
+    } catch (error) {
+      if (isNodeError(error) && (error.code === "ENOENT" || error.code === "EACCES")) return null;
+      throw error;
+    }
     let raw: string;
     try {
       raw = await readFile(path.join(this.#directory, fileName), "utf8");
@@ -116,6 +140,7 @@ export class SessionStore {
       }
       throw error;
     }
+    if (Buffer.byteLength(raw, "utf8") > MAX_SESSION_FILE_BYTES) return null;
     try {
       const parsed: unknown = JSON.parse(raw);
       return isSession(parsed) ? parsed : null;
@@ -184,15 +209,114 @@ function toMeta(session: Session): SessionMeta {
 function isSession(value: unknown): value is Session {
   if (value === null || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
-  return (
-    typeof candidate.schemaVersion === "number" &&
-    typeof candidate.id === "string" &&
-    typeof candidate.title === "string" &&
-    typeof candidate.createdAt === "string" &&
-    typeof candidate.updatedAt === "string" &&
-    typeof candidate.workspace === "string" &&
+  const allowedFields = new Set([
+    "schemaVersion",
+    "id",
+    "title",
+    "createdAt",
+    "updatedAt",
+    "workspace",
+    "providerId",
+    "modelId",
+    "variantId",
+    "messages",
+  ]);
+  if (Object.keys(candidate).some((key) => !allowedFields.has(key))) return false;
+  if (
+    candidate.schemaVersion === SESSION_SCHEMA_VERSION &&
+    isBoundedMetadataString(candidate.id, MAX_SESSION_ID_CHARACTERS, false) &&
+    isBoundedMetadataString(candidate.title, MAX_SESSION_TITLE_CHARACTERS, true) &&
+    isIsoTimestamp(candidate.createdAt) &&
+    isIsoTimestamp(candidate.updatedAt) &&
+    isBoundedMetadataString(candidate.workspace, MAX_SESSION_WORKSPACE_CHARACTERS, false) &&
     Array.isArray(candidate.messages)
+  ) {
+    if (candidate.messages.length > MAX_SESSION_MESSAGES) return false;
+    const providerId = nullableString(candidate.providerId);
+    const modelId = nullableString(candidate.modelId);
+    const variantId = nullableString(candidate.variantId);
+    if (providerId === undefined || modelId === undefined || variantId === undefined) return false;
+    if (
+      providerId !== null &&
+      (!isBoundedMetadataString(providerId, MAX_SESSION_METADATA_CHARACTERS, false) ||
+        !ProviderIdSchema.safeParse(providerId).success)
+    ) {
+      return false;
+    }
+    if (modelId !== null) {
+      if (!isBoundedMetadataString(modelId, MAX_SESSION_METADATA_CHARACTERS, false)) return false;
+      const parsedModel = CanonicalModelIdSchema.safeParse(modelId);
+      // Provider/model consistency is checked at restoration time. Keep legacy provider-qualified
+      // model ids readable here so their transcript can be inspected and repaired safely.
+      if (!parsedModel.success && !ModelIdSchema.safeParse(modelId).success) {
+        return false;
+      }
+    }
+    if (
+      variantId !== null &&
+      (!isBoundedMetadataString(variantId, MAX_SESSION_METADATA_CHARACTERS, false) ||
+        !ReasoningIntentSchema.safeParse(variantId).success)
+    ) {
+      return false;
+    }
+    if (
+      !candidate.messages.every(
+        (message) =>
+          message !== null &&
+          typeof message === "object" &&
+          isExactMessage(message as Record<string, unknown>),
+      )
+    ) {
+      return false;
+    }
+    // Older session files predate the explicit identity fields. Normalize absent values to null so
+    // untrusted `undefined` metadata never enters the TUI state or gets re-serialized as a secret.
+    Object.assign(candidate, { providerId, modelId, variantId });
+    return true;
+  }
+  return false;
+}
+
+function nullableString(value: unknown): string | null | undefined {
+  if (value === undefined) return null;
+  return value === null || typeof value === "string" ? value : undefined;
+}
+
+function isSessionRole(value: unknown): value is SessionMessage["role"] {
+  return value === "user" || value === "assistant" || value === "tool" || value === "system";
+}
+
+function isExactMessage(value: Record<string, unknown>): boolean {
+  return (
+    Object.keys(value).every((key) => key === "role" || key === "content") &&
+    isSessionRole(value.role) &&
+    typeof value.content === "string" &&
+    Buffer.byteLength(value.content, "utf8") <= MAX_SESSION_MESSAGE_CHARACTERS
   );
+}
+
+function isBoundedMetadataString(
+  value: unknown,
+  maximumCharacters: number,
+  allowEmpty: boolean,
+): value is string {
+  if (typeof value !== "string") return false;
+  if (!allowEmpty && value.length === 0) return false;
+  return value.length <= maximumCharacters && !containsUnsafeMetadataControls(value);
+}
+
+function containsUnsafeMetadataControls(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true;
+  }
+  return false;
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  if (!isBoundedMetadataString(value, 64, false)) return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
 }
 
 function defaultSessionsDirectory(): string {

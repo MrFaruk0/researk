@@ -107,7 +107,11 @@ export interface StatusNotice {
   readonly createdAt: number;
 }
 
-/** Provider configuration form fields. The API key is held only in memory and never persisted. */
+/**
+ * Provider configuration form fields. The API key is an ephemeral input; after a successful live
+ * connection the controller may persist it through the OS credential store, never in this form,
+ * session metadata, or ordinary provider configuration.
+ */
 export interface ProviderFormState {
   readonly kind: ProviderConnectionKind;
   readonly providerId: string;
@@ -202,6 +206,7 @@ export function createInitialState(
     sessionTitle?: string;
     sessionUpdatedAt?: string;
     conversation?: readonly ConversationEntry[];
+    notices?: readonly StatusNotice[];
   }>,
 ): AppState {
   const conversation = options.conversation ?? [];
@@ -227,7 +232,7 @@ export function createInitialState(
     overlay: { kind: "none" },
     composer: { value: "", cursor: 0, history: [], draft: "" },
     runStatus: "idle",
-    notices: [],
+    notices: options.notices ?? [],
     stagedDocuments: [],
     scrollOffset: 0,
     scrollMax: 0,

@@ -4,10 +4,10 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { RunEvent } from "@researk/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AppConfig, AppConfigStore, DEFAULT_APP_CONFIG } from "../src/config/config.js";
-import { FileCredentialStore } from "../src/config/credentials.js";
-import { PersistentProviderRegistry } from "../src/config/providers.js";
+import { type CredentialStore, FileCredentialStore } from "../src/config/credentials.js";
+import { PersistentProviderRegistry, providerCredentialStoreRef } from "../src/config/providers.js";
 import { type Session, SessionStore } from "../src/config/sessions.js";
 import { type ConfigStore, FileConfigStore } from "../src/config/store.js";
 import { composePrompt, TuiController, validateProviderEndpoint } from "../src/tui/controller.js";
@@ -626,6 +626,8 @@ describe("TUI controller persistence", () => {
     controller: TuiController;
     configStore: AppConfigStore;
     sessionStore: SessionStore;
+    credentialStore: FileCredentialStore;
+    providerRegistry: PersistentProviderRegistry;
   }
 
   function cloneConfig(config: AppConfig): AppConfig {
@@ -683,7 +685,9 @@ describe("TUI controller persistence", () => {
     }
   }
 
-  async function makeStorageController(): Promise<StorageFixture> {
+  async function makeStorageController(
+    environment: Readonly<Record<string, string | undefined>> = {},
+  ): Promise<StorageFixture> {
     const directory = await mkdtemp(path.join(tmpdir(), "researk-tui-store-"));
     cleanupPaths.push(directory);
     const workspace = await openWorkspace(directory);
@@ -692,15 +696,23 @@ describe("TUI controller persistence", () => {
     const providerRegistry = new PersistentProviderRegistry(
       new FileConfigStore(directory, "providers"),
       credStore,
+      environment,
     );
     const sessionStore = new SessionStore(path.join(directory, "sessions"));
     const controller = new TuiController({
       dependencies: { harness: harnessOf([]) },
-      env: {},
+      env: environment,
       workspace,
       storage: { configStore, sessionStore, providerRegistry, credentialStore: credStore },
     });
-    return { directory, controller, configStore, sessionStore };
+    return {
+      directory,
+      controller,
+      configStore,
+      sessionStore,
+      credentialStore: credStore,
+      providerRegistry,
+    };
   }
 
   it("loads persisted app config and null when nothing is saved", async () => {
@@ -782,10 +794,12 @@ describe("TUI controller persistence", () => {
     });
 
     controlled.failNextSave();
-    await Promise.all([
+    const [failed, recovered] = await Promise.all([
       controller.saveConfig({ themeName: "dark" }),
       controller.saveConfig({ sessionId: "session-after-failure" }),
     ]);
+    expect(failed).toEqual({ ok: false, message: "Could not save configuration." });
+    expect(recovered).toEqual({ ok: true });
     expect(controlled.current().lastSessionId).toBe("session-after-failure");
 
     await controller.saveConfig({ themeName: "light" });
@@ -816,7 +830,7 @@ describe("TUI controller persistence", () => {
         { role: "assistant", content: "Answer" },
       ],
     };
-    await controller.saveSession(session);
+    await expect(controller.saveSession(session)).resolves.toEqual({ ok: true });
     expect((await controller.listSessions()).map((entry) => entry.id)).toEqual(["session-1"]);
     expect(await controller.loadSession("session-1")).toEqual(session);
     await controller.deleteSession("session-1");
@@ -835,7 +849,7 @@ describe("TUI controller persistence", () => {
 
   it("persists a provider profile and resolves its credential", async () => {
     const { controller } = await makeStorageController();
-    await controller.persistProvider(
+    const result = await controller.persistProvider(
       {
         providerId: "compatible",
         baseUrl: "https://example.test/v1/",
@@ -844,12 +858,221 @@ describe("TUI controller persistence", () => {
       },
       { TEST_KEY: "synthetic-secret" },
     );
+    expect(result).toEqual({ ok: true });
     const profile = await controller.getProvider("compatible");
     expect(profile?.protocol).toBe("compatible");
     expect(profile?.baseUrl).toBe("https://example.test/v1/");
+    expect(profile?.credentialRef).toBe(providerCredentialStoreRef("compatible"));
+    expect(profile?.credentialEnvironmentVariable).toBe("TEST_KEY");
     if (profile === undefined) throw new Error("provider profile missing");
     expect(controller.resolveBaseUrl(profile)).toBe("https://example.test/v1/");
     expect(await controller.resolveCredential("compatible")).toBe("synthetic-secret");
+  });
+
+  it("resolves a saved provider into an ephemeral credential map before the environment fallback", async () => {
+    const { controller } = await makeStorageController({ TEST_KEY: "environment-secret" });
+    const result = await controller.persistProvider(
+      {
+        providerId: "compatible",
+        baseUrl: "https://example.test/v1/",
+        apiKeyEnvironmentVariable: "TEST_KEY",
+        kind: "compatible",
+      },
+      { TEST_KEY: "persisted-secret" },
+    );
+    expect(result.ok).toBe(true);
+
+    const resolved = await controller.resolveProvider("compatible");
+    expect(resolved?.connection).toMatchObject({
+      providerId: "compatible",
+      baseUrl: "https://example.test/v1/",
+      apiKeyEnvironmentVariable: "TEST_KEY",
+    });
+    expect(resolved?.credentialValues).toEqual({ TEST_KEY: "persisted-secret" });
+    expect(resolved?.credentialAvailable).toBe(true);
+  });
+
+  it("restores an existing provider credential when profile persistence fails", async () => {
+    const { controller, credentialStore, providerRegistry } = await makeStorageController();
+    const connection: ProviderConnection = {
+      providerId: "rollback-existing",
+      baseUrl: "https://example.test/v1/",
+      apiKeyEnvironmentVariable: "TEST_KEY",
+      kind: "compatible",
+    };
+    const oldSecret = "synthetic-old-provider-secret";
+    const newSecret = "synthetic-new-provider-secret";
+    await expect(controller.persistProvider(connection, { TEST_KEY: oldSecret })).resolves.toEqual({
+      ok: true,
+    });
+    const profileWrite = vi
+      .spyOn(providerRegistry, "addCustomProvider")
+      .mockRejectedValue(new Error("profile backend failed"));
+    try {
+      const result = await controller.persistProvider(connection, { TEST_KEY: newSecret });
+      expect(result).toEqual({ ok: false, message: "Provider credential could not be persisted." });
+      expect(await credentialStore.get(providerCredentialStoreRef(connection.providerId))).toBe(
+        oldSecret,
+      );
+      expect(result.message).not.toContain(oldSecret);
+      expect(result.message).not.toContain(newSecret);
+    } finally {
+      profileWrite.mockRestore();
+    }
+  });
+
+  it("removes a first-time provider credential when profile persistence fails", async () => {
+    const { controller, credentialStore, providerRegistry } = await makeStorageController();
+    const connection: ProviderConnection = {
+      providerId: "rollback-first-write",
+      baseUrl: "https://example.test/v1/",
+      apiKeyEnvironmentVariable: "TEST_KEY",
+      kind: "compatible",
+    };
+    const secret = "synthetic-first-write-secret";
+    const profileWrite = vi
+      .spyOn(providerRegistry, "addCustomProvider")
+      .mockRejectedValue(new Error("profile backend failed"));
+    try {
+      const result = await controller.persistProvider(connection, { TEST_KEY: secret });
+      expect(result).toEqual({ ok: false, message: "Provider credential could not be persisted." });
+      expect(
+        await credentialStore.get(providerCredentialStoreRef(connection.providerId)),
+      ).toBeNull();
+      expect(result.message).not.toContain(secret);
+    } finally {
+      profileWrite.mockRestore();
+    }
+  });
+
+  it("normalizes a provider credential rollback failure without exposing either secret", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "researk-tui-credential-rollback-failure-"));
+    cleanupPaths.push(root);
+    const workspace = await openWorkspace(root);
+    let setCalls = 0;
+    const oldSecret = "synthetic-rollback-old-secret";
+    const newSecret = "synthetic-rollback-new-secret";
+    const credentials: CredentialStore = {
+      async get(): Promise<string | null> {
+        return oldSecret;
+      },
+      async set(_ref: string, secret: string): Promise<void> {
+        setCalls += 1;
+        if (setCalls > 1) throw new Error(`rollback backend failed for ${secret}`);
+      },
+      async delete(): Promise<void> {},
+    };
+    const providerRegistry = new PersistentProviderRegistry(
+      new FileConfigStore(root, "providers"),
+      credentials,
+    );
+    const controller = new TuiController({
+      dependencies: { harness: harnessOf([]) },
+      env: {},
+      workspace,
+      storage: { providerRegistry, credentialStore: credentials },
+    });
+    const profileWrite = vi
+      .spyOn(providerRegistry, "addCustomProvider")
+      .mockRejectedValue(new Error("profile backend failed"));
+    try {
+      const result = await controller.persistProvider(
+        {
+          providerId: "rollback-normalized",
+          baseUrl: "https://example.test/v1/",
+          apiKeyEnvironmentVariable: "TEST_KEY",
+          kind: "compatible",
+        },
+        { TEST_KEY: newSecret },
+      );
+      expect(result).toEqual({ ok: false, message: "Provider credential could not be persisted." });
+      expect(result.message).not.toContain(oldSecret);
+      expect(result.message).not.toContain(newSecret);
+    } finally {
+      profileWrite.mockRestore();
+    }
+  });
+
+  it("redacts a resolved provider credential before returning a persisted transcript", async () => {
+    const { controller, sessionStore } = await makeStorageController();
+    const secret = "synthetic-session-credential";
+    await controller.persistProvider(
+      {
+        providerId: "compatible",
+        baseUrl: "https://example.test/v1/",
+        apiKeyEnvironmentVariable: "TEST_KEY",
+        kind: "compatible",
+      },
+      { TEST_KEY: secret },
+    );
+    await sessionStore.saveSession({
+      schemaVersion: 1,
+      id: "session-secret",
+      title: `Question ${secret}`,
+      createdAt: "2026-08-10T10:00:00.000Z",
+      updatedAt: "2026-08-10T10:00:00.000Z",
+      workspace: controller.workspaceRoot,
+      providerId: "compatible",
+      modelId: "compatible:science",
+      variantId: "auto",
+      messages: [
+        { role: "user", content: `Question ${secret}` },
+        { role: "assistant", content: String.raw`\\section{Results} ordinary` },
+      ],
+    });
+
+    const loaded = await controller.loadSession("session-secret");
+    expect(loaded?.title).toBe("Question [REDACTED]");
+    expect(loaded?.messages[0]?.content).toBe("Question [REDACTED]");
+    expect(loaded?.messages[1]?.content).toBe(String.raw`\\section{Results} ordinary`);
+    expect(JSON.stringify(loaded)).not.toContain(secret);
+  });
+
+  it("returns a safe failure when secure credential persistence is unavailable", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "researk-tui-credential-failure-"));
+    cleanupPaths.push(root);
+    const workspace = await openWorkspace(root);
+    const configStore = new AppConfigStore(new FileConfigStore(root, "app"));
+    const sessionStore = new SessionStore(path.join(root, "sessions"));
+    const failingCredentials = {
+      async get(): Promise<string | null> {
+        return null;
+      },
+      async set(_ref: string, secret: string): Promise<void> {
+        throw new Error(`native backend failed for ${secret}`);
+      },
+      async delete(): Promise<void> {},
+    };
+    const providerRegistry = new PersistentProviderRegistry(
+      new FileConfigStore(root, "providers"),
+      failingCredentials,
+    );
+    const controller = new TuiController({
+      dependencies: { harness: harnessOf([]) },
+      env: {},
+      workspace,
+      storage: {
+        configStore,
+        sessionStore,
+        providerRegistry,
+        credentialStore: failingCredentials,
+      },
+    });
+
+    const secret = "synthetic-failure-secret";
+    const result = await controller.persistProvider(
+      {
+        providerId: "failure-provider",
+        baseUrl: "https://example.test/v1/",
+        apiKeyEnvironmentVariable: "OPENAI_API_KEY",
+        kind: "compatible",
+      },
+      { OPENAI_API_KEY: secret },
+    );
+    expect(result.ok).toBe(false);
+    expect(result.message).not.toContain(secret);
+    expect(result.message).toMatch(/could not be persisted|unavailable/u);
+    expect(providerCredentialStoreRef("failure-provider")).not.toContain(secret);
   });
 
   it("no-ops every storage method when no stores are injected", async () => {
@@ -862,7 +1085,10 @@ describe("TUI controller persistence", () => {
       workspace,
     });
     expect(await controller.loadConfig()).toBeNull();
-    await expect(controller.saveConfig({ themeName: "dark" })).resolves.toBeUndefined();
+    await expect(controller.saveConfig({ themeName: "dark" })).resolves.toEqual({
+      ok: false,
+      message: "Configuration persistence is unavailable.",
+    });
     expect(await controller.listSessions()).toEqual([]);
     expect(await controller.loadSession("nope")).toBeNull();
     await expect(controller.deleteSession("nope")).resolves.toBeUndefined();

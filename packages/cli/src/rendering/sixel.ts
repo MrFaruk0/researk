@@ -11,9 +11,23 @@ export const MAX_SIXEL_ENCODED_BYTES = 1024 * 1024;
 const RGBA_CHANNELS = 4;
 const SIXEL_DATA_OFFSET = 0x3f;
 const SIXEL_BAND_HEIGHT = 6;
-const GRAYSCALE_LEVELS = Object.freeze([0, 14, 29, 43, 57, 71, 86, 100] as const);
+const MAX_SIXEL_COLORS = 16;
+const HISTOGRAM_BITS = 5;
+const HISTOGRAM_SIDE = 1 << HISTOGRAM_BITS;
+const HISTOGRAM_SIZE = HISTOGRAM_SIDE * HISTOGRAM_SIDE * HISTOGRAM_SIDE;
+// This sentinel is never a valid palette index (the palette is bounded to 16 colors). Keeping it
+// in the band buffer lets P2=1 leave fully transparent source pixels untouched instead of drawing
+// a background plane over the entire raster.
+const TRANSPARENT_PIXEL = 0xff;
+interface RgbColor {
+  readonly red: number;
+  readonly green: number;
+  readonly blue: number;
+}
 
 export interface SixelImage {
+  /** Resolved terminal background used to composite source alpha before quantization. */
+  readonly background?: string;
   readonly pixels: Uint8Array;
   readonly width: number;
   readonly height: number;
@@ -24,6 +38,7 @@ export type SixelFailureReason =
   | "invalid-dimensions"
   | "pixels-length"
   | "area-limit"
+  | "no-visible-pixels"
   | "output-limit";
 
 export interface SixelEncodeSuccess {
@@ -51,8 +66,10 @@ export interface ImageCellSize {
  *
  * This function is deliberately a pure formatter. It does not inspect the environment, write to
  * a stream, decode a PNG, or interpolate caller-controlled text. DCS P2=1 leaves zero-valued
- * sixels untouched, so each source pixel is assigned to exactly one palette plane (white included)
- * rather than relying on terminal background clearing.
+ * sixels untouched. Fully transparent source pixels therefore remain unset; non-transparent pixels
+ * are assigned to exactly one bounded palette plane rather than relying on terminal background
+ * clearing. When no terminal background is known, source RGB values are retained without an
+ * invented white/dark canvas.
  */
 export function encodeSixel(input: SixelImage): SixelEncodeResult;
 export function encodeSixel(pixels: Uint8Array, width: number, height: number): SixelEncodeResult;
@@ -82,14 +99,18 @@ export function encodeSixel(
     return true;
   };
 
+  const background = resolveBackground(input.background);
+  const palette = buildPalette(input.pixels, input.width, input.height, background);
+  if (palette.length === 0) return { ok: false, reason: "no-visible-pixels" };
+
   // P1=0 selects the standard sixel mode; P2=1 keeps unset sixels transparent. Raster attributes
   // provide fixed 1:1 pixels and the bounded image dimensions. All values are local integers.
   if (!append(`\u001bP0;1q"1;1;${input.width};${input.height}`)) {
     return { ok: false, reason: "output-limit" };
   }
-  for (let palette = 0; palette < GRAYSCALE_LEVELS.length; palette += 1) {
-    const level = GRAYSCALE_LEVELS[palette];
-    if (!append(`#${palette};2;${level};${level};${level}`)) {
+  for (let index = 0; index < palette.length; index += 1) {
+    const color = palette[index];
+    if (color === undefined || !append(paletteDefinition(index, color))) {
       return { ok: false, reason: "output-limit" };
     }
   }
@@ -99,14 +120,14 @@ export function encodeSixel(
   for (let band = 0; band < bandCount; band += 1) {
     const firstRow = band * SIXEL_BAND_HEIGHT;
     const rows = Math.min(SIXEL_BAND_HEIGHT, input.height - firstRow);
-    fillBandPixels(bandPixels, input.pixels, input.width, firstRow, rows);
+    fillBandPixels(bandPixels, input.pixels, input.width, firstRow, rows, palette, background);
 
-    for (let palette = 0; palette < GRAYSCALE_LEVELS.length; palette += 1) {
-      if (!append(`#${palette}`)) return { ok: false, reason: "output-limit" };
-      if (!appendPlane(append, bandPixels, input.width, rows, palette)) {
+    for (let index = 0; index < palette.length; index += 1) {
+      if (!append(`#${index}`)) return { ok: false, reason: "output-limit" };
+      if (!appendPlane(append, bandPixels, input.width, rows, index)) {
         return { ok: false, reason: "output-limit" };
       }
-      if (palette + 1 < GRAYSCALE_LEVELS.length && !append("$")) {
+      if (index + 1 < palette.length && !append("$")) {
         return { ok: false, reason: "output-limit" };
       }
     }
@@ -161,12 +182,14 @@ function normalizeInput(
   }
   if (inputOrPixels === null || typeof inputOrPixels !== "object") return undefined;
   const candidate = inputOrPixels as {
+    readonly background?: unknown;
     readonly pixels?: unknown;
     readonly width?: unknown;
     readonly height?: unknown;
   };
   if (!(candidate.pixels instanceof Uint8Array)) return undefined;
   return {
+    ...(typeof candidate.background === "string" ? { background: candidate.background } : {}),
     pixels: candidate.pixels,
     width: candidate.width as number,
     height: candidate.height as number,
@@ -194,6 +217,8 @@ function fillBandPixels(
   width: number,
   firstRow: number,
   rows: number,
+  palette: readonly RgbColor[],
+  background: RgbColor | undefined,
 ): void {
   for (let row = 0; row < rows; row += 1) {
     const sourceRow = firstRow + row;
@@ -201,28 +226,205 @@ function fillBandPixels(
     const bandOffset = row * width;
     for (let column = 0; column < width; column += 1) {
       const pixelOffset = sourceOffset + column * RGBA_CHANNELS;
-      bandPixels[bandOffset + column] = grayscalePaletteIndex(
+      const color = compositePixel(
         pixels[pixelOffset] ?? 0,
         pixels[pixelOffset + 1] ?? 0,
         pixels[pixelOffset + 2] ?? 0,
         pixels[pixelOffset + 3] ?? 0,
+        background,
       );
+      bandPixels[bandOffset + column] =
+        color === undefined ? TRANSPARENT_PIXEL : nearestPaletteIndex(color, palette);
     }
   }
   // The final band can be shorter than six rows. Clear the unused rows so they cannot contribute
   // stale bits if this reusable band buffer is read by a caller-modified implementation later.
   for (let row = rows; row < SIXEL_BAND_HEIGHT; row += 1) {
-    bandPixels.fill(0, row * width, (row + 1) * width);
+    bandPixels.fill(TRANSPARENT_PIXEL, row * width, (row + 1) * width);
   }
 }
 
-function grayscalePaletteIndex(red: number, green: number, blue: number, alpha: number): number {
-  // ITU-R BT.601 luma is deterministic and keeps colored input useful while the output palette is
-  // strictly grayscale. Composite over white before quantizing to the nearest of eight levels.
-  const luma = Math.round((299 * red + 587 * green + 114 * blue) / 1000);
-  const composited = Math.round((luma * alpha + 255 * (255 - alpha)) / 255);
-  return Math.max(0, Math.min(GRAYSCALE_LEVELS.length - 1, Math.round((composited * 7) / 255)));
+function buildPalette(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  background: RgbColor | undefined,
+): readonly RgbColor[] {
+  // A 5-bit/channel histogram is a fixed ~128 KiB structure even for the largest accepted raster.
+  // It gives small formulas a faithful foreground color without retaining unbounded source data.
+  const histogram = new Uint32Array(HISTOGRAM_SIZE);
+  for (let row = 0; row < height; row += 1) {
+    const sourceOffset = row * width * RGBA_CHANNELS;
+    for (let column = 0; column < width; column += 1) {
+      const pixelOffset = sourceOffset + column * RGBA_CHANNELS;
+      const color = compositePixel(
+        pixels[pixelOffset] ?? 0,
+        pixels[pixelOffset + 1] ?? 0,
+        pixels[pixelOffset + 2] ?? 0,
+        pixels[pixelOffset + 3] ?? 0,
+        background,
+      );
+      if (color === undefined) continue;
+      const bin = colorBin(color);
+      histogram[bin] = (histogram[bin] ?? 0) + 1;
+    }
+  }
+
+  const candidates: Array<{ readonly bin: number; readonly count: number }> = [];
+  for (let bin = 0; bin < histogram.length; bin += 1) {
+    const count = histogram[bin] ?? 0;
+    if (count > 0) candidates.push({ bin, count });
+  }
+  candidates.sort((left, right) => right.count - left.count || left.bin - right.bin);
+
+  const palette: RgbColor[] = background === undefined ? [] : [background];
+  for (const candidate of candidates) {
+    if (palette.length >= MAX_SIXEL_COLORS) break;
+    const color = colorFromBin(candidate.bin);
+    if (palette.some((selected) => colorDistanceSquared(selected, color) < 18 * 18)) continue;
+    palette.push(color);
+  }
+  // If every source pixel is the resolved background, a one-color plane is enough and keeps the
+  // protocol compact. Otherwise include the strongest source color even when it is close to the
+  // background; anti-aliased light glyphs should not disappear into a light surface.
+  if (background !== undefined && palette.length === 1 && candidates.length > 0) {
+    const strongest = colorFromBin(candidates[0]?.bin ?? 0);
+    if (colorDistanceSquared(strongest, background) > 0) palette.push(strongest);
+  }
+  return palette;
 }
+
+function compositePixel(
+  red: number,
+  green: number,
+  blue: number,
+  alpha: number,
+  background: RgbColor | undefined,
+): RgbColor | undefined {
+  const boundedAlpha = Math.max(0, Math.min(255, alpha));
+  if (boundedAlpha === 0) return undefined;
+  // A system terminal does not expose its background reliably. Preserve source RGB for every
+  // visible pixel rather than compositing against a guessed dark/white surface. This is bounded
+  // and hue-preserving; P2=1 still keeps zero-alpha padding transparent.
+  if (background === undefined) return { blue, green, red };
+  const inverseAlpha = 255 - boundedAlpha;
+  return {
+    blue: Math.round((blue * boundedAlpha + background.blue * inverseAlpha) / 255),
+    green: Math.round((green * boundedAlpha + background.green * inverseAlpha) / 255),
+    red: Math.round((red * boundedAlpha + background.red * inverseAlpha) / 255),
+  };
+}
+
+function nearestPaletteIndex(color: RgbColor, palette: readonly RgbColor[]): number {
+  let bestIndex = 0;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 0; index < palette.length; index += 1) {
+    const candidate = palette[index];
+    if (candidate === undefined) continue;
+    const distance = colorDistanceSquared(color, candidate);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
+function colorDistanceSquared(left: RgbColor, right: RgbColor): number {
+  const red = left.red - right.red;
+  const green = left.green - right.green;
+  const blue = left.blue - right.blue;
+  return red * red + green * green + blue * blue;
+}
+
+function colorBin(color: RgbColor): number {
+  return ((color.red >> 3) << 10) | ((color.green >> 3) << 5) | (color.blue >> 3);
+}
+
+function colorFromBin(bin: number): RgbColor {
+  return {
+    blue: ((bin & 0x1f) << 3) | 4,
+    green: (((bin >> 5) & 0x1f) << 3) | 4,
+    red: (((bin >> 10) & 0x1f) << 3) | 4,
+  };
+}
+
+function paletteDefinition(index: number, color: RgbColor): string {
+  return `#${index};2;${Math.round((color.red * 100) / 255)};${Math.round(
+    (color.green * 100) / 255,
+  )};${Math.round((color.blue * 100) / 255)}`;
+}
+
+function resolveBackground(value: string | undefined): RgbColor | undefined {
+  if (value === undefined) return undefined;
+  return parseBackgroundColor(value);
+}
+
+function parseBackgroundColor(value: string): RgbColor | undefined {
+  const hexadecimal = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/iu.exec(value);
+  if (hexadecimal?.[1] !== undefined) {
+    const digits = hexadecimal[1];
+    const expanded =
+      digits.length === 3 || digits.length === 4
+        ? [...digits].map((digit) => digit + digit).join("")
+        : digits;
+    const red = Number.parseInt(expanded.slice(0, 2), 16);
+    const green = Number.parseInt(expanded.slice(2, 4), 16);
+    const blue = Number.parseInt(expanded.slice(4, 6), 16);
+    const alpha = expanded.length === 8 ? Number.parseInt(expanded.slice(6, 8), 16) : 255;
+    if (alpha !== 255) return undefined;
+    return { blue, green, red };
+  }
+
+  const rgb = /^rgba?\(([^)]+)\)$/iu.exec(value);
+  if (rgb?.[1] !== undefined) {
+    const channels = rgb[1].split(",").map((channel) => channel.trim());
+    if (channels.length !== 3 && channels.length !== 4) return undefined;
+    const parsed = channels.slice(0, 3).map(parseColorChannel);
+    if (parsed.some((channel) => channel === undefined)) return undefined;
+    const alpha = channels[3] === undefined ? 255 : parseAlpha(channels[3]);
+    if (alpha === undefined) return undefined;
+    if (alpha !== 255) return undefined;
+    return { blue: parsed[2] ?? 0, green: parsed[1] ?? 0, red: parsed[0] ?? 0 };
+  }
+
+  const named = value.toLowerCase();
+  return Object.hasOwn(NAMED_BACKGROUND_COLORS, named) ? NAMED_BACKGROUND_COLORS[named] : undefined;
+}
+
+function parseColorChannel(value: string): number | undefined {
+  if (value.endsWith("%")) {
+    const percent = Number.parseFloat(value.slice(0, -1));
+    return Number.isFinite(percent) && percent >= 0 && percent <= 100
+      ? Math.round((percent * 255) / 100)
+      : undefined;
+  }
+  const channel = Number(value);
+  return Number.isInteger(channel) && channel >= 0 && channel <= 255 ? channel : undefined;
+}
+
+function parseAlpha(value: string): number | undefined {
+  if (value.endsWith("%")) {
+    const percent = Number.parseFloat(value.slice(0, -1));
+    return Number.isFinite(percent) && percent >= 0 && percent <= 100
+      ? Math.round((percent * 255) / 100)
+      : undefined;
+  }
+  const alpha = Number(value);
+  return Number.isFinite(alpha) && alpha >= 0 && alpha <= 1 ? Math.round(alpha * 255) : undefined;
+}
+
+const NAMED_BACKGROUND_COLORS: Readonly<Record<string, RgbColor>> = Object.freeze({
+  black: { red: 0, green: 0, blue: 0 },
+  blue: { red: 0, green: 0, blue: 255 },
+  cyan: { red: 0, green: 255, blue: 255 },
+  gray: { red: 128, green: 128, blue: 128 },
+  green: { red: 0, green: 128, blue: 0 },
+  magenta: { red: 255, green: 0, blue: 255 },
+  red: { red: 255, green: 0, blue: 0 },
+  white: { red: 255, green: 255, blue: 255 },
+  yellow: { red: 255, green: 255, blue: 0 },
+});
 
 function appendPlane(
   append: (value: string) => boolean,

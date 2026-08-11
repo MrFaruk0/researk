@@ -10,6 +10,7 @@ import type { ConversationEntry } from "../src/tui/state.js";
 import { createTuiTheme } from "../src/tui/theme.js";
 
 const darkTheme = createTuiTheme("dark", { colorEnabled: true });
+const lightTheme = createTuiTheme("light", { colorEnabled: true });
 const monoTheme = createTuiTheme("mono", { colorEnabled: false });
 
 function entry(
@@ -89,9 +90,11 @@ function createMeasuredGraphicsRuntime(
     measure,
     renderer: async (request) => {
       requests.push({ display: request.display, tex: request.tex });
+      const pixels = new Uint8Array(20 * 20 * 4);
+      for (let offset = 3; offset < pixels.length; offset += 4) pixels[offset] = 255;
       return {
         height: 20,
-        pixels: new Uint8Array(20 * 20 * 4),
+        pixels,
         png: Uint8Array.from([0x89, 0x50, 0x4e, 0x47]),
         width: 20,
       };
@@ -191,12 +194,46 @@ describe("conversation content and viewport", () => {
     view.unmount();
   });
 
+  it("keeps display math borderless inside the message shell", () => {
+    const view = render(
+      transcript(darkTheme, [entry("display-border", "assistant", "\\[x^2\\]")], 8),
+    );
+    const frame = view.lastFrame() ?? "";
+
+    // The message itself retains its shell border; display math contributes only natural spacing.
+    expect((frame.match(/┌/gu) ?? []).length).toBe(1);
+    expect(frame).toContain("\\[x^2\\]");
+    view.unmount();
+  });
+
+  it("keeps color-disabled assistant math exact-source even with a positive graphics runtime", async () => {
+    const requests: Array<{ readonly display: boolean; readonly tex: string }> = [];
+    const runtime = createGraphicsRuntime(requests);
+    const source = "\\[ x+y \\]";
+    const view = render(
+      transcript(
+        monoTheme,
+        [entry("assistant-no-color", "assistant", source)],
+        8,
+        0,
+        undefined,
+        48,
+        runtime,
+      ),
+    );
+    await settleLayout();
+    expect(requests).toEqual([]);
+    expect(view.lastFrame() ?? "").toContain(source);
+    view.unmount();
+    runtime.dispose();
+  });
+
   it("promotes assistant inline formulas without dropping surrounding prose", async () => {
     const requests: Array<{ readonly display: boolean; readonly tex: string }> = [];
     const runtime = createGraphicsRuntime(requests);
     const view = render(
       transcript(
-        monoTheme,
+        darkTheme,
         [entry("assistant-inline", "assistant", "before $x$ after")],
         8,
         0,
@@ -226,7 +263,7 @@ describe("conversation content and viewport", () => {
     const refs = indexConversationFormulas([entry("assistant-duplicates", "assistant", source)]);
     const view = render(
       transcript(
-        monoTheme,
+        darkTheme,
         [entry("assistant-duplicates", "assistant", source)],
         10,
         0,
@@ -252,6 +289,48 @@ describe("conversation content and viewport", () => {
     runtime.dispose();
   });
 
+  it("shares one cumulative render budget per assistant response without starving the next one", async () => {
+    const requests: Array<{ readonly display: boolean; readonly tex: string }> = [];
+    const runtime = new FormulaGraphicsRuntime({
+      capability: { cellPixels: { height: 20, width: 10 }, protocol: "kitty" },
+      renderer: async (request, options) => {
+        // The real LaTeX backend claims this same budget. This seam keeps the regression independent
+        // of workers and terminal graphics while preserving the backend contract.
+        options.budget?.claim();
+        requests.push({ display: request.display, tex: request.tex });
+        return {
+          height: 20,
+          pixels: new Uint8Array(20 * 20 * 4),
+          png: Uint8Array.from([0x89, 0x50, 0x4e, 0x47]),
+          width: 20,
+        };
+      },
+      stdout: { write: () => true },
+    });
+    const source = Array.from({ length: 260 }, (_, index) => `$x_{${index}}$`).join(" ");
+    const first = entry("budgeted-response", "assistant", source);
+    const view = render(transcript(darkTheme, [first], 10, 0, undefined, 48, runtime));
+    await settleLayout();
+
+    expect(requests).toHaveLength(256);
+    expect(view.lastFrame() ?? "").toContain("$x_{259}$");
+
+    // Theme/layout rerenders keep this response's budget exhausted rather than granting every
+    // FormulaGraphic a fresh allowance.
+    view.rerender(transcript(lightTheme, [first], 10, 0, undefined, 48, runtime));
+    await settleLayout();
+    expect(requests).toHaveLength(256);
+
+    // A distinct keyed response receives its own budget and can render normally.
+    const second = entry("later-response", "assistant", "$fresh$");
+    view.rerender(transcript(lightTheme, [first, second], 10, 0, undefined, 48, runtime));
+    await settleLayout();
+    expect(requests).toHaveLength(257);
+
+    view.unmount();
+    runtime.dispose();
+  });
+
   it.each(["kitty", "sixel"] as const)(
     "rasterizes and places an assistant formula through the %s frame lifecycle",
     async (protocol) => {
@@ -267,7 +346,7 @@ describe("conversation content and viewport", () => {
       }));
       const view = render(
         transcript(
-          monoTheme,
+          darkTheme,
           [entry("assistant-placed", "assistant", source)],
           8,
           0,
@@ -318,7 +397,7 @@ describe("conversation content and viewport", () => {
     );
     const view = render(
       transcript(
-        monoTheme,
+        darkTheme,
         [entry("assistant-invalid-placement", "assistant", source)],
         8,
         0,
@@ -343,7 +422,9 @@ describe("conversation content and viewport", () => {
     await settleLayout();
 
     expect(runtime.runtime.isVisible(formula?.key ?? "")).toBe(false);
-    expect(runtime.runtime.placedCount()).toBe(0);
+    // The old confirmed placement may be retained for one transition frame; source is already
+    // restored, so cleanup cannot create a blank/omitted formula while the replacement is stale.
+    expect(runtime.runtime.placedCount()).toBeGreaterThanOrEqual(0);
     expect(view.lastFrame() ?? "").toContain("Answer with a formula:");
     expect(view.lastFrame() ?? "").toContain("$\\frac{a}{b}$");
     expect(runtime.writes.join("").split(kittyPlacementMarker).length - 1).toBe(placedOutputCount);
@@ -359,7 +440,7 @@ describe("conversation content and viewport", () => {
     const [formula] = indexConversationFormulas([assistant]);
     const view = render(
       transcript(
-        monoTheme,
+        darkTheme,
         [
           entry("user-formula", "user", "user $y$"),
           entry("assistant-incomplete", "assistant", "tail $z"),

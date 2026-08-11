@@ -8,6 +8,8 @@
  * request actually in flight is a protocol failure, not a render failure.
  */
 
+import { isLatexRenderStyle, type LatexRenderStyle } from "./style.js";
+
 /** Request identifiers are a bounded, wrapping counter so an id is always an exact small integer. */
 export const maximumRequestId = 2 ** 32;
 
@@ -33,6 +35,10 @@ export const maximumRgbaBytes = maximumRasterArea * 4;
 
 export const rendererIdentity = "mathjax-4.1.3";
 
+/** Stable identity for cache keys. It includes both the MathJax source and raster backend versions. */
+export const rendererVersion = "mathjax-4.1.3-resvg-2.6.2";
+export const latexRendererVersion = rendererVersion;
+
 /**
  * The only error codes a worker may report. `worker_failed`, `timeout`, `cancelled`, and the budget
  * codes are pool-authored and are never accepted from a worker.
@@ -55,6 +61,7 @@ export interface WorkerRenderRequest {
   readonly tex: string;
   readonly display: boolean;
   readonly format: WorkerRenderFormat;
+  readonly style?: LatexRenderStyle;
 }
 
 export interface WorkerReadyMessage {
@@ -99,6 +106,14 @@ export interface ExpectedResponse {
 }
 
 const readyKeys: ReadonlySet<string> = new Set(["type"]);
+const requestKeys: ReadonlySet<string> = new Set([
+  "id",
+  "type",
+  "tex",
+  "display",
+  "format",
+  "style",
+]);
 const resultKeys: ReadonlySet<string> = new Set(["type", "id", "result"]);
 const errorKeys: ReadonlySet<string> = new Set(["type", "id", "code", "message"]);
 const svgPayloadKeys: ReadonlySet<string> = new Set(["display", "renderer", "svg", "tex"]);
@@ -218,11 +233,20 @@ export function parseWorkerResponse(
 
 export function isWorkerRenderRequest(value: unknown): value is WorkerRenderRequest {
   if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  const hasStyle = Object.hasOwn(value, "style");
+  if (
+    keys.length !== (hasStyle ? requestKeys.size : requestKeys.size - 1) ||
+    !keys.every((key) => requestKeys.has(key))
+  ) {
+    return false;
+  }
   return (
     value.type === "render" &&
     isBoundedRequestId(value.id) &&
-    typeof value.tex === "string" &&
+    isBoundedString(value.tex, maximumTexLength) &&
     typeof value.display === "boolean" &&
-    (value.format === "svg" || value.format === "png")
+    (value.format === "svg" || value.format === "png") &&
+    (!hasStyle || isLatexRenderStyle(value.style))
   );
 }

@@ -1,6 +1,11 @@
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { parseArguments } from "../src/args.js";
+import { DEFAULT_APP_CONFIG } from "../src/config/config.js";
+import type { ProviderConfigFile } from "../src/config/providers.js";
+import { PersistentProviderRegistry } from "../src/config/providers.js";
+import type { Session } from "../src/config/sessions.js";
+import type { ConfigStore } from "../src/config/store.js";
 import {
   createNonPersistentCredentialStore,
   isFormulaGraphicsProbeEligible,
@@ -8,6 +13,7 @@ import {
   isSessionInWorkspace,
   replayTerminalInput,
   resolveStartupColorEnabled,
+  restoreState,
 } from "../src/tui.js";
 import type { CliIo } from "../src/types.js";
 
@@ -52,6 +58,48 @@ describe("TUI startup policy", () => {
     const credentials = createNonPersistentCredentialStore();
     await credentials.set("OPENROUTER_API_KEY", "synthetic-secret");
     await expect(credentials.get("OPENROUTER_API_KEY")).resolves.toBeNull();
+  });
+
+  it("does not qualify a provider-less session model under startup's global provider", async () => {
+    let stored: ProviderConfigFile = { schemaVersion: 1, providers: [] };
+    const providerConfig: ConfigStore<ProviderConfigFile> = {
+      async load(defaults) {
+        return { ...defaults, ...stored, providers: [...stored.providers] };
+      },
+      async save(value) {
+        stored = { ...value, providers: [...value.providers] };
+      },
+    };
+    const registry = new PersistentProviderRegistry(
+      providerConfig,
+      createNonPersistentCredentialStore(),
+      {},
+    );
+    const session: Session = {
+      schemaVersion: 1,
+      id: "providerless-startup",
+      title: "Providerless session",
+      createdAt: "2026-08-10T10:00:00.000Z",
+      updatedAt: "2026-08-10T10:00:00.000Z",
+      workspace: "/workspace",
+      providerId: null,
+      modelId: "science",
+      variantId: "high",
+      messages: [{ role: "user", content: "Question" }],
+    };
+    const restored = await restoreState(
+      { ...DEFAULT_APP_CONFIG, activeProviderId: "openrouter" },
+      registry,
+      {},
+      session,
+    );
+
+    expect(restored.connection?.providerId).toBe("openrouter");
+    expect(restored.model).toBeUndefined();
+    expect(restored.variant).toBe("auto");
+    expect(restored.notices.some((notice) => notice.message.includes("lacked a provider"))).toBe(
+      true,
+    );
   });
 
   it.each([

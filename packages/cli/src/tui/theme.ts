@@ -1,4 +1,5 @@
 import { THEME_NAMES, type ThemeName } from "../theme.js";
+import type { FormulaRenderStyle } from "./formula-renderer.js";
 
 /**
  * Semantic presentation tokens for the full-screen TUI. Components reference token names only, so a
@@ -26,6 +27,8 @@ export interface TuiPalette {
 }
 
 export type TuiThemeToken = keyof TuiPalette;
+
+export type FormulaGraphicsProtocol = "exact-source" | "iterm2" | "kitty" | "sixel" | "unsupported";
 
 export interface TuiTheme {
   readonly name: ThemeName;
@@ -341,3 +344,80 @@ export function themeColor(theme: TuiTheme, token: TuiThemeToken): string | unde
   if (!theme.colorEnabled) return undefined;
   return theme.palette[token];
 }
+
+/**
+ * Resolve Ink's named colors and the palette's CSS literals to a deterministic CSS color. Ink
+ * names are terminal vocabulary, not valid CSS in all cases (for example whiteBright), so they
+ * must not cross the isolated LaTeX renderer boundary unchanged.
+ */
+export function tuiColorToCss(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  if (value.startsWith("#")) return value.toLowerCase();
+  return INK_CSS_COLORS[value];
+}
+
+/**
+ * Build the validated-style input used by formula rasters. Kitty retains transparent padding so
+ * the terminal surface shows through; Sixel receives a semantic surface when one is known. The
+ * system theme deliberately omits that unknown terminal background, allowing the bounded Sixel
+ * encoder to preserve source colors without inventing a dark/white canvas. Color-disabled themes
+ * intentionally return undefined so callers keep exact source instead of producing an unstyled
+ * graphic.
+ */
+export function formulaRenderStyle(
+  theme: TuiTheme,
+  protocol: FormulaGraphicsProtocol = "kitty",
+): FormulaRenderStyle | undefined {
+  if (!theme.colorEnabled) return undefined;
+  const cachedByProtocol = FORMULA_STYLE_CACHE.get(theme);
+  const cached = cachedByProtocol?.get(protocol);
+  if (cached !== undefined) return cached;
+  const foreground = tuiColorToCss(themeColor(theme, "math"));
+  if (foreground === undefined) return undefined;
+  const background = tuiColorToCss(
+    themeColor(theme, "background") ??
+      themeColor(theme, "assistantSurface") ??
+      themeColor(theme, "surface"),
+  );
+  const style: FormulaRenderStyle = {
+    dpi: 96,
+    fontScale: 1,
+    foreground,
+    ...(protocol === "sixel" && background !== undefined ? { background } : {}),
+  };
+  if (cachedByProtocol === undefined) {
+    FORMULA_STYLE_CACHE.set(theme, new Map([[protocol, style]]));
+  } else {
+    cachedByProtocol.set(protocol, style);
+  }
+  return style;
+}
+
+/** Explicitly named alias for integrations that prefer a theme-oriented API. */
+export const themeFormulaRenderStyle = formulaRenderStyle;
+
+const INK_CSS_COLORS: Readonly<Record<string, string>> = Object.freeze({
+  black: "#000000",
+  blackBright: "#666666",
+  blue: "#0000ee",
+  blueBright: "#5c5cff",
+  cyan: "#00cdcd",
+  cyanBright: "#00ffff",
+  default: "#f5f5f5",
+  gray: "#808080",
+  green: "#00cd00",
+  greenBright: "#00ff00",
+  magenta: "#cd00cd",
+  magentaBright: "#ff00ff",
+  red: "#cd0000",
+  redBright: "#ff0000",
+  white: "#e5e5e5",
+  whiteBright: "#ffffff",
+  yellow: "#cdcd00",
+  yellowBright: "#ffff00",
+});
+
+const FORMULA_STYLE_CACHE = new WeakMap<
+  TuiTheme,
+  Map<FormulaGraphicsProtocol, FormulaRenderStyle>
+>();

@@ -99,6 +99,15 @@ function malformed(request) {
     // Payload shape
     case "payload-extra-field":
       return { type: "result", id, result: { ...payload, detail: secret } };
+    case "payload-style-extra-field":
+      return {
+        type: "result",
+        id,
+        result: {
+          ...payload,
+          style: { foreground: "#fff", fontScale: 1, dpi: 96 },
+        },
+      };
     case "payload-missing-svg": {
       const { svg: _svg, ...rest } = payload;
       return { type: "result", id, result: rest };

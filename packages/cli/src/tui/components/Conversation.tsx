@@ -1,3 +1,4 @@
+import { LatexRenderBudget } from "@researk/latex-renderer";
 import { Box, type DOMElement, Text, useBoxMetrics } from "ink";
 import { type ReactNode, useEffect, useRef } from "react";
 import { type ContentBlock, type ContentSegment, classifyContent } from "../content.js";
@@ -8,7 +9,7 @@ import {
   type FormulaGraphicsRuntime,
 } from "../graphics.js";
 import { type ConversationEntry, displayText, type MessageRole } from "../state.js";
-import { type TuiTheme, themeColor } from "../theme.js";
+import { formulaRenderStyle, type TuiTheme, themeColor } from "../theme.js";
 
 function roleToken(role: MessageRole): "userMessage" | "assistantMessage" | "toolMessage" {
   if (role === "user") return "userMessage";
@@ -46,7 +47,9 @@ function borderProp(
 }
 
 interface FormulaRenderContext {
+  readonly budget: LatexRenderBudget;
   readonly runtime: FormulaGraphicsRuntime;
+  readonly renderStyle?: ReturnType<typeof formulaRenderStyle>;
   readonly selectedFormulaKey: string | undefined;
   readonly clipRef?: FormulaGraphicsRefLike;
   readonly refs: readonly FormulaRef[];
@@ -55,19 +58,30 @@ interface FormulaRenderContext {
 
 function createFormulaRenderContext(
   entry: ConversationEntry,
+  theme: TuiTheme,
+  budget: LatexRenderBudget,
   runtime: FormulaGraphicsRuntime | undefined,
   selectedFormulaKey: string | undefined,
   clipRef: FormulaGraphicsRefLike | undefined,
 ): FormulaRenderContext | undefined {
-  if (entry.role !== "assistant" || runtime === undefined || runtime.disposed) return undefined;
+  if (
+    entry.role !== "assistant" ||
+    !theme.colorEnabled ||
+    runtime === undefined ||
+    runtime.disposed
+  ) {
+    return undefined;
+  }
   if (!runtime.supportsGraphics()) return undefined;
   const refs = indexConversationFormulas([entry]);
   return refs.length === 0
     ? undefined
     : {
+        budget,
         cursor: 0,
         refs,
         runtime,
+        renderStyle: formulaRenderStyle(theme, runtime.rendererId),
         selectedFormulaKey,
         ...(clipRef === undefined ? {} : { clipRef }),
       };
@@ -94,15 +108,17 @@ function selectedFormula(context: FormulaRenderContext, formula: FormulaRef): bo
 }
 
 function FormulaSlot(props: {
+  readonly budget: LatexRenderBudget;
   readonly context: FormulaRenderContext;
   readonly formula: FormulaRef;
   readonly display: boolean;
   readonly mathColor: string | undefined;
   readonly accentColor: string | undefined;
+  readonly renderStyle?: ReturnType<typeof formulaRenderStyle>;
   readonly bold?: boolean;
 }): ReactNode {
   const selected = selectedFormula(props.context, props.formula);
-  const marker = selected ? "\u25b8 " : "  ";
+  const marker = selected ? "\u25b8 " : props.display ? "" : "  ";
   const boldProp = props.bold === undefined ? {} : { bold: props.bold };
   const selectedColorProp =
     props.accentColor === undefined ? {} : { selectedColor: props.accentColor };
@@ -119,6 +135,8 @@ function FormulaSlot(props: {
         display={props.display}
         inline={!props.display}
         selected={selected}
+        renderBudget={props.budget}
+        {...(props.renderStyle === undefined ? {} : { renderStyle: props.renderStyle })}
         style={{
           ...colorProp(props.mathColor),
           ...boldProp,
@@ -249,10 +267,12 @@ function FormulaSegments(props: {
         ) : (
           <FormulaSlot
             accentColor={props.accentColor}
+            budget={props.context.budget}
             context={props.context}
             display={false}
             formula={formula}
             mathColor={props.mathColor}
+            renderStyle={props.context.renderStyle}
             {...(props.bold === undefined ? {} : { bold: props.bold })}
           />
         )}
@@ -378,15 +398,7 @@ function Block(props: {
       // Delimiters and source are shown verbatim as safe display text. No TeX engine, Unicode
       // approximation, or terminal graphics protocol participates in rendering.
       return (
-        <Box
-          flexDirection="column"
-          width="100%"
-          marginY={1}
-          paddingX={1}
-          borderStyle="single"
-          {...borderProp(border)}
-          {...backgroundProp(surfaceMuted)}
-        >
+        <Box flexDirection="column" width="100%" marginY={1}>
           {props.formulaContext === undefined ? (
             <Text {...colorProp(math)}>{displayText(block.source)}</Text>
           ) : (
@@ -397,10 +409,12 @@ function Block(props: {
               ) : (
                 <FormulaSlot
                   accentColor={accent}
+                  budget={props.formulaContext.budget}
                   context={props.formulaContext}
                   display
                   formula={formula}
                   mathColor={math}
+                  renderStyle={props.formulaContext.renderStyle}
                 />
               );
             })()
@@ -468,6 +482,10 @@ export function ConversationMessage(props: {
   readonly clipRef?: FormulaGraphicsRefLike;
 }): ReactNode {
   const { entry, theme } = props;
+  // Keep one budget for this keyed assistant response across theme/layout rerenders. A later
+  // response mounts a different message and therefore receives a fresh budget.
+  const formulaRenderBudget = useRef<LatexRenderBudget | undefined>(undefined);
+  formulaRenderBudget.current ??= new LatexRenderBudget();
   const baseColor = themeColor(theme, roleToken(entry.role));
   const muted = themeColor(theme, "muted");
   const border = themeColor(theme, "border");
@@ -476,6 +494,8 @@ export function ConversationMessage(props: {
   const label = roleLabel(entry.role);
   const formulaContext = createFormulaRenderContext(
     entry,
+    theme,
+    formulaRenderBudget.current,
     props.graphicsRuntime,
     props.selectedFormulaKey,
     props.clipRef,

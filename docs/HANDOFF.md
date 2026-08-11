@@ -1,5 +1,75 @@
 # Development handoff
 
+## 2026-08-11 frozen final validation - alpha.4 iteration
+
+This section is the authoritative handoff for the completed capability-aware rendering, `/new`,
+and provider-credential iteration. The dated sections below retain implementation chronology and may
+describe earlier intermediate states.
+
+### Delivered behavior
+
+- A centralized capability layer selects presentation from bounded runtime evidence. Kitty is used
+  only after a complete Kitty protocol probe; Sixel requires positive Windows Terminal/DA1/cell-pixel
+  evidence; iTerm2 is limited to its positively identified one-shot path. Ordinary terminals,
+  including Windows Terminal without positive graphics evidence, receive exact original source.
+- Enhanced math uses bundled MathJax 4.1.3 -> validated path-only SVG -> in-memory
+  `@resvg/resvg-js` 2.6.2 raster output. It never executes system TeX or external `latex`/`dvipng`
+  tools. Markdown and original LaTeX remain canonical; graphics are disposable presentation, and
+  exact source is the lossless fallback required by ADR 0006.
+- Semantic theme foreground/background values affect rendering and cache selection. Kitty and iTerm2
+  retain transparent output where practical. Sixel leaves fully zero-alpha padding unset; a known
+  semantic background is used only to composite partially transparent antialias pixels. The system
+  theme does not invent a background, and unknown backgrounds conservatively preserve nonzero source
+  hues. Formula cache keys include canonical source, style/theme, scale, DPI, renderer identity, and
+  other pixel-affecting options; the bounded cache is per-user, outside the research repository, and
+  corrupt entries are safely discarded.
+- Response-scoped expression/time budgets and bounded raster/payload limits protect the renderer.
+  Retained graphics reserve measured rows/columns, serialize protocol writes, clean old placements,
+  and fall back to exact source when resize, clipping, stale generation, cancellation, or stream
+  failure makes layout unsafe.
+- `/new` replaces only session state. Async generation guards, race handling, and save-pointer
+  updates prevent late output or persistence from the previous session from corrupting the new one.
+  The mounted shell, dimensions/layout, theme, provider registry and credentials, provider/model/
+  variant selection, capability evidence, and formula renderer selection remain alive.
+- Provider profiles globally reference provider-scoped credentials in the `@napi-rs/keyring` OS
+  credential store. A key entered through `/provider` persists once; resolution is persisted credential
+  first, then an explicitly configured environment fallback, then missing. Restart, resume, `/new`,
+  blank reconnect, and custom endpoint/profile metadata use that same global profile without placing a
+  secret in sessions, ordinary config, or transcripts. Failed profile updates roll back safely where
+  possible, registry mutations are serialized per process/instance, and untrusted session files are
+  schema-validated and redacted before restoration.
+- [ADR 0011](decisions/0011-runtime-dependency-review.md) records the accepted `resvg` and native
+  keyring dependency review. [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) is the concise
+  release-artifact notice for the executable distribution; the standalone builder requires, copies,
+  and verifies it in the final artifact.
+
+### Verification
+
+The requested repository gates all passed: `npm run clean`, `npm run build`, `npm run typecheck`,
+`npm test`, `npm run lint`, `npm run format-check`, and `git diff --check`. The final test counts were
+705 total: CLI 545; contracts 10; harness 7; latex-renderer 125; compatible provider 12; OpenRouter
+4; research 2. Lint passed with 17 informational style suggestions only.
+
+Final standalone validation measured 59,759,821 bytes. The staged native matrix and SBOM covered
+24/24 lock-pinned native optional entries: 23 contain `.node` files, while
+`@resvg/resvg-js-android-arm-eabi@2.6.2` is the upstream metadata-only marker. Offline install,
+`help`, `version`, and temporary-directory cleanup passed. The final validated tarball contains the
+non-empty 2,769-byte notice.
+
+The production Windows keyring synthetic probe returned true for all required availability/set/get/
+delete booleans, and the synthetic entry was deleted afterward.
+
+### Manual follow-up and residuals
+
+WezTerm was unavailable, and this execution channel was non-TTY/redirected. Windows Terminal was
+installed, but no observable interactive visual smoke was possible. Real WezTerm/Kitty graphics,
+Windows Terminal fallback/Sixel behavior, macOS/Linux keyring backends, and real resize/backpressure
+smoke remain manual follow-up; this environment limitation does not make the iteration incomplete.
+
+Remaining operational limits are that registry serialization is per process/instance, credential
+rollback is best-effort if the credential backend itself fails, and CI release checks still depend on
+the platform's `tar` utility and related platform checks.
+
 ## 2026-08-10 OpenCode-inspired TUI redesign
 
 Completed the OpenCode-inspired Researk TUI redesign, using `img/home.png` and `img/fullscreen.png`

@@ -2,14 +2,16 @@
 
 ## Status
 
-Researk has a pre-alpha source implementation and local build and test scripts. It has no release
-workflow, installable GitHub Release, native package, or release artifact. This document defines
-the release contract; it is not evidence that a release is available.
+Researk has a pre-alpha source implementation and local build, standalone-packaging, and smoke-test
+scripts. It has no published GitHub Release or supported installer. The repository can build one
+self-contained npm tarball and its SPDX SBOM from source, but this capability is not evidence that
+a release is available. This document defines the release contract.
 
 The Node.js 24 and npm workspace toolchain can build, type-check, test, lint, and format-check the
-source. Signing, checksums, software bills of materials, provenance, native packaging, and release
-automation are not implemented. Until all release controls exist and pass, maintainers MUST NOT
-publish an official executable release.
+source. Signing, checksums, provenance, and release automation are not complete. The standalone
+packer locks and validates the runtime dependency closure, including native optional records for
+the renderer and keyring, and writes an SPDX SBOM. Until all release controls and platform smoke
+tests exist and pass, maintainers MUST NOT publish an official executable release.
 
 No continuous-integration configuration is introduced by this document.
 
@@ -38,11 +40,16 @@ Before tagging, the release owner verifies that:
 - the planned scope is complete and reviewed,
 - automated tests and required platform checks pass,
 - supported installation and offline startup smoke tests pass,
+- the single standalone artifact passes `npm run pack:standalone -- --output <empty-dir>` and
+  `npm run smoke:standalone -- --artifact <tarball> --root <empty-dir>` from an unrelated directory,
 - security and dependency reviews have no unresolved release-blocking findings,
 - user-facing behavior and configuration are documented,
 - `CHANGELOG.md` contains the release notes and migration guidance,
 - version metadata is consistent,
 - dependency locks and required notices are current,
+- [ADR 0011](decisions/0011-runtime-dependency-review.md) and
+  [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) cover bundled renderer/keyring packages and
+  native optional records,
 - release artifacts can be generated reproducibly by the release workflow,
 - every artifact will receive a checksum, a signature or attestation, an SBOM, and build provenance,
 - no secrets, private research material, or development-only files enter an artifact.
@@ -76,6 +83,7 @@ repository implements; it must not rely on guessed or personal tooling.
 Once implementation releases begin, each supported platform package must have:
 
 - the distributable artifact,
+- `THIRD_PARTY_NOTICES.md` or an equivalent notice bundle carried with the artifact,
 - a SHA-256 checksum in the release checksum manifest,
 - the signed checksum manifest and a signature or verifiable artifact attestation,
 - an SBOM covering bundled dependencies,

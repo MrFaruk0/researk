@@ -2,7 +2,9 @@
 
 ## Status
 
-This is the intended architecture for a pre-alpha project. It defines boundaries before implementation; it does not describe existing packages, directories, adapters, or commands. The language, toolchain, package layout, and distribution format require a recorded architecture decision before code is scaffolded.
+This is the implemented architecture for the current pre-alpha source milestone. It records the
+boundaries that the source packages and TUI follow. Release packaging and some Domain adapters
+remain separately gated by the accepted decisions in `docs/decisions/`.
 
 ## System boundary
 
@@ -132,11 +134,20 @@ The evidence bundle captures source identifiers, repository revision, dependency
 State has four categories:
 
 - **configuration**: versioned, non-secret preferences and adapter references;
-- **credentials**: handles stored in environment or an approved operating-system credential backend, never session data;
+- **credentials**: provider-scoped handles resolved through the approved operating-system
+  credential backend, with an explicit environment-variable fallback, never session data;
 - **workspace content**: authoritative user files inside an explicit boundary; and
 - **derived state**: versioned sessions, source registry, evidence graph, manuscript index, run records, and caches that can be rebuilt where possible.
 
-Sessions refer to adapter and model identifiers but not credentials. State writes are atomic. Migrations are transactional, preserve a backup when destructive, and follow `VERSIONING.md`. Symlink and path resolution must not silently escape the workspace.
+Provider profiles persist non-secret identity, protocol, endpoint, and a credential reference. The
+credential value lives in the OS keyring (keyring-rs documents macOS Keychain Services, Windows
+Credential Manager, and *nix Secret Service); ordinary config and session files contain no key. Session
+records refer to provider, model, and variant identities but not credentials. State writes are
+atomic. Session reads validate bounded untrusted input and redact known provider secrets before
+restoration. `/new` replaces only session state and keeps the mounted shell, layout, theme,
+provider registry, model, variant, capability evidence, and renderer state alive. Migrations are
+transactional, preserve a backup when destructive, and follow `VERSIONING.md`. Symlink and path
+resolution must not silently escape the workspace.
 
 No component emits telemetry by default. Logs and traces redact authorization headers, tokens, secrets, and configured sensitive fields.
 
@@ -144,15 +155,31 @@ No component emits telemetry by default. Logs and traces redact authorization he
 
 The CLI translates user input into Harness requests and typed events into interactive, plain/raw, accessible, or machine-readable output. Standard output remains data-only in non-TTY mode; diagnostics go to standard error.
 
-Canonical Markdown and LaTeX source belongs to Harness content. The renderer maintains a streaming parse state so delimiters split across chunks are not corrupted. It recognizes math only outside code spans/fences, neutralizes unsafe control sequences for display, detects terminal capabilities conservatively, and uses exact-source fallback. Mathematical graphics are optional presentation and never replace canonical source. A display failure does not fail the research run.
+Canonical Markdown and LaTeX source belongs to Harness content. The renderer maintains a streaming
+parse state so delimiters split across chunks are not corrupted. A structured formula artifact keeps
+the canonical expression and the exact original source separate from disposable pixels. The CLI
+recognizes math only outside code spans/fences, neutralizes unsafe control sequences for display,
+and selects a renderer through one centralized capability layer. Positive Kitty, Sixel, or iTerm2
+protocol evidence can select graphics; otherwise the exact original LaTeX source is emitted. There
+is no lossy Unicode approximation. Theme semantic colors, scale, DPI, and renderer version affect
+the disposable per-user formula cache key. Mathematical graphics never replace canonical source,
+and a display failure does not fail the research run.
 
-Full terminal requirements live in [CLI_RENDERING.md](CLI_RENDERING.md). Terminal visualization never invokes system TeX. Manuscript LaTeX validation/export is a separate Domain/export path.
+Full terminal requirements live in [CLI_RENDERING.md](CLI_RENDERING.md). The current graphics path
+is bundled MathJax 4.1.3 -> validated path-only SVG -> `@resvg/resvg-js` 2.6.2 raster output;
+terminal visualization never invokes system TeX, `latex`, `dvipng`, or an external helper.
+Manuscript LaTeX validation/export is a separate Domain/export path.
 
 ## Adapter boundaries
 
 Provider adapters declare authentication method, model discovery, streaming, structured-output, tool-use, usage, cancellation, and retry capabilities. Unsupported behavior is negotiated explicitly.
 
-A provider registry owns adapter discovery and canonical `provider:model` identities. Live model catalogs are normalized, sanitized as untrusted data, and cached with provenance and freshness for offline inspection. The registry preserves dynamic unknown models instead of requiring a hard-coded allowlist. Custom OpenAI-compatible endpoints and local runtimes receive distinct provider identities.
+A provider registry owns adapter discovery, provider profiles, and canonical `provider:model`
+identities. Live model catalogs are normalized, sanitized as untrusted data, and cached with
+provenance and freshness for offline inspection. The registry preserves dynamic unknown models
+instead of requiring a hard-coded allowlist. Custom OpenAI-compatible endpoints and local runtimes
+receive distinct provider identities. A profile owns its endpoint and stable credential reference;
+the credential store resolves the value without putting it in the profile, session, or transcript.
 
 Normalized model capabilities cover streaming, tool calls, structured output, vision/files, context and output limits, and reasoning controls. Selection filters against workflow requirements. Session and run records capture the exact provider/model identity, exposed revision, and effective settings; an adapter cannot silently substitute a model.
 
@@ -171,8 +198,10 @@ The principal untrusted inputs are model output, documents, web pages, repositor
 - least-privilege adapter permissions and action-scoped approvals;
 - explicit workspace boundaries and review before manuscript overwrite;
 - prompt-injection separation for retrieved material;
-- no secret persistence in ordinary files or events;
+- no secret persistence in ordinary files, session data, cache entries, or events;
 - control-sequence neutralization at the CLI boundary;
+- positive terminal-protocol evidence before graphics output;
+- bounded validation and redaction before untrusted session data enters TUI state;
 - network disclosure and default-denied reproduction networking; and
 - disposable isolation and resource limits for downloaded code.
 
@@ -180,4 +209,8 @@ The architecture must fail closed when a required permission or isolation contro
 
 ## Deferred decisions
 
-The first roadmap gate must record decisions for the implementation language and supported versions, dependency/build tooling, package layout, operating-system matrix, local state locations, credential backend behavior, isolation technology, GitHub release artifact format, and provider conformance strategy. This document must then be updated to describe real packages rather than anticipated directories.
+The accepted decisions record the TypeScript/Node.js toolchain, local state locations, credential
+backend, isolation boundary, and single-artifact GitHub Release format. Remaining gates include the
+supported operating-system matrix, cross-platform native keyring and renderer smoke coverage,
+provider conformance, schema migrations, and the final release workflow. This document must be
+updated when those gates become implemented behavior.

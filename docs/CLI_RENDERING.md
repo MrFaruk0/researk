@@ -3,13 +3,14 @@
 ## Status
 
 This document defines the normative rendering contract for the Researk CLI. The current
-`0.1.0-alpha.4` source build includes restricted local MathJax 4 SVG generation, in-memory resvg
-rasterization, one-shot display-math emission in positively detected iTerm2 TTYs, and retained
-formula graphics in the full-screen TUI. The TUI uses Kitty only after complete bounded query
-evidence (matching `i=31` literal `OK`, valid DA1, and measured cell pixels) and Windows Terminal
-Sixel only after its advertised capability and cell-pixel response are proven. Exact source is used
-everywhere else. Sections that explicitly describe planned command-line or configuration options are
-future contract requirements, not claims that those options are accepted by the current CLI.
+`0.1.0-alpha.4` source build includes restricted local MathJax 4.1.3 -> validated path-only SVG,
+in-memory `@resvg/resvg-js` 2.6.2 rasterization, an optional per-user formula-raster cache,
+one-shot display-math emission in positively detected iTerm2 TTYs, and retained formula graphics
+in the full-screen TUI. The TUI uses Kitty only after complete bounded query evidence (matching
+`i=31` literal `OK`, valid DA1, and measured cell pixels) and Windows Terminal Sixel only after its
+advertised capability and cell-pixel response are proven. Exact original source is used everywhere
+else. Sections that explicitly describe planned command-line or configuration options are future
+contract requirements, not claims that those options are accepted by the current CLI.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** describe requirements for implementations of the official CLI and compatible clients.
 
@@ -217,15 +218,15 @@ render(tex, display_mode, container_width, scale, theme, macro_set)
 The current bundled image implementation is:
 
 ```text
-MathJax 4 TeX input
+MathJax 4.1.3 TeX input
         ↓
 standalone SVG
         ↓
-SVG validation and sanitization
+path-only SVG validation and sanitization
         ↓
-resvg rasterization at fixed 2× scale
+`@resvg/resvg-js` 2.6.2 rasterization
         ↓
-opaque-white RGBA pixels and PNG
+theme-aware RGBA pixels and PNG
 ```
 
 The initial backend MUST:
@@ -240,10 +241,14 @@ The initial backend MUST:
 - avoid invoking `latex`, `pdflatex`, `xelatex`, `lualatex`, `tectonic`, `kitten`, `imgcat`, `chafa`, or any other external executable,
 - produce deterministic output for the same input, backend version, configuration, width, scale, and theme.
 
-The TUI formula path uses this same restricted MathJax 4 → SVG → resvg pipeline for both display
-math and inline math promoted to a dedicated row. The fixed opaque-white background keeps glyphs
-visible in dark terminals; the rasterizer returns both PNG and raw RGBA data for the terminal
-protocol emitters. No path executes system TeX, accesses files, or makes network requests.
+The TUI formula path uses this same restricted MathJax 4.1.3 → validated SVG → resvg 2.6.2
+pipeline for both display math and inline math promoted to a dedicated row. Semantic theme tokens
+provide the foreground. Kitty and iTerm2 retain transparent output where practical. Sixel leaves
+fully zero-alpha padding unset; when a semantic background is known, it is used only to composite
+partially transparent antialias pixels. The system theme does not invent a background, and unknown
+backgrounds conservatively preserve nonzero source hues. No path executes system TeX, accesses files,
+or makes network requests. This is a raster presentation path, not native vector or system-TeX
+rendering.
 
 Renderer isolation MAY use a worker thread or another embedded, terminable worker supplied with Researk. It MUST NOT invoke an external rendering subprocess.
 
@@ -319,18 +324,32 @@ The following options define planned contract behavior. They are not accepted by
 
 `source` is the default fallback. `error` is intended for strict one-shot commands and automated checks.
 
-The current TUI raster output uses an opaque-white background at fixed 2× scale so formula glyphs
-remain visible on dark surfaces. Future theme options MAY choose another safe background, but they
-MUST retain sufficient contrast and MUST NOT weaken exact-source fallback.
+The current TUI raster output uses semantic theme tokens for the foreground and an optional known
+background. Kitty and iTerm2 can retain transparent equation padding so the terminal surface shows
+through. Sixel leaves fully zero-alpha padding unset; a known semantic background is used only for
+partially transparent antialias compositing. The system theme does not invent a background, and
+nonzero source hues are conservatively preserved when no background is known. Font scale and DPI
+are part of the style and cache key. Color-disabled, uncertain, or failed paths keep exact source
+instead of producing an unthemed graphic. Theme changes select a different cached render or
+invalidate the old style; they do not change canonical content.
 
 ## 7.5 Local persistence boundary
 
-The full-screen TUI currently persists non-secret provider profiles, selected model/reasoning/theme
-configuration, and bounded canonical sessions in the platform's local data directories. It restores
-the selected workspace session when the saved workspace matches the current directory. Normal TUI
-startup deliberately uses a non-persistent credential store: API keys remain in memory and are
-resolved through environment-variable references. An operating-system credential backend remains
-future work. Rendered protocol bytes and raster cache entries are never session state.
+The full-screen TUI persists non-secret provider profiles, selected model/reasoning/theme
+configuration, and bounded canonical sessions in the platform's local data directories. Provider
+profiles contain a stable credential reference and an explicit environment-variable name; the
+credential value is stored through `@napi-rs/keyring` and is resolved before the environment
+fallback. A missing or unavailable native keyring does not create a plaintext fallback. It reports
+that persistence is unavailable so the user can use the explicit environment option or repair the
+keyring. The underlying keyring-rs v1 API documents macOS Keychain Services, Windows Credential
+Manager, and *nix Secret Service; availability depends on the host session. The selected workspace
+session is restored only when its saved workspace matches the current directory. Rendered protocol
+bytes and raster cache entries are never session state.
+
+`/new` replaces only the session ID, title, conversation, and session metadata. The mounted TUI
+shell, dimensions/layout, theme, provider registry/profile, credentials, model, variant, capability
+evidence, and renderer selection remain global. A resumed session uses its saved provider/model/
+variant identities while resolving credentials globally.
 
 The following equivalents remain planned command-line/configuration contract values rather than
 accepted current CLI flags:
@@ -360,7 +379,8 @@ The current source build has two deliberately separate graphics paths:
 2. **Full-screen TUI:** argument-less interactive TTY startup probes before Ink mounts. Assistant
    display math and inline math promoted to a dedicated row may use retained Kitty or Windows
    Terminal Sixel placements after the evidence gates in Section 8.1. The common image backend is
-   restricted MathJax 4 → SVG → resvg at fixed 2× scale, returning opaque-white PNG/RGBA data.
+   restricted MathJax 4.1.3 → validated path-only SVG → `@resvg/resvg-js` 2.6.2 rasterization,
+   returning theme-aware PNG/RGBA data.
 
 The CLI MUST emit protocol bytes directly from its trusted terminal backend. It MUST NOT depend on
 helper executables. Unsupported, inaccessible, raw, JSON, non-TTY, renderer-failure, clipped,
@@ -374,8 +394,9 @@ without corrupting layout, `FormulaGraphic` MUST keep its exact source projectio
 The TUI graphics runtime emits after the matching Ink frame has flushed, outside the Ink tree. Before
 each frame it synchronously clears prior placements. Generation checks, serialized writes, stream
 failure handling, terminal dimensions, clipping, and the reserved final scroll row prevent stale or
-misplaced images from surviving a redraw. Dispose, cancellation, resize, and exit clear or disable
-placements before terminal restoration.
+misplaced images from surviving a redraw. A retained replacement remains source-visible until its
+new placement is confirmed; a blocked or failed placement restores the exact source projection.
+Dispose, cancellation, resize, and exit clear or disable placements before terminal restoration.
 
 The `/formula` overlay provides keyboard navigation (Up/Down or `j`/`k`), exact canonical-source
 copy through bounded OSC 52 (`c`), local draft editing and rerendering (`e`, then Enter), source
@@ -387,7 +408,8 @@ operation.
 
 ## 8.1 Capability detection
 
-For the retained TUI path, capability detection proceeds before Ink mounts:
+For the retained TUI path, one centralized capability layer runs before Ink mounts. UI components
+do not inspect terminal environment variables or process names themselves:
 
 1. Confirm stdin and stdout are TTYs and the invocation is interactive.
 2. Reject `TERM=dumb`, CI/non-interactive environments, accessible/raw/JSON paths, and unverified
@@ -397,7 +419,7 @@ For the retained TUI path, capability detection proceeds before Ink mounts:
    with literal protocol `OK`, a valid DA1 response, and bounded measured cell-pixel dimensions.
 4. Select Windows Terminal Sixel only when `WT_SESSION` is non-empty, the DA1 response includes
    parameter `4`, and a valid bounded `CSI 6;<height>;<width>t` cell-pixel response is present.
-5. Otherwise use source fallback. A trusted iTerm2 identity may enable the one-shot path, but it does
+5. Otherwise use exact-source fallback. A trusted iTerm2 identity may enable the one-shot path, but it does
    not enable retained TUI placements.
 
 No capability query may be emitted in Markdown, JSON, accessible, raw, or non-TTY output. A missing,
@@ -424,7 +446,9 @@ The retained TUI backend MUST:
 - avoid corrupting scrollback, the alternate screen, or the input prompt.
 
 Terminal resize invalidates layout and width-dependent raster placement decisions. It does not
-invalidate canonical source or assistant/session persistence.
+invalidate canonical source or assistant/session persistence. WezTerm is a useful Windows
+development terminal because it supports Kitty graphics, but no terminal brand is required and a
+terminal that does not prove a protocol remains fully supported through source output.
 
 ## 8.3 Host notes
 
@@ -558,23 +582,28 @@ Reaching a ceiling is a typed rendering failure. With the default fallback, the 
 
 # 13. Cache
 
-The renderer SHOULD use a bounded in-memory least-recently-used cache.
+The renderer SHOULD use a bounded in-memory least-recently-used cache. The source build also uses
+an optional per-user persistent formula-raster cache beneath Researk's platform cache directory;
+it is not stored in the active research repository and is safe to delete.
 
 The cache key MUST include:
 
-- exact TeX input,
-- inline or display mode,
+- canonical TeX input and inline/display mode,
 - macro-set digest,
-- backend and font versions,
+- renderer/backend version and font versions,
 - TeX extension set,
 - container width,
 - raster scale,
-- foreground/theme selection,
+- foreground and background/theme selection,
+- font scale and DPI,
 - sanitizer version.
 
 Cached values MUST pass the same size limits as newly rendered values. Cache entries are untrusted after a software upgrade and MUST NOT be reused across incompatible renderer or sanitizer versions.
 
-An optional disk cache may be added later. It MUST live in the platform cache directory, be size-bounded, use atomic writes and private permissions, validate every read, and remain safe to delete at any time. It MUST NOT live in the research workspace or be committed to source control.
+The disk cache MUST live in the platform cache directory, be size-bounded, use atomic writes and
+private permissions where supported, validate every read, and remain safe to delete at any time.
+Corrupt or incompatible entries are discarded and rendering continues with a fresh render or exact
+source fallback. It MUST NOT live in the research workspace or be committed to source control.
 
 ---
 
@@ -698,17 +727,21 @@ CLI rendering is complete for its initial release only when all of the following
 - Canonical Markdown and LaTeX survive parsing, persistence, fallback, and JSON output without semantic mutation.
 - Every graphically rendered expression has a documented exact-source reveal or copy path that does not use OCR or reverse conversion.
 - Parser results are independent of streaming chunk boundaries.
-- Supported display math renders through the bundled MathJax-to-SVG and resvg pipeline while offline.
+- Supported display math renders through the bundled MathJax 4.1.3 -> validated path-only SVG ->
+  `@resvg/resvg-js` 2.6.2 pipeline while offline.
 - iTerm2 renders representative display equations without corrupting the prompt, cursor, resize
   behavior, or scrollback in one-shot `chat`.
 - The full-screen TUI renders inline (promoted to a row) and display formulas through the restricted
-  MathJax 4 → SVG → resvg 2× opaque-white PNG/RGBA path when retained Kitty or Sixel capability and
-  layout criteria pass.
+  MathJax 4.1.3 -> validated SVG -> resvg raster path when retained Kitty or Sixel capability and
+  layout criteria pass, with semantic theme style and transparent output where practical.
 - Retained TUI graphics are emitted outside Ink after frame flush with pre-frame cleanup; scroll,
   resize, clipping, stale generations, and failures fall back to exact source.
 - `/formula` navigates, copies canonical source through bounded OSC 52, locally edits/rerenders,
   toggles source, and inserts edited or canonical source without mutating assistant/session source.
 - Unsupported terminals receive exact source automatically and without installation steps.
+- Theme changes select a style-specific render; repeated identical formulas hit the bounded
+  in-memory or per-user raster cache, and corrupt cache entries are discarded safely.
+- Capability selection uses protocol evidence rather than a WezTerm/Kitty process-name assumption.
 - Redirected output contains no terminal control or graphics protocol bytes.
 - Accessible mode provides stable, linear, exact-source math output.
 - JSON output is structured, reconstructable, and escape-safe.

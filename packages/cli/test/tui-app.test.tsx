@@ -1,15 +1,18 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { ModelDescriptor, RunEvent } from "@researk/contracts";
+import type { ModelDescriptor, RunEvent, RunRequest } from "@researk/contracts";
 import { render as inkRender } from "ink-testing-library";
 import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppConfigStore } from "../src/config/config.js";
+import { type CredentialStore, FileCredentialStore } from "../src/config/credentials.js";
+import { PersistentProviderRegistry } from "../src/config/providers.js";
 import { type Session, SessionStore } from "../src/config/sessions.js";
 import { FileConfigStore } from "../src/config/store.js";
 import { App, type AppProps } from "../src/tui/App.js";
 import { TuiController } from "../src/tui/controller.js";
+import { createFormulaGraphicsRuntime } from "../src/tui/graphics.js";
 import { displayCellWidth } from "../src/tui/layout.js";
 import { DISABLE_MOUSE_TRACKING, ENABLE_MOUSE_TRACKING } from "../src/tui/mouse.js";
 import { createInitialState } from "../src/tui/state.js";
@@ -111,8 +114,13 @@ async function mount(
     terminalWidth?: number;
     terminalHeight?: number;
     mouseTrackingEnabled?: boolean;
+    colorEnabled?: boolean;
+    env?: Readonly<Record<string, string | undefined>>;
+    graphicsRuntime?: AppProps["graphicsRuntime"];
     sessionStore?: SessionStore;
     configStore?: AppConfigStore;
+    providerRegistry?: PersistentProviderRegistry;
+    credentialStore?: CredentialStore;
     copyFormula?: AppProps["copyFormula"];
   }> = {},
 ) {
@@ -129,14 +137,23 @@ async function mount(
 
   const controller = new TuiController({
     dependencies: { harness },
-    env: { TEST_KEY: "synthetic-app-key" },
+    env: options.env ?? { TEST_KEY: "synthetic-app-key" },
     workspace,
-    ...(options.sessionStore === undefined && options.configStore === undefined
+    ...(options.sessionStore === undefined &&
+    options.configStore === undefined &&
+    options.providerRegistry === undefined &&
+    options.credentialStore === undefined
       ? {}
       : {
           storage: {
             ...(options.configStore === undefined ? {} : { configStore: options.configStore }),
             ...(options.sessionStore === undefined ? {} : { sessionStore: options.sessionStore }),
+            ...(options.providerRegistry === undefined
+              ? {}
+              : { providerRegistry: options.providerRegistry }),
+            ...(options.credentialStore === undefined
+              ? {}
+              : { credentialStore: options.credentialStore }),
           },
         }),
   });
@@ -147,7 +164,7 @@ async function mount(
       initialState: createInitialState({
         workspaceRoot: workspace.root,
         themeName: "dark",
-        colorEnabled: false,
+        colorEnabled: options.colorEnabled ?? false,
         variant: "auto",
       }),
       onExit: options.onExit ?? (() => {}),
@@ -156,6 +173,9 @@ async function mount(
       ...(options.mouseTrackingEnabled === undefined
         ? {}
         : { mouseTrackingEnabled: options.mouseTrackingEnabled }),
+      ...(options.graphicsRuntime === undefined
+        ? {}
+        : { graphicsRuntime: options.graphicsRuntime }),
       ...(options.copyFormula === undefined ? {} : { copyFormula: options.copyFormula }),
     }),
   );
@@ -530,7 +550,6 @@ describe("TUI provider configuration", () => {
       await app.type(KEYS.tab);
       await app.type("https://example.test/v1/");
       await app.type(KEYS.tab);
-      await app.type("TEST_KEY");
       await app.type(KEYS.enter);
       await app.type(KEYS.escape);
 
@@ -784,6 +803,30 @@ describe("TUI model, variant and theme overlays", () => {
     await app.type(KEYS.enter);
     expect(app.lastFrame() ?? "").not.toMatch(/Up\/Down preview/u);
     app.unmount();
+  });
+
+  it("updates retained formula graphics style when the semantic theme changes", async () => {
+    const runtime = createFormulaGraphicsRuntime({
+      capability: { protocol: "unsupported" },
+      stdout: { write: () => true },
+    });
+    const updateStyle = vi.spyOn(runtime, "updateStyle");
+    const app = await mount({ colorEnabled: true, graphicsRuntime: runtime });
+    try {
+      expect(updateStyle).toHaveBeenCalledTimes(1);
+      const initialRevision = runtime.styleRevision;
+
+      await app.type("/themes");
+      await app.type(KEYS.enter);
+      await app.type(KEYS.down);
+
+      expect(app.lastFrame() ?? "").toContain("light");
+      expect(updateStyle).toHaveBeenCalledTimes(2);
+      expect(runtime.styleRevision).toBe(initialRevision + 1);
+      expect(runtime.disposed).toBe(false);
+    } finally {
+      app.unmount();
+    }
   });
 });
 
@@ -1172,6 +1215,61 @@ describe("TUI workspace reading", () => {
     const frame = app.lastFrame() ?? "";
     expect(frame).toContain("paper.tex");
     app.unmount();
+  });
+
+  it("does not let a deferred /read stage a document into a later /new session", async () => {
+    const app = await mount({ files: { "paper.md": "old session source" } });
+    const gate = asyncGate();
+    const originalStage = app.controller.stageDocument.bind(app.controller);
+    const stageSpy = vi
+      .spyOn(app.controller, "stageDocument")
+      .mockImplementation(async (request, staged) => {
+        await gate.promise;
+        return originalStage(request, staged);
+      });
+    try {
+      await app.type("/read paper.md");
+      await app.type(KEYS.enter);
+      await app.type("/new");
+      await app.type(KEYS.enter);
+      await app.settle();
+
+      gate.release();
+      await app.settle();
+
+      expect(stageSpy).toHaveBeenCalledWith("paper.md", []);
+      expect(app.lastFrame() ?? "").not.toContain("paper.md");
+      expect(app.lastFrame() ?? "").not.toContain("old session source");
+    } finally {
+      stageSpy.mockRestore();
+      app.unmount();
+    }
+  });
+
+  it("ignores a deferred /read failure after a later /new session", async () => {
+    const app = await mount({ files: { "paper.md": "old session source" } });
+    const gate = asyncGate();
+    const stageSpy = vi.spyOn(app.controller, "stageDocument").mockImplementation(async () => {
+      await gate.promise;
+      throw new Error("late read failure");
+    });
+    try {
+      await app.type("/read paper.md");
+      await app.type(KEYS.enter);
+      await app.type("/new");
+      await app.type(KEYS.enter);
+      await app.settle();
+
+      gate.release();
+      await app.settle();
+
+      expect(stageSpy).toHaveBeenCalledWith("paper.md", []);
+      expect(app.lastFrame() ?? "").not.toContain("late read failure");
+      expect(app.lastFrame() ?? "").not.toContain("paper.md");
+    } finally {
+      stageSpy.mockRestore();
+      app.unmount();
+    }
   });
 
   it("reports a traversal attempt as a TUI error", async () => {
@@ -1609,6 +1707,228 @@ describe("TUI session persistence", () => {
     app.unmount();
   });
 
+  it("does not qualify a provider-less session model under the active provider", async () => {
+    const { store, configStore } = await makeStore();
+    const app = await mount({ sessionStore: store, configStore });
+    await connectAndSelectModel(app);
+    await store.saveSession(
+      persistedSession(app.workspaceRoot, {
+        providerId: null,
+        modelId: "science",
+        variantId: "high",
+      }),
+    );
+
+    await app.type("/sessions");
+    await app.type(KEYS.enter);
+    await app.type(KEYS.enter);
+    await app.settle();
+    expect(app.lastFrame() ?? "").toContain("no saved provider");
+
+    await app.type("Prompt after restore");
+    await app.type(KEYS.enter);
+    await app.settle();
+    expect(app.lastFrame() ?? "").toContain("Select a model first");
+    app.unmount();
+  });
+
+  it("does not let a deferred session load roll back a later /new", async () => {
+    const { store, configStore } = await makeStore();
+    const app = await mount({ sessionStore: store, configStore });
+    await store.saveSession(persistedSession(app.workspaceRoot));
+    const gate = asyncGate();
+    const originalLoad = app.controller.loadSession.bind(app.controller);
+    const loadSpy = vi.spyOn(app.controller, "loadSession").mockImplementation(async (id) => {
+      await gate.promise;
+      return originalLoad(id);
+    });
+
+    try {
+      await app.type("/sessions");
+      await app.type(KEYS.enter);
+      // Selecting the row starts the deferred replacement. Escape closes only the browser, leaving
+      // the load in flight so /new can claim the newer generation.
+      await app.type(KEYS.enter);
+      await app.type(KEYS.escape);
+      await app.type("/new");
+      await app.type(KEYS.enter);
+      await app.settle();
+      gate.release();
+      await app.settle();
+
+      const frame = app.lastFrame() ?? "";
+      expect(frame).not.toContain("First question");
+      expect(frame).not.toContain("Drafting a hypothesis");
+      const pointer = (await configStore.loadConfig()).lastSessionId;
+      expect(pointer).toEqual(expect.any(String));
+      expect(pointer).not.toBe("session-abc");
+      expect(loadSpy).toHaveBeenCalledWith("session-abc");
+    } finally {
+      loadSpy.mockRestore();
+      app.unmount();
+    }
+  });
+
+  it("restores a saved provider credential when resuming a session without fetching its catalog", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "researk-tui-session-provider-"));
+    cleanupPaths.push(directory);
+    const store = new SessionStore(path.join(directory, "sessions"));
+    const configStore = new AppConfigStore(
+      new FileConfigStore(path.join(directory, "config"), "app"),
+    );
+    const credentialStore = new FileCredentialStore(path.join(directory, "credentials"));
+    const providerRegistry = new PersistentProviderRegistry(
+      new FileConfigStore(path.join(directory, "providers"), "providers"),
+      credentialStore,
+      { TEST_KEY: "environment-secret" },
+    );
+    let catalogRequests = 0;
+    const harness: CliHarness = {
+      async *run(): AsyncIterable<RunEvent> {
+        // A resumed transcript must not start a Harness run.
+      },
+      async listModels() {
+        catalogRequests += 1;
+        return [descriptor("science")];
+      },
+    };
+    const app = await mount({
+      harness,
+      sessionStore: store,
+      configStore,
+      providerRegistry,
+      credentialStore,
+    });
+    await app.controller.persistProvider(
+      {
+        providerId: "compatible",
+        baseUrl: "https://example.test/v1/",
+        apiKeyEnvironmentVariable: "TEST_KEY",
+        kind: "compatible",
+      },
+      { TEST_KEY: "persisted-session-secret" },
+    );
+    await store.saveSession(
+      persistedSession(app.workspaceRoot, {
+        providerId: "compatible",
+        modelId: "compatible:science",
+        variantId: "high",
+        messages: [
+          { role: "user", content: "Question persisted-session-secret" },
+          { role: "assistant", content: "Follow-up answer" },
+        ],
+      }),
+    );
+    await app.type("/sessions");
+    await app.type(KEYS.enter);
+    await app.type(KEYS.enter);
+    await app.settle();
+
+    const resolved = await app.controller.resolveProvider("compatible");
+    expect(resolved?.credentialValues).toEqual({ TEST_KEY: "persisted-session-secret" });
+    expect(resolved?.credentialValues).not.toEqual({ TEST_KEY: "environment-secret" });
+    expect(catalogRequests).toBe(0);
+    const frame = app.lastFrame() ?? "";
+    expect(frame).toContain("Follow-up answer");
+    expect(frame).not.toContain("persisted-session-secret");
+    expect(frame).not.toContain("environment-secret");
+    app.unmount();
+  });
+
+  it("reuses a persisted custom-provider credential when reconnecting with a blank key", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "researk-tui-reconnect-custom-"));
+    cleanupPaths.push(directory);
+    const credentialStore = new FileCredentialStore(path.join(directory, "credentials"));
+    const providerRegistry = new PersistentProviderRegistry(
+      new FileConfigStore(path.join(directory, "providers"), "providers"),
+      credentialStore,
+      {},
+    );
+    const secret = "persisted-custom-reconnect-secret";
+    const app = await mount({
+      env: {},
+      providerRegistry,
+      credentialStore,
+    });
+    await app.controller.persistProvider(
+      {
+        providerId: "custom",
+        baseUrl: "https://example.test/v1/",
+        apiKeyEnvironmentVariable: "TEST_KEY",
+        kind: "compatible",
+      },
+      { TEST_KEY: secret },
+    );
+    const connectSpy = vi.spyOn(app.controller, "connect");
+    try {
+      await app.type("/provider");
+      await app.type(KEYS.enter);
+      await app.type(KEYS.down);
+      await app.type(KEYS.enter);
+      await app.type("custom");
+      await app.type(KEYS.tab);
+      await app.type("https://example.test/v2/");
+      await app.type(KEYS.tab);
+      await app.type(KEYS.enter);
+      await app.settle();
+
+      expect(connectSpy).toHaveBeenCalledWith(expect.objectContaining({ providerId: "custom" }), {
+        OPENAI_API_KEY: secret,
+      });
+      const profile = await providerRegistry.getProvider("custom");
+      expect(profile?.baseUrl).toBe("https://example.test/v2/");
+      expect(profile?.credentialEnvironmentVariable).toBe("OPENAI_API_KEY");
+      expect((await app.controller.resolveProvider("custom"))?.credentialValues).toEqual({
+        OPENAI_API_KEY: secret,
+      });
+      expect(app.lastFrame() ?? "").not.toContain(secret);
+    } finally {
+      app.unmount();
+    }
+  });
+
+  it("reuses a persisted OpenRouter credential when reconnecting with a blank key", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "researk-tui-reconnect-openrouter-"));
+    cleanupPaths.push(directory);
+    const credentialStore = new FileCredentialStore(path.join(directory, "credentials"));
+    const providerRegistry = new PersistentProviderRegistry(
+      new FileConfigStore(path.join(directory, "providers"), "providers"),
+      credentialStore,
+      {},
+    );
+    const secret = "persisted-openrouter-reconnect-secret";
+    const app = await mount({
+      env: {},
+      providerRegistry,
+      credentialStore,
+    });
+    await app.controller.persistProvider(
+      {
+        providerId: "openrouter",
+        baseUrl: "https://openrouter.ai/api/v1/",
+        apiKeyEnvironmentVariable: "OPENROUTER_API_KEY",
+        kind: "openrouter",
+      },
+      { OPENROUTER_API_KEY: secret },
+    );
+    const connectSpy = vi.spyOn(app.controller, "connect");
+    try {
+      await app.type("/provider");
+      await app.type(KEYS.enter);
+      await app.type(KEYS.enter);
+      await app.type(KEYS.enter);
+      await app.settle();
+
+      expect(connectSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ providerId: "openrouter" }),
+        { OPENROUTER_API_KEY: secret },
+      );
+      expect(app.lastFrame() ?? "").not.toContain(secret);
+    } finally {
+      app.unmount();
+    }
+  });
+
   it("autosaves a completed exchange as a session and updates the footer title", async () => {
     const { store, configStore } = await makeStore();
     const harness: CliHarness = {
@@ -1647,7 +1967,7 @@ describe("TUI session persistence", () => {
     app.unmount();
   });
 
-  it("starts a fresh untitled session with /new", async () => {
+  it("starts and persists a fresh empty session with /new", async () => {
     const { store, configStore } = await makeStore();
     const app = await mount({ sessionStore: store, configStore });
     await store.saveSession(persistedSession(app.workspaceRoot));
@@ -1663,8 +1983,124 @@ describe("TUI session persistence", () => {
     const frame = app.lastFrame() ?? "";
     expect(frame).toContain("/provider");
     expect(frame).not.toContain("First question");
-    expect((await configStore.loadConfig()).lastSessionId).toBeNull();
+    const pointer = (await configStore.loadConfig()).lastSessionId;
+    expect(pointer).toEqual(expect.any(String));
+    expect(pointer).not.toBe("session-abc");
+    if (pointer === null) throw new Error("new session pointer missing");
+    const fresh = await store.loadSession(pointer);
+    expect(fresh?.messages).toEqual([]);
+    expect(JSON.stringify(fresh)).not.toContain("API_KEY");
     app.unmount();
+  });
+
+  it("does not advance the session pointer when /new persistence fails", async () => {
+    const { store, configStore } = await makeStore();
+    const app = await mount({ sessionStore: store, configStore });
+    const saveSpy = vi
+      .spyOn(app.controller, "saveSession")
+      .mockResolvedValue({ ok: false, message: "Could not save the session." });
+    try {
+      await app.type("/new");
+      await app.type(KEYS.enter);
+      await app.settle();
+
+      expect(saveSpy).toHaveBeenCalledOnce();
+      expect((await configStore.loadConfig())?.lastSessionId ?? null).toBeNull();
+      expect(app.lastFrame() ?? "").toContain("Could not save the session.");
+    } finally {
+      app.unmount();
+    }
+  });
+
+  it("warns without changing the old pointer when config persistence fails", async () => {
+    const { store, configStore } = await makeStore();
+    const app = await mount({ sessionStore: store, configStore });
+    await app.controller.saveConfig({ sessionId: "old-session" });
+    const saveSpy = vi
+      .spyOn(app.controller, "saveConfig")
+      .mockResolvedValue({ ok: false, message: "Could not save configuration." });
+    try {
+      await app.type("/new");
+      await app.type(KEYS.enter);
+      await app.settle();
+
+      expect(saveSpy).toHaveBeenCalledWith({ sessionId: expect.any(String) });
+      expect((await configStore.loadConfig())?.lastSessionId).toBe("old-session");
+      expect(app.lastFrame() ?? "").toContain("Could not save configuration.");
+    } finally {
+      app.unmount();
+    }
+  });
+
+  it("keeps the mounted connected shell and selections when /new replaces the session", async () => {
+    const { store, configStore } = await makeStore();
+    const runs: RunRequest[] = [];
+    const harness: CliHarness = {
+      async *run(request): AsyncIterable<RunEvent> {
+        runs.push(request);
+        yield {
+          schemaVersion: 1,
+          runId: request.runId,
+          sequence: 0,
+          timestamp: "2026-08-10T00:00:00.000Z",
+          type: "text_delta",
+          delta: "Answer",
+        } as RunEvent;
+      },
+      async listModels() {
+        return [descriptor("science", ["low", "high"])];
+      },
+    };
+    const app = await mount({
+      harness,
+      files: { "paper.md": "staged research context" },
+      sessionStore: store,
+      configStore,
+      terminalWidth: 100,
+      terminalHeight: 24,
+    });
+    try {
+      await connectAndSelectModel(app);
+      await app.type("/variant");
+      await app.type(KEYS.enter);
+      await app.type(KEYS.down);
+      await app.type(KEYS.enter);
+      await app.type("/read paper.md");
+      await app.type(KEYS.enter);
+      await app.settle();
+      await app.type("Explain");
+      await app.type(KEYS.enter);
+      await app.settle();
+      expect(app.lastFrame() ?? "").toContain("Answer");
+
+      await app.type("/new");
+      await app.type(KEYS.enter);
+      await app.settle();
+      const frame = app.lastFrame() ?? "";
+      expect(frame).toContain("ask a question, or type / for commands");
+      expect(frame).not.toContain("Explain");
+      expect(frame).not.toContain("Answer");
+      expect(Math.max(...frame.split("\n").map((line) => line.length))).toBeLessThanOrEqual(100);
+
+      // The selected model and variant are still live after the session-only transition.
+      await app.type("/variant");
+      await app.type(KEYS.enter);
+      expect(app.lastFrame() ?? "").toContain("low");
+      await app.type(KEYS.escape);
+      const pointer = (await configStore.loadConfig()).lastSessionId;
+      expect(pointer).toEqual(expect.any(String));
+      if (pointer === null) throw new Error("new session pointer missing");
+      const fresh = await store.loadSession(pointer);
+      expect(fresh?.messages).toEqual([]);
+      expect(fresh?.providerId).toBe("local");
+      expect(fresh?.modelId).toBe("compatible:science");
+      expect(fresh?.variantId).toBe("low");
+      expect(
+        runs[0]?.messages.some((message) => message.content.includes("staged research context")),
+      ).toBe(true);
+    } finally {
+      app.unmount();
+    }
   });
 
   it("clears the in-memory conversation with /clear without touching saved sessions", async () => {
@@ -2116,7 +2552,9 @@ describe("TUI source and safety invariants combined", () => {
 });
 
 describe("TUI formula interaction", () => {
-  async function mountFormulaApp() {
+  async function mountFormulaApp(
+    options: Readonly<{ graphicsRuntime?: AppProps["graphicsRuntime"] }> = {},
+  ) {
     const harness: CliHarness = {
       async *run(): AsyncIterable<RunEvent> {
         yield {
@@ -2132,13 +2570,34 @@ describe("TUI formula interaction", () => {
         return [descriptor("science")];
       },
     };
-    const app = await mount({ harness });
+    const app = await mount({ harness, ...options });
     await connectAndSelectModel(app);
     await app.type("Explain formulas");
     await app.type(KEYS.enter);
     await app.settle();
     return app;
   }
+
+  it("keeps a color-disabled formula overlay exact-source with a capable runtime", async () => {
+    const runtime = createFormulaGraphicsRuntime({
+      capability: { cellPixels: { height: 20, width: 10 }, protocol: "kitty" },
+      renderer: async () => ({
+        height: 1,
+        pixels: new Uint8Array(4),
+        png: Uint8Array.of(0x89),
+        width: 1,
+      }),
+      stdout: { write: () => true },
+    });
+    const renderFormula = vi.spyOn(runtime, "renderFormula");
+    const app = await mountFormulaApp({ graphicsRuntime: runtime });
+    await app.type("/formula");
+    await app.type(KEYS.enter);
+
+    expect(app.lastFrame() ?? "").toContain("Exact source \u00b7 typeset preview unavailable");
+    expect(renderFormula).not.toHaveBeenCalled();
+    app.unmount();
+  });
 
   it("opens, navigates, and toggles the exact-source view", async () => {
     const app = await mountFormulaApp();

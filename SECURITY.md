@@ -36,15 +36,40 @@ are unsupported by the CLI. The experimental generic OpenAI-compatible adapter s
 requests only to the user-supplied base URL. It is not verified native support for any named
 provider.
 
-The current CLI reads a credential from an explicitly named environment variable. It does not
-persist the value. Errors and HTTP metadata are redacted. Operating-system credential storage and
-persistent configuration or sessions are not implemented.
+Interactive TUI provider profiles are global local configuration. A key entered through
+`/provider` is written to the provider-scoped OS keyring entry provided by `@napi-rs/keyring`;
+the provider profile stores only the reference and the explicit environment-variable name. The
+persisted key is checked before the environment fallback. Keys are not copied into sessions,
+ordinary config, prompts, events, logs, or crash output. One-shot commands may still resolve an
+explicit environment variable for their lifetime and do not store it.
+
+If the native keyring is unavailable or locked, Researk does not silently fall back to plaintext
+files. Provider setup reports that persistence is unavailable, and the user can use the explicit
+environment fallback or restore a working OS keyring. A secure-keyring implementation is not a
+protection against a compromised host or account. The underlying keyring-rs v1 API documents
+macOS Keychain Services, Windows Credential Manager, and *nix Secret Service; backend availability
+depends on the host session. The source smoke test covers Windows, with macOS/Linux coverage a
+release-matrix requirement.
+
+Persisted session files are untrusted input. Reads enforce file, message, metadata, and control-
+character bounds, validate provider/model/variant identities, and redact known provider secrets
+before titles or messages enter the TUI. A malformed, oversized, foreign-workspace, or unavailable
+session is ignored or requires reconnection; it cannot authorize a provider or tool action.
 
 Model responses are untrusted input. Terminal output removes or escapes unsafe control sequences.
-In a positively detected iTerm2 TTY, display math can pass through the bounded local MathJax SVG
-backend, in-memory resvg rasterization, and the trusted iTerm2 inline-image emitter. Exact LaTeX
-source is used for inline math and for unsupported, non-TTY, accessible, raw, JSON, or failed-render
-paths. Kitty and Sixel are unsupported, and no system TeX execution exists.
+The renderer selects iTerm2, Kitty, or Sixel only from centralized, positive capability evidence.
+The local graphics path is bundled MathJax 4.1.3 -> validated path-only SVG ->
+`@resvg/resvg-js` 2.6.2 rasterization. It does not invoke a shell, system TeX, external helper,
+filesystem, or network request. Exact original LaTeX is the lossless fallback for unsupported,
+uncertain, non-TTY, accessible, raw, JSON, clipped, stale, and failed-render paths. Theme-derived
+foreground/background values affect graphics and cache keys; rendered pixels are disposable and
+never become session content.
+
+The bundled renderer and keyring native packages are lock-pinned and reviewed in
+[ADR 0011](docs/decisions/0011-runtime-dependency-review.md) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Official artifacts must retain the recorded
+license/notice information and their SPDX SBOM must cover the JS packages and all bundled native
+optional records.
 
 Scholarly web tools, general tool execution, and the paper-reproduction runner are not implemented.
 Future web pages, papers, supplements, repositories, and datasets must remain untrusted. They must

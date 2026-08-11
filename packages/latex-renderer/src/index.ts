@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { Worker } from "node:worker_threads";
 import {
   latexSvgRendererLimits as coreLimits,
+  LatexSvgRenderError,
   type LatexSvgRenderErrorCode,
   type LatexSvgRenderRequest,
   type LatexSvgRenderResult,
@@ -13,6 +14,11 @@ import {
   type WorkerErrorCode,
   type WorkerRenderRequest,
 } from "./protocol.js";
+import {
+  type LatexRenderStyle,
+  type NormalizedLatexRenderStyle,
+  normalizeLatexRenderStyle,
+} from "./style.js";
 
 const maximumExpressionsPerResponse = 256;
 const maximumCumulativeRenderMs = 5_000;
@@ -27,12 +33,19 @@ const initializationTimeoutMs = 5_000;
  */
 const maximumWarmRetries = 3;
 
-export { LatexSvgRenderError } from "./core.js";
 export type {
   LatexSvgRenderErrorCode,
   LatexSvgRenderRequest,
   LatexSvgRenderResult,
 } from "./core.js";
+export { LatexSvgRenderError } from "./core.js";
+export { latexRendererVersion, rendererIdentity, rendererVersion } from "./protocol.js";
+export type {
+  FormulaRenderStyle,
+  LatexRenderStyle,
+  NormalizedLatexRenderStyle,
+} from "./style.js";
+export { latexRenderStyleLimits, normalizeLatexColor, normalizeLatexRenderStyle } from "./style.js";
 
 export const latexSvgRendererLimits = Object.freeze({
   ...coreLimits,
@@ -96,6 +109,13 @@ export class LatexRenderBudget {
   get renderTimeMs(): number {
     return this.#renderTimeMs;
   }
+}
+
+export interface LatexRenderOptions {
+  readonly budget?: LatexRenderBudget;
+  readonly signal?: AbortSignal;
+  /** Optional convenience form; an explicit request.style takes precedence. */
+  readonly style?: LatexRenderStyle;
 }
 
 export interface ManagedLatexRendererOptions {
@@ -177,8 +197,18 @@ export class ManagedLatexRenderer {
     if (this.#closed)
       return Promise.reject(new ManagedLatexRenderError("worker_failed", "Renderer is closed."));
     if (signal?.aborted === true) return Promise.reject(cancelledError());
+    let normalizedRequest: LatexSvgRenderRequest;
+    try {
+      normalizedRequest = normalizePublicRequest(request);
+    } catch (error) {
+      return Promise.reject(
+        new ManagedLatexRenderError("invalid_input", "LaTeX render request is invalid.", {
+          cause: error instanceof Error ? error : undefined,
+        }),
+      );
+    }
     // Enforce the byte ceiling before an untrusted payload is copied into worker messaging.
-    if (Buffer.byteLength(request.tex, "utf8") > coreLimits.maximumInputBytes) {
+    if (Buffer.byteLength(normalizedRequest.tex, "utf8") > coreLimits.maximumInputBytes) {
       return Promise.reject(
         new ManagedLatexRenderError("input_limit", "TeX input exceeds the renderer limit."),
       );
@@ -190,7 +220,7 @@ export class ManagedLatexRenderer {
     }
     return new Promise((resolve, reject) => {
       const job: Job = {
-        request,
+        request: normalizedRequest,
         format,
         budget,
         ...(signal === undefined ? {} : { signal }),
@@ -395,6 +425,7 @@ export class ManagedLatexRenderer {
           tex: job.request.tex,
           display,
           format: job.format,
+          ...(job.request.style === undefined ? {} : { style: job.request.style }),
         };
         slot.worker.postMessage(message);
       });
@@ -488,10 +519,10 @@ export async function closeManagedLatexRenderer(): Promise<void> {
 
 export async function renderTexToSvg(
   request: LatexSvgRenderRequest,
-  options: { readonly budget?: LatexRenderBudget; readonly signal?: AbortSignal } = {},
+  options: LatexRenderOptions = {},
 ): Promise<LatexSvgRenderResult> {
   return getManagedLatexRenderer().render(
-    request,
+    requestWithStyleOption(request, options.style),
     options.budget ?? new LatexRenderBudget(),
     options.signal,
   );
@@ -507,10 +538,10 @@ export interface LatexPngRenderResult extends LatexSvgRenderResult {
 
 export async function renderTexToPng(
   request: LatexSvgRenderRequest,
-  options: { readonly budget?: LatexRenderBudget; readonly signal?: AbortSignal } = {},
+  options: LatexRenderOptions = {},
 ): Promise<LatexPngRenderResult> {
   const result = await getManagedLatexRenderer().render(
-    request,
+    requestWithStyleOption(request, options.style),
     options.budget ?? new LatexRenderBudget(),
     options.signal,
     "png",
@@ -524,6 +555,21 @@ export async function renderTexToPng(
     throw new ManagedLatexRenderError("worker_failed", "Renderer returned an incomplete image.");
   }
   return result as LatexPngRenderResult;
+}
+
+function requestWithStyleOption(
+  request: LatexSvgRenderRequest,
+  style: LatexRenderOptions["style"],
+): LatexSvgRenderRequest {
+  if (
+    style === undefined ||
+    typeof request !== "object" ||
+    request === null ||
+    request.style !== undefined
+  ) {
+    return request;
+  }
+  return { ...request, style };
 }
 
 /**
@@ -567,4 +613,28 @@ function describeWorkerError(code: WorkerErrorCode): string {
     case "render_failed":
       return "The isolated LaTeX renderer could not render the expression.";
   }
+}
+
+/**
+ * Validates caller input before it enters the queue and canonicalizes style values once. This keeps
+ * malformed styles from poisoning a worker and ensures the strict worker request contains the same
+ * pixel-affecting values that the caller supplied, even if the input object is mutated later.
+ */
+function normalizePublicRequest(request: LatexSvgRenderRequest): LatexSvgRenderRequest {
+  if (typeof request !== "object" || request === null || Array.isArray(request)) {
+    throw new LatexSvgRenderError("invalid_input", "LaTeX render request must be an object.");
+  }
+  if (typeof request.tex !== "string" || request.tex.length === 0) {
+    throw new LatexSvgRenderError("invalid_input", "TeX input must be a non-empty string.");
+  }
+  if (request.display !== undefined && typeof request.display !== "boolean") {
+    throw new LatexSvgRenderError("invalid_input", "LaTeX display mode must be a boolean.");
+  }
+
+  const style: NormalizedLatexRenderStyle | undefined = normalizeLatexRenderStyle(request.style);
+  return Object.freeze({
+    ...(request.display === undefined ? {} : { display: request.display }),
+    ...(style === undefined ? {} : { style }),
+    tex: request.tex,
+  });
 }

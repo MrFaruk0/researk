@@ -2,7 +2,13 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { autoTitle, type Session, SessionStore } from "../../src/config/sessions.js";
+import {
+  autoTitle,
+  MAX_SESSION_MESSAGE_CHARACTERS,
+  MAX_SESSION_MESSAGES,
+  type Session,
+  SessionStore,
+} from "../../src/config/sessions.js";
 
 const cleanups: string[] = [];
 
@@ -97,6 +103,98 @@ describe("SessionStore", () => {
     await writeFile(path.join(directory, "broken.json"), "{ nope", "utf8");
     await expect(store.loadSession("broken")).resolves.toBeNull();
     await expect(store.listSessions()).resolves.toEqual([]);
+  });
+
+  it("rejects untrusted provider, model, variant, and message metadata", async () => {
+    const { directory, store } = await fixture();
+    await writeFile(
+      path.join(directory, "invalid.json"),
+      JSON.stringify({
+        ...makeSession(),
+        providerId: "bad provider",
+        modelId: "compatible:science",
+        variantId: "maximum",
+        messages: [{ role: "unknown", content: "ignored" }],
+      }),
+      "utf8",
+    );
+    await expect(store.loadSession("invalid")).resolves.toBeNull();
+  });
+
+  it("rejects unsupported schema versions and oversized records before state hydration", async () => {
+    const { directory, store } = await fixture();
+    await writeFile(
+      path.join(directory, "future.json"),
+      JSON.stringify({ ...makeSession(), schemaVersion: 999 }),
+      "utf8",
+    );
+    await writeFile(
+      path.join(directory, "too-many.json"),
+      JSON.stringify({
+        ...makeSession(),
+        messages: Array.from({ length: MAX_SESSION_MESSAGES + 1 }, () => ({
+          role: "user",
+          content: "x",
+        })),
+      }),
+      "utf8",
+    );
+    await writeFile(
+      path.join(directory, "too-large.json"),
+      JSON.stringify({
+        ...makeSession(),
+        messages: [{ role: "user", content: "x".repeat(MAX_SESSION_MESSAGE_CHARACTERS + 1) }],
+      }),
+      "utf8",
+    );
+    await expect(store.loadSession("future")).resolves.toBeNull();
+    await expect(store.loadSession("too-many")).resolves.toBeNull();
+    await expect(store.loadSession("too-large")).resolves.toBeNull();
+  });
+
+  it("rejects unknown or unsafe metadata while preserving ordinary canonical source", async () => {
+    const { directory, store } = await fixture();
+    const canonical = String.raw`\\section{Results} $E=mc^2$`;
+    await writeFile(
+      path.join(directory, "extra.json"),
+      JSON.stringify({ ...makeSession(), extra: "unexpected" }),
+      "utf8",
+    );
+    await writeFile(
+      path.join(directory, "control.json"),
+      JSON.stringify({ ...makeSession(), title: "unsafe\u001b[31m" }),
+      "utf8",
+    );
+    await writeFile(
+      path.join(directory, "ordinary.json"),
+      JSON.stringify({
+        ...makeSession(),
+        messages: [{ role: "assistant", content: canonical }],
+      }),
+      "utf8",
+    );
+    await expect(store.loadSession("extra")).resolves.toBeNull();
+    await expect(store.loadSession("control")).resolves.toBeNull();
+    await expect(store.loadSession("ordinary")).resolves.toMatchObject({
+      messages: [{ role: "assistant", content: canonical }],
+    });
+  });
+
+  it("normalizes legacy sessions with absent identity fields to null", async () => {
+    const { directory, store } = await fixture();
+    const legacy = makeSession();
+    const {
+      providerId: _providerId,
+      modelId: _modelId,
+      variantId: _variantId,
+      ...withoutIdentity
+    } = legacy;
+    await writeFile(path.join(directory, "legacy.json"), JSON.stringify(withoutIdentity), "utf8");
+    await expect(store.loadSession("legacy")).resolves.toMatchObject({
+      providerId: null,
+      modelId: null,
+      variantId: null,
+    });
   });
 
   it("skips a non-session JSON file in the list", async () => {

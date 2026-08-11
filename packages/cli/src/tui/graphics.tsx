@@ -1,7 +1,14 @@
 import type { Writable } from "node:stream";
-import { renderTexToPng } from "@researk/latex-renderer";
+import type { LatexRenderBudget } from "@researk/latex-renderer";
 import { Box, type DOMElement, measureElement, Text, type TextProps } from "ink";
 import * as React from "react";
+import {
+  createTerminalCapabilities,
+  type FormulaRendererDescriptor,
+  type FormulaRendererId,
+  selectFormulaRenderer,
+  type TerminalCapabilities,
+} from "../rendering/capabilities.js";
 import { buildKittyPng, kittyDeleteById } from "../rendering/kitty.js";
 import {
   encodeSixel,
@@ -15,12 +22,17 @@ import type {
   TerminalCapabilityProbeResult,
 } from "../rendering/terminal-query.js";
 import {
+  DEFAULT_FORMULA_RENDER_STYLE,
   type FormulaRaster,
   FormulaRasterCache,
   type FormulaRasterCacheOptions,
   type FormulaRasterOutcome,
   type FormulaRasterRenderer,
   type FormulaRasterRenderOptions,
+  type FormulaRenderStyle,
+  latexFormulaRasterRenderer,
+  type NormalizedFormulaRenderStyle,
+  normalizeFormulaRenderStyle,
 } from "./formula-renderer.js";
 import { displayText } from "./state.js";
 
@@ -50,6 +62,7 @@ export interface FormulaGraphicsTerminalSize {
 export type FormulaGraphicsCapability =
   | TerminalCapability
   | TerminalCapabilityProbeResult
+  | TerminalCapabilities
   | Readonly<{
       readonly protocol: TerminalGraphicsProtocol;
       readonly reason?: string;
@@ -100,6 +113,10 @@ export interface FormulaGraphicsRuntimeOptions {
   readonly rasterCache?: FormulaRasterCache;
   readonly renderer?: FormulaRasterRenderer;
   readonly cacheOptions?: FormulaRasterCacheOptions;
+  /** Explicit pixel-affecting style; omitted styles use a foreground-only safe default. */
+  readonly style?: FormulaRenderStyle;
+  /** Cache/renderer identity used when style.rendererVersion is omitted. */
+  readonly rendererVersion?: string;
   readonly measure?: (ref: DOMElement) => FormulaGraphicsMetrics | undefined;
   readonly maxVisibleSlots?: number;
   readonly maxFrameBytes?: number;
@@ -110,6 +127,7 @@ export interface FormulaGraphicsRuntimeOptions {
 export interface FormulaGraphicsRenderRequest {
   readonly tex: string;
   readonly display: boolean;
+  readonly style?: FormulaRenderStyle;
 }
 
 interface RegisteredFormula extends FormulaGraphicsRegistration {
@@ -170,6 +188,7 @@ type RuntimeListener = () => void;
 export class FormulaGraphicsRuntime {
   readonly #stdout: FormulaGraphicsStdout;
   readonly #capability: FormulaGraphicsCapability;
+  readonly #rendererSelection: FormulaRendererDescriptor;
   readonly #cache: FormulaRasterCache;
   readonly #measure: (ref: DOMElement) => FormulaGraphicsMetrics | undefined;
   readonly #maxVisibleSlots: number;
@@ -181,10 +200,14 @@ export class FormulaGraphicsRuntime {
   #columns: number;
   #rows: number;
   #generation = 0;
+  #styleRevision = 0;
+  #style: NormalizedFormulaRenderStyle = DEFAULT_FORMULA_RENDER_STYLE;
   #snapshot: SnapshotFrame | undefined;
   #visibleKeys = new Set<string>();
   #visibleRegistrations = new Map<string, RegisteredFormula>();
   #placed: PlacedFormula[] = [];
+  /** Confirmed placements waiting for a source frame before their cleanup is emitted. */
+  #pendingCleanup = new Set<PlacedFormula>();
   #nextImageId = 1;
   #nextPlacementId = 1;
   #writeTail: Promise<unknown> | undefined;
@@ -222,6 +245,7 @@ export class FormulaGraphicsRuntime {
     const options = normalizeRuntimeOptions(optionsOrStdout, capability, terminalSize, seam);
     this.#stdout = options.stdout;
     this.#capability = options.capability;
+    this.#rendererSelection = selectFormulaRenderer(rendererCapabilityInput(options.capability));
     this.#columns = boundedDimension(options.terminalSize?.columns ?? 80, MAX_TERMINAL_COLUMNS);
     this.#rows = boundedDimension(options.terminalSize?.rows ?? 24, MAX_TERMINAL_ROWS);
     this.#measure = options.measure ?? measureElement;
@@ -236,14 +260,85 @@ export class FormulaGraphicsRuntime {
       MAX_FRAME_BYTES,
     );
     this.#requestFrame = options.requestFrame;
+    const rendererVersion =
+      options.rendererVersion ??
+      options.cacheOptions?.rendererVersion ??
+      DEFAULT_FORMULA_RENDER_STYLE.rendererVersion;
+    // No terminal background is knowable at runtime unless the semantic theme supplies one.
+    // Keep the compatibility foreground default for direct embedders, but never manufacture a
+    // dark/white Sixel canvas; P2=1 leaves transparent raster padding untouched.
+    const initialStyle = options.style ?? { foreground: DEFAULT_FORMULA_RENDER_STYLE.foreground };
+    const normalizedStyle = normalizeFormulaRenderStyle(
+      { display: true, style: initialStyle, tex: "x" },
+      {},
+      rendererVersion,
+    );
+    if (normalizedStyle === undefined) throw new TypeError("Invalid formula graphics style");
+    this.#style = normalizedStyle;
     this.#cache =
       options.cache ??
       options.rasterCache ??
-      new FormulaRasterCache(options.renderer ?? renderTexToPng, options.cacheOptions);
+      new FormulaRasterCache(options.renderer ?? latexFormulaRasterRenderer, options.cacheOptions);
   }
 
   public get capability(): FormulaGraphicsCapability {
     return this.#capability;
+  }
+
+  /** The central capability layer's selected protocol, or exact-source when graphics are unsafe. */
+  public get rendererId(): FormulaRendererId {
+    return this.#rendererSelection.id;
+  }
+
+  public get renderer(): FormulaRendererDescriptor {
+    return this.#rendererSelection;
+  }
+
+  /** Current validated pixel-affecting style used by formula renders. */
+  public get style(): FormulaRenderStyle {
+    return this.#style;
+  }
+
+  /** Increments when a style update invalidates existing raster registrations. */
+  public get styleRevision(): number {
+    return this.#styleRevision;
+  }
+
+  /**
+   * Update the style without remounting the runtime. Existing registrations and placements are
+   * removed, in-flight renders are aborted, and subscribed FormulaGraphic nodes rerender against a
+   * cache key containing the new style and renderer version. Invalid styles fail closed.
+   */
+  public setStyle(style: FormulaRenderStyle): boolean {
+    if (this.#disposed) return false;
+    const normalized = normalizeFormulaRenderStyle(
+      { display: true, style, tex: "x" },
+      {},
+      this.#style.rendererVersion,
+    );
+    if (normalized === undefined || sameFormulaStyle(this.#style, normalized)) return false;
+    this.#style = normalized;
+    this.#styleRevision += 1;
+    this.#generation += 1;
+    this.#snapshot = undefined;
+    this.#registrations.clear();
+    this.#visibleKeys.clear();
+    this.#visibleRegistrations.clear();
+    for (const controller of this.#controllers) controller.abort();
+    this.#controllers.clear();
+    this.#scheduleAllPlacementCleanup();
+    this.#notify();
+    try {
+      this.#requestFrame?.();
+    } catch {
+      // A frame scheduler belongs to the embedding lifecycle and cannot invalidate the style.
+    }
+    return true;
+  }
+
+  /** Descriptive alias for integrations that call theme changes an update. */
+  public updateStyle(style: FormulaRenderStyle): boolean {
+    return this.setStyle(style);
   }
 
   public get cache(): FormulaRasterCache {
@@ -259,7 +354,12 @@ export class FormulaGraphicsRuntime {
   }
 
   public supportsGraphics(): boolean {
-    return this.#cellPixels() !== undefined;
+    // The live overlay owns Kitty/Sixel placement bytes. iTerm2 remains available to the one-shot
+    // renderer, but without a live placement implementation it must stay exact-source here.
+    return (
+      (this.#rendererSelection.id === "kitty" || this.#rendererSelection.id === "sixel") &&
+      this.#cellPixels() !== undefined
+    );
   }
 
   /** Return a bounded cell reservation for a validated raster, or undefined for source fallback. */
@@ -276,7 +376,11 @@ export class FormulaGraphicsRuntime {
     if (this.#disposed || !this.supportsGraphics()) {
       return Promise.resolve({ ok: false, reason: "renderer_failed" });
     }
-    return this.#cache.render(request, options);
+    const style = request.style ?? options.style ?? this.#style;
+    return this.#cache.render(
+      { display: request.display, style, tex: request.tex },
+      { ...options, style },
+    );
   }
 
   /** Alias kept small and convenient for component and embedding callers. */
@@ -354,6 +458,9 @@ export class FormulaGraphicsRuntime {
     this.#registrations.delete(key);
     this.#visibleKeys.delete(key);
     this.#visibleRegistrations.delete(key);
+    for (const placed of this.#placed) {
+      if (placed.placement.placementKey === key) this.#pendingCleanup.add(placed);
+    }
     this.#notify();
     return true;
   }
@@ -367,7 +474,10 @@ export class FormulaGraphicsRuntime {
     this.#generation += 1;
     this.#columns = boundedDimension(columns, MAX_TERMINAL_COLUMNS);
     this.#rows = boundedDimension(rows, MAX_TERMINAL_ROWS);
-    this.#clearPlacedSynchronously();
+    // A prior fallback frame has already exposed exact source. Only then is it safe to remove a
+    // placement that was not replaced. While a write is blocked, retain the confirmed image so a
+    // stale generation cannot leave the FormulaGraphic source suppressed over a blank terminal.
+    if (!this.#afterFrameBusy) this.#flushPendingPlacementCleanup();
 
     const formulas: SnapshotFormula[] = [];
     if (this.supportsGraphics() && this.#columns > 0 && this.#rows > 1) {
@@ -410,6 +520,9 @@ export class FormulaGraphicsRuntime {
       ) {
         retainedKeys.add(formula.registration.key);
       }
+    }
+    for (const placed of this.#placed) {
+      if (!retainedKeys.has(placed.placement.placementKey)) this.#pendingCleanup.add(placed);
     }
     this.#snapshot = { generation: this.#generation, formulas };
     // Preserve already-successful graphical boxes that remain eligible. New/unproven formulas
@@ -464,6 +577,7 @@ export class FormulaGraphicsRuntime {
     this.#visibleKeys.clear();
     this.#visibleRegistrations.clear();
     this.#snapshot = undefined;
+    this.#pendingCleanup.clear();
     for (const controller of this.#controllers) controller.abort();
     this.#controllers.clear();
     this.#clearPlacedSynchronously();
@@ -485,7 +599,8 @@ export class FormulaGraphicsRuntime {
     const snapshot = this.#snapshot;
     if (snapshot === undefined || snapshot.generation !== generation) return;
 
-    const nextPlaced: PlacedFormula[] = [];
+    const previousByKey = new Map<string, PlacedFormula>();
+    for (const placed of this.#placed) previousByKey.set(placed.placement.placementKey, placed);
     let frameBytes = 0;
     for (const item of snapshot.formulas) {
       if (this.#disposed || generation !== this.#generation) return;
@@ -493,44 +608,77 @@ export class FormulaGraphicsRuntime {
         this.#setVisible(item.registration.key, false);
         continue;
       }
+      const previous = previousByKey.get(item.registration.key);
       const built = this.#buildPlacement(item, frameBytes);
       if (built === undefined) {
+        // A confirmed placement is safer than suppressing source while a replacement cannot be
+        // emitted. A changed registration cannot reuse the old pixels, so it remains source-only
+        // and its old placement is cleaned after that source frame is visible.
+        if (
+          previous !== undefined &&
+          this.#visibleKeys.has(item.registration.key) &&
+          this.#visibleRegistrations.get(item.registration.key) === item.registration
+        ) {
+          continue;
+        }
+        if (previous !== undefined) this.#pendingCleanup.add(previous);
         this.#setVisible(item.registration.key, false);
         continue;
       }
-      frameBytes += built.bytes;
       const placed: PlacedFormula =
         built.protocol === "kitty"
           ? { placement: built.placement, protocol: "kitty" }
           : { placement: built.placement, protocol: "sixel" };
+      const sequence = this.#replacementSequence(previous, built.sequence);
+      if (
+        sequence === undefined ||
+        !withinFrameBudget(frameBytes, sequence.length, this.#maxFrameBytes)
+      ) {
+        // Keep the prior confirmed image in place when a replacement would exceed a protocol or
+        // frame bound. It is preferable to exact source being temporarily hidden over nothing.
+        if (
+          previous === undefined ||
+          !this.#visibleKeys.has(item.registration.key) ||
+          this.#visibleRegistrations.get(item.registration.key) !== item.registration
+        ) {
+          if (previous !== undefined) this.#pendingCleanup.add(previous);
+          this.#setVisible(item.registration.key, false);
+        }
+        continue;
+      }
+      frameBytes += sequence.length;
       // Track before the write can yield on backpressure. A resize/dispose can therefore clear an
       // image whose stdout.write returned false, while generation-aware queued writes are skipped.
       this.#placed.push(placed);
       try {
-        const result = await this.#queueWrite(built.sequence, generation);
+        const result = await this.#queueWrite(sequence, generation);
         if (result === "stale") {
           this.#removePlaced(placed);
           // A newer beforeFrame owns visibility now; an old stale continuation must not clear it.
-          if (generation === this.#generation) {
+          if (generation === this.#generation && previous === undefined) {
             this.#setVisible(item.registration.key, false);
           }
           continue;
         }
       } catch {
+        this.#removePlaced(placed);
+        if (previous !== undefined) this.#pendingCleanup.add(previous);
         this.#fallbackSnapshot(generation);
         return;
       }
-      if (this.#disposed || generation !== this.#generation) return;
-      nextPlaced.push(placed);
+      if (this.#disposed || generation !== this.#generation) {
+        this.#pendingCleanup.add(placed);
+        return;
+      }
+      this.#confirmReplacement(previous, placed);
       this.#setVisible(item.registration.key, true, item.registration);
     }
-    if (!this.#disposed && generation === this.#generation) this.#placed = nextPlaced;
   }
 
   #buildPlacement(item: SnapshotFormula, frameBytes: number): BuiltPlacement | undefined {
     const row = item.metrics.y + 1;
     const column = item.metrics.x + 1;
-    if (this.#capability.protocol === "kitty") {
+    if (this.#rendererSelection.id === "kitty") {
       const imageId = this.#allocateId("image");
       const placementId = this.#allocateId("placement");
       if (imageId === undefined || placementId === undefined) return undefined;
@@ -566,8 +714,11 @@ export class FormulaGraphicsRuntime {
       };
     }
 
-    if (this.#capability.protocol !== "sixel") return undefined;
-    const encoded = encodeSixel(item.registration.raster);
+    if (this.#rendererSelection.id !== "sixel") return undefined;
+    const encoded = encodeSixel({
+      ...item.registration.raster,
+      ...(this.#style.background === undefined ? {} : { background: this.#style.background }),
+    });
     if (!encoded.ok) return undefined;
     const sequence = sixelPlacementSequence(row, column, encoded);
     if (!withinFrameBudget(frameBytes, sequence.length, this.#maxFrameBytes)) return undefined;
@@ -586,22 +737,27 @@ export class FormulaGraphicsRuntime {
   }
 
   #cellPixels(): CellPixelDimensions | undefined {
-    if (this.#capability.protocol === "kitty") {
+    if (this.#rendererSelection.id === "kitty") {
       const capability = this.#capability as FormulaGraphicsCapability & {
+        readonly evidence?: Readonly<{
+          readonly kittyResponse?: Readonly<{ readonly explicitOk?: boolean }>;
+          readonly cellPixels?: CellPixelDimensions;
+        }>;
         readonly kittyResponse?: Readonly<{ readonly explicitOk?: boolean }>;
         readonly cellPixels?: CellPixelDimensions;
       };
-      const explicit = capability.kittyResponse?.explicitOk;
+      const explicit =
+        capability.kittyResponse?.explicitOk ?? capability.evidence?.kittyResponse?.explicitOk;
       if (explicit === false) return undefined;
-      const returned = capability.cellPixels;
+      const returned = capability.cellPixels ?? capability.evidence?.cellPixels;
       return isCellPixels(returned) ? returned : undefined;
     }
-    if (this.#capability.protocol === "sixel") {
-      const cellPixels = (
-        this.#capability as FormulaGraphicsCapability & {
-          readonly cellPixels?: CellPixelDimensions;
-        }
-      ).cellPixels;
+    if (this.#rendererSelection.id === "sixel") {
+      const capability = this.#capability as FormulaGraphicsCapability & {
+        readonly cellPixels?: CellPixelDimensions;
+        readonly evidence?: Readonly<{ readonly cellPixels?: CellPixelDimensions }>;
+      };
+      const cellPixels = capability.cellPixels ?? capability.evidence?.cellPixels;
       return isCellPixels(cellPixels) ? cellPixels : undefined;
     }
     return undefined;
@@ -631,6 +787,54 @@ export class FormulaGraphicsRuntime {
   #removePlaced(target: PlacedFormula): void {
     const index = this.#placed.indexOf(target);
     if (index >= 0) this.#placed.splice(index, 1);
+    this.#pendingCleanup.delete(target);
+  }
+
+  #replacementSequence(previous: PlacedFormula | undefined, sequence: string): string | undefined {
+    if (previous === undefined || previous.protocol !== "sixel") return sequence;
+    const clear = sixelClearSequence(previous.placement);
+    if (clear === undefined) return undefined;
+    // Sixel has no image identity. Clear and replacement must cross the stream in this order as a
+    // single queued write, so backpressure cannot expose a blank interval between them.
+    return clear + sequence;
+  }
+
+  #confirmReplacement(previous: PlacedFormula | undefined, replacement: PlacedFormula): void {
+    if (previous === undefined || previous === replacement) return;
+    if (previous.protocol === "kitty") {
+      const sequence = kittyDeleteById(previous.placement.imageId);
+      if (sequence !== undefined) this.#writeCleanupSynchronously(sequence);
+    }
+    // Sixel cleanup was ordered inside the replacement write. Kitty cleanup was emitted only after
+    // the new image write completed, so either path now has one confirmed placement per key.
+    this.#removePlaced(previous);
+  }
+
+  #scheduleAllPlacementCleanup(): void {
+    for (const placed of this.#placed) this.#pendingCleanup.add(placed);
+  }
+
+  #flushPendingPlacementCleanup(): void {
+    if (this.#writeBroken || this.#pendingCleanup.size === 0) return;
+    for (const placed of [...this.#pendingCleanup]) {
+      if (!this.#placed.includes(placed)) {
+        this.#pendingCleanup.delete(placed);
+        continue;
+      }
+      this.#clearPlacementSynchronously(placed);
+    }
+  }
+
+  #clearPlacementSynchronously(placed: PlacedFormula): void {
+    if (this.#writeBroken) return;
+    if (placed.protocol === "kitty") {
+      const sequence = kittyDeleteById(placed.placement.imageId);
+      if (sequence !== undefined) this.#writeCleanupSynchronously(sequence);
+    } else {
+      const sequence = sixelClearSequence(placed.placement);
+      if (sequence !== undefined) this.#writeCleanupSynchronously(sequence);
+    }
+    this.#removePlaced(placed);
   }
 
   #clearPlacedSynchronously(): void {
@@ -649,6 +853,7 @@ export class FormulaGraphicsRuntime {
         if (sequence !== undefined) this.#writeCleanupSynchronously(sequence);
       }
     }
+    this.#pendingCleanup.clear();
   }
 
   /**
@@ -728,6 +933,11 @@ export class FormulaGraphicsRuntime {
     const snapshot = this.#snapshot;
     if (snapshot === undefined || snapshot.generation !== generation) return;
     for (const formula of snapshot.formulas) {
+      for (const placed of this.#placed) {
+        if (placed.placement.placementKey === formula.registration.key) {
+          this.#pendingCleanup.add(placed);
+        }
+      }
       this.#setVisible(formula.registration.key, false);
     }
   }
@@ -794,6 +1004,10 @@ export interface FormulaGraphicProps {
   readonly inline?: boolean;
   readonly clipRef?: FormulaGraphicsRefLike;
   readonly selected?: boolean;
+  /** Stable response/message budget shared by every formula slot in the assistant entry. */
+  readonly renderBudget?: LatexRenderBudget;
+  /** Explicit validated style for this raster; runtime style is used when omitted. */
+  readonly renderStyle?: FormulaRenderStyle;
   readonly style?: FormulaGraphicStyle;
 }
 
@@ -809,12 +1023,21 @@ export function FormulaGraphic(props: FormulaGraphicProps): React.ReactElement {
   const ref = React.useRef<DOMElement | null>(null);
   const [outcome, setOutcome] = React.useState<FormulaRasterOutcome | undefined>(undefined);
   const supported = props.runtime.supportsGraphics();
+  const styleRevision = React.useSyncExternalStore(
+    (listener) => props.runtime.subscribe(listener),
+    () => props.runtime.styleRevision,
+    () => 0,
+  );
   const visible = React.useSyncExternalStore(
     (listener) => props.runtime.subscribe(listener),
     () => props.runtime.isVisible(formulaKey),
     () => false,
   );
+  const renderStyle = props.renderStyle;
 
+  // styleRevision is an external-store invalidation token. It intentionally reruns this effect
+  // even though the render request itself only captures the validated style object.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: styleRevision invalidates the raster without changing props
   React.useEffect(() => {
     setOutcome(undefined);
     if (!supported || props.runtime.disposed || tex.length === 0) return undefined;
@@ -822,7 +1045,17 @@ export function FormulaGraphic(props: FormulaGraphicProps): React.ReactElement {
     const release = props.runtime.trackRender(controller);
     let mounted = true;
     void props.runtime
-      .renderFormula({ display, tex }, { signal: controller.signal })
+      .renderFormula(
+        {
+          display,
+          ...(renderStyle === undefined ? {} : { style: renderStyle }),
+          tex,
+        },
+        {
+          ...(props.renderBudget === undefined ? {} : { budget: props.renderBudget }),
+          signal: controller.signal,
+        },
+      )
       .then((next) => {
         if (mounted) setOutcome(next);
       })
@@ -834,7 +1067,7 @@ export function FormulaGraphic(props: FormulaGraphicProps): React.ReactElement {
       release();
       controller.abort();
     };
-  }, [display, props.runtime, supported, tex]);
+  }, [display, props.renderBudget, props.runtime, renderStyle, styleRevision, supported, tex]);
 
   const raster = outcome?.ok === true ? outcome.raster : undefined;
   const cellSize = raster === undefined ? undefined : props.runtime.cellSize(raster);
@@ -915,6 +1148,31 @@ function normalizeRuntimeOptions(
     stdout: optionsOrStdout as FormulaGraphicsStdout,
     ...(terminalSize === undefined ? {} : { terminalSize }),
   };
+}
+
+/** Adapt the legacy/minimal runtime seam while keeping protocol precedence centralized. */
+function rendererCapabilityInput(
+  capability: FormulaGraphicsCapability,
+): TerminalCapabilities | TerminalCapability | TerminalCapabilityProbeResult {
+  if (isTerminalCapabilities(capability)) return capability;
+  if (isTerminalCapabilityProbeResult(capability)) return capability;
+  if ("reason" in capability && capability.reason !== undefined) {
+    return { protocol: capability.protocol, reason: capability.reason };
+  }
+  return createTerminalCapabilities({
+    protocol: capability.protocol,
+    reason: capability.reason ?? "runtime capability input",
+  });
+}
+
+function isTerminalCapabilities(value: FormulaGraphicsCapability): value is TerminalCapabilities {
+  return "kittyGraphics" in value && "sixel" in value && "itermImages" in value;
+}
+
+function isTerminalCapabilityProbeResult(
+  value: FormulaGraphicsCapability,
+): value is TerminalCapabilityProbeResult {
+  return "timedOut" in value && "replay" in value;
 }
 
 function isCacheSeam(
@@ -1057,4 +1315,17 @@ function sameSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean
   if (left.size !== right.size) return false;
   for (const value of left) if (!right.has(value)) return false;
   return true;
+}
+
+function sameFormulaStyle(
+  left: NormalizedFormulaRenderStyle,
+  right: NormalizedFormulaRenderStyle,
+): boolean {
+  return (
+    left.background === right.background &&
+    left.dpi === right.dpi &&
+    left.fontScale === right.fontScale &&
+    left.foreground === right.foreground &&
+    left.rendererVersion === right.rendererVersion
+  );
 }

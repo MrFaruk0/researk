@@ -10,13 +10,16 @@ import {
 
 const ESC = "\u001b";
 const ST = `${ESC}\\`;
-const PALETTE = [0, 14, 29, 43, 57, 71, 86, 100] as const;
-
 interface DecodedSixel {
   readonly width: number;
   readonly height: number;
   readonly pixels: number[][];
   readonly palette: readonly number[];
+  readonly colors: readonly {
+    readonly blue: number;
+    readonly green: number;
+    readonly red: number;
+  }[];
 }
 
 function pixelsFor(values: readonly number[], width = values.length): Uint8Array {
@@ -54,7 +57,8 @@ function decodeSixel(sequence: string): DecodedSixel {
   const width = Number(rasterMatch[1]);
   const height = Number(rasterMatch[2]);
   const pixels = Array.from({ length: height }, () => Array<number>(width).fill(-1));
-  const palette = Array<number>(8).fill(-1);
+  const palette = Array<number>(16).fill(-1);
+  const colors: Array<{ blue: number; green: number; red: number }> = [];
   let currentColor = 0;
   let x = 0;
   let y = 0;
@@ -85,6 +89,11 @@ function decodeSixel(sequence: string): DecodedSixel {
         expect(definition).not.toBeNull();
         if (definition === null) throw new Error("malformed palette definition");
         palette[currentColor] = Number(definition[1]);
+        colors[currentColor] = {
+          blue: Number(definition[3]),
+          green: Number(definition[2]),
+          red: Number(definition[1]),
+        };
         cursor = end + definition[0].length;
       } else {
         cursor = end;
@@ -118,17 +127,16 @@ function decodeSixel(sequence: string): DecodedSixel {
     draw(character, 1);
     cursor += 1;
   }
-  return { width, height, pixels, palette };
+  return { colors, height, palette, pixels, width };
 }
 
 describe("bounded pure Sixel encoding", () => {
   it("emits a deterministic complete golden 1x1 black image", () => {
-    const result = success(encodeSixel({ pixels: pixelsFor([0]), width: 1, height: 1 }));
-    expect(result.sequence).toBe(
-      `${ESC}P0;1q"1;1;1;1#0;2;0;0;0#1;2;14;14;14#2;2;29;29;29#3;2;43;43;43#4;2;57;57;57#5;2;71;71;71#6;2;86;86;86#7;2;100;100;100#0@$#1?$#2?$#3?$#4?$#5?$#6?$#7?${ST}`,
-    );
+    const input = { background: "#ffffff", pixels: pixelsFor([0]), width: 1, height: 1 } as const;
+    const result = success(encodeSixel(input));
+    expect(result.sequence).toBe(`${ESC}P0;1q"1;1;1;1#0;2;100;100;100#1;2;2;2;2#0?$#1@${ST}`);
     expect(result.encodedBytes).toBe(result.sequence.length);
-    expect(encodeSixel({ pixels: pixelsFor([0]), width: 1, height: 1 })).toEqual(result);
+    expect(encodeSixel(input)).toEqual(result);
   });
 
   it("round-trips black, white, grayscale, and transparent pixels through palette planes", () => {
@@ -136,8 +144,8 @@ describe("bounded pure Sixel encoding", () => {
     const decoded = decodeSixel(
       success(encodeSixel({ pixels: source, width: 4, height: 1 })).sequence,
     );
-    expect(decoded.pixels).toEqual([[0, 7, 2, 7]]);
-    expect(decoded.palette).toEqual(PALETTE);
+    expect(decoded.pixels).toEqual([[0, 2, 1, -1]]);
+    expect(decoded.palette.slice(0, 3)).toEqual([2, 30, 99]);
   });
 
   it("maps all six vertical bit positions and preserves a band boundary", () => {
@@ -151,24 +159,84 @@ describe("bounded pure Sixel encoding", () => {
 
   it("uses RLE only when it reduces the encoded plane", () => {
     const four = success(
-      encodeSixel({ pixels: pixelsFor([0, 0, 0, 0]), width: 4, height: 1 }),
+      encodeSixel({ background: "#ffffff", pixels: pixelsFor([0, 0, 0, 0]), width: 4, height: 1 }),
     ).sequence;
-    expect(four).toContain("#0!4@");
-    expect(four).toContain("#1!4?");
+    expect(four).toContain("#1!4@");
+    expect(four).toContain("#0!4?");
 
     const three = success(
-      encodeSixel({ pixels: pixelsFor([0, 0, 0]), width: 3, height: 1 }),
+      encodeSixel({ background: "#ffffff", pixels: pixelsFor([0, 0, 0]), width: 3, height: 1 }),
     ).sequence;
-    expect(three).toContain("#0@@@");
+    expect(three).toContain("#1@@@");
     expect(three).not.toContain("!3");
   });
 
   it("composites alpha against white before palette quantization", () => {
     const source = new Uint8Array([0, 0, 0, 0, 0, 0, 0, 128, 0, 0, 0, 255]);
     const decoded = decodeSixel(
-      success(encodeSixel({ pixels: source, width: 3, height: 1 })).sequence,
+      success(encodeSixel({ background: "#ffffff", pixels: source, width: 3, height: 1 })).sequence,
     );
-    expect(decoded.pixels).toEqual([[7, 3, 0]]);
+    expect(decoded.pixels).toEqual([[-1, 2, 1]]);
+  });
+
+  it("quantizes semantic hues and composites alpha against the resolved dark/light background", () => {
+    const source = new Uint8Array([255, 0, 0, 255, 0, 0, 0, 128, 0, 0, 0, 0]);
+    const dark = decodeSixel(
+      success(encodeSixel({ background: "#101820", height: 1, pixels: source, width: 3 })).sequence,
+    );
+    const light = decodeSixel(
+      success(encodeSixel({ background: "#f5f7fa", height: 1, pixels: source, width: 3 })).sequence,
+    );
+
+    // Palette 0 is the resolved background, while the opaque math pixel retains a red semantic
+    // hue instead of collapsing into a grayscale luma.
+    expect(dark.palette.slice(0, 1)).toEqual([6]);
+    const darkRed = dark.colors.findIndex(
+      (color, index) => index > 0 && color !== undefined && color.red > 60 && color.green < 40,
+    );
+    expect(darkRed).toBeGreaterThan(0);
+    expect(dark.pixels[0]?.[0]).toBe(darkRed);
+    expect(light.palette[0]).toBeGreaterThan(dark.palette[0] ?? -1);
+    expect(light.pixels[0]?.[1]).not.toBe(light.pixels[0]?.[2]);
+    expect(dark.pixels[0]?.[2]).toBe(-1);
+    expect(light.pixels[0]?.[2]).toBe(-1);
+  });
+
+  it("leaves transparent padding unset and does not draw a full background plane", () => {
+    const source = new Uint8Array([0, 0, 0, 0, 255, 0, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const decoded = decodeSixel(
+      success(encodeSixel({ background: "#242832", height: 1, pixels: source, width: 4 })).sequence,
+    );
+    expect(decoded.pixels[0]).toEqual([-1, expect.any(Number), -1, -1]);
+    // The semantic background may be defined in the palette for antialias compositing, but its
+    // plane must not paint transparent padding.
+    const backgroundIndex = decoded.palette.indexOf(14);
+    if (backgroundIndex >= 0)
+      expect(decoded.pixels[0]?.every((value) => value !== backgroundIndex)).toBe(true);
+  });
+
+  it("omits an unknown system background without a white or dark halo", () => {
+    const source = new Uint8Array([255, 0, 255, 255, 0, 0, 0, 128, 0, 0, 0, 0]);
+    const decoded = decodeSixel(
+      success(encodeSixel({ height: 1, pixels: source, width: 3 })).sequence,
+    );
+    expect(decoded.pixels[0]?.[2]).toBe(-1);
+    expect(decoded.colors[0]).not.toEqual({ red: 100, green: 100, blue: 100 });
+    expect(
+      decoded.colors.some(
+        (color) => color?.red === 100 && color.green === 100 && color.blue === 100,
+      ),
+    ).toBe(false);
+    expect(
+      decoded.colors.some((color) => color?.red < 10 && color.green < 10 && color.blue < 10),
+    ).toBe(true);
+  });
+
+  it("fails closed when the entire raster is transparent", () => {
+    expect(encodeSixel({ pixels: new Uint8Array([0, 0, 0, 0]), width: 1, height: 1 })).toEqual({
+      ok: false,
+      reason: "no-visible-pixels",
+    });
   });
 
   it("rejects malformed input and all renderer/output ceilings before success", () => {

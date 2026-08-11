@@ -1,6 +1,10 @@
 import { Buffer } from "node:buffer";
 import type { Writable } from "node:stream";
-import { type LatexRenderBudget, renderTexToPng } from "@researk/latex-renderer";
+import {
+  type LatexRenderBudget,
+  type LatexRenderStyle,
+  renderTexToPng,
+} from "@researk/latex-renderer";
 import type { MarkdownRenderEvent, MathRenderEvent } from "./parser.js";
 
 export type TerminalGraphicsProtocol = "iterm2" | "kitty" | "sixel" | "unsupported";
@@ -65,7 +69,7 @@ export function reconstructCanonicalSource(events: readonly MarkdownRenderEvent[
  * expressions the renderer happens to accept for rasterization on a given host.
  */
 export type TerminalMathImageRenderer = (
-  request: { readonly tex: string; readonly display: boolean },
+  request: { readonly tex: string; readonly display: boolean; readonly style?: LatexRenderStyle },
   options: { readonly budget?: LatexRenderBudget; readonly signal?: AbortSignal },
 ) => Promise<{ readonly png: Uint8Array }>;
 
@@ -84,11 +88,12 @@ export async function renderTerminalMath(
   budget?: LatexRenderBudget,
   signal?: AbortSignal,
   renderImage: TerminalMathImageRenderer = renderTexToPng,
+  style?: LatexRenderStyle,
 ): Promise<boolean> {
   if (event.kind !== "display" || capability.protocol !== "iterm2") return false;
   try {
     const image = await renderImage(
-      { tex: event.tex, display: true },
+      { display: true, ...(style === undefined ? {} : { style }), tex: event.tex },
       {
         ...(budget === undefined ? {} : { budget }),
         ...(signal === undefined ? {} : { signal }),

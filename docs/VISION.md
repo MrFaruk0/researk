@@ -83,12 +83,20 @@ publication-profile metadata, and an argument-less full-screen TUI with local pr
 configuration, and session persistence. The fake adapter is not exposed through
 `RESEARK_FAKE_PROVIDER`, `fake:paper`, or any other CLI fake mode.
 
-The TUI renders assistant inline math (promoted to a row) and display math with restricted local
-MathJax 4 → SVG → resvg 2× opaque-white PNG/RGBA output. Retained graphics require a bounded Kitty
-query with explicit success or Windows Terminal Sixel evidence (`WT_SESSION`, DA1 parameter 4, and
-a proven cell-pixel response). One-shot iTerm2 remains display-math support only;
-it is not a retained TUI overlay protocol. Exact source is used for unsupported, inaccessible,
-raw, JSON, non-TTY, clipped, stale, and failed paths. There is no published GitHub Release, native
-packaging, operating-system credential backend, persistent model-catalog cache, CSL processor,
-scholarly web tooling, reproduction runner, or verified native provider support yet. The remaining
-product description is a target until each capability exists and is tested.
+The TUI renders assistant inline math (promoted to a row) and display math through a centralized
+capability-aware path. Positive Kitty, Sixel, or iTerm2 protocol evidence can select the restricted
+local MathJax 4.1.3 -> validated path-only SVG -> `@resvg/resvg-js` 2.6.2 raster backend. Theme
+semantic colors affect the graphics and cache key; transparent output is used where practical, and
+exact original source remains the lossless fallback. WezTerm is a useful Windows development
+terminal, not a requirement. Windows Terminal remains readable without graphics. There is no
+system TeX execution, external renderer helper, or hosted rendering service.
+
+Provider profiles persist non-secret endpoint metadata globally, while interactive credentials live
+in the provider-scoped OS keyring (keyring-rs documents macOS Keychain Services, Windows Credential
+Manager, and *nix Secret Service) and environment variables remain an explicit fallback. `/new`
+replaces only session state and preserves the mounted TUI shell, theme, provider, model, variant,
+and renderer state. Resumed sessions restore their saved identities and resolve credentials through
+the global profile. There is no published GitHub Release or native installer, persistent
+model-catalog cache, CSL processor, scholarly web tooling, reproduction runner, or verified native
+provider support yet. The remaining product description is a target until each capability exists
+and is tested.

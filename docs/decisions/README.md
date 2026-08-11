@@ -27,6 +27,7 @@ Accepted records remain unchanged. A new record must supersede an accepted decis
 | [0008](0008-typescript-node-toolchain.md) | TypeScript and Node.js toolchain | Accepted | 2026-08-06 |
 | [0009](0009-npm-and-github-release-distribution.md) | npm and GitHub Release distribution | Superseded | 2026-08-06 |
 | [0010](0010-self-contained-github-cli-artifact.md) | Self-contained GitHub Release CLI artifact | Accepted | 2026-08-06 |
+| [0011](0011-runtime-dependency-review.md) | Rendering and secure-credential dependency review | Accepted | 2026-08-11 |
 
 ## Create a record
 

@@ -2,8 +2,8 @@ import { Worker } from "node:worker_threads";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   LatexRenderBudget,
-  ManagedLatexRenderer,
   type ManagedLatexRenderErrorCode,
+  ManagedLatexRenderer,
 } from "../src/index.js";
 import {
   isWorkerReadyMessage,
@@ -82,6 +82,7 @@ const malformedModes = [
   "error-message-not-string",
   // Payload shape and SVG ceiling
   "payload-extra-field",
+  "payload-style-extra-field",
   "payload-missing-svg",
   "payload-svg-not-string",
   "payload-svg-too-long",
@@ -133,6 +134,55 @@ const pngOnlyModes = new Set<string>([
 ]);
 
 describe("worker protocol validation", () => {
+  it("accepts a bounded style request and rejects malformed or open style shapes", () => {
+    const base = {
+      type: "render" as const,
+      id: 1,
+      tex: "x^2",
+      display: true,
+      format: "png" as const,
+    };
+
+    expect(
+      isWorkerRenderRequest({
+        ...base,
+        style: { foreground: "#5fd7ff", fontScale: 1, dpi: 96 },
+      }),
+    ).toBe(true);
+    expect(
+      isWorkerRenderRequest({
+        ...base,
+        style: { foreground: "not-a-color", fontScale: 1, dpi: 96 },
+      }),
+    ).toBe(false);
+    expect(
+      isWorkerRenderRequest({
+        ...base,
+        style: { foreground: "#fff", fontScale: 0.1, dpi: 96 },
+      }),
+    ).toBe(false);
+    expect(
+      isWorkerRenderRequest({
+        ...base,
+        style: { foreground: "#fff", fontScale: null, dpi: 96 },
+      }),
+    ).toBe(false);
+    expect(
+      isWorkerRenderRequest({
+        ...base,
+        style: { foreground: "#fff", fontScale: 1, dpi: 601 },
+      }),
+    ).toBe(false);
+    expect(
+      isWorkerRenderRequest({
+        ...base,
+        style: { foreground: "#fff", fontScale: 1, dpi: 96, unknown: true },
+      }),
+    ).toBe(false);
+    expect(isWorkerRenderRequest({ ...base, unknown: true })).toBe(false);
+    expect(isWorkerRenderRequest({ ...base, tex: "x".repeat(16 * 1024 + 1) })).toBe(false);
+  });
+
   it.each(malformedModes)(
     "rejects a %s message as worker_failed and replaces the worker",
     async (mode) => {

@@ -1,8 +1,8 @@
-import { PassThrough } from "node:stream";
 import { Console } from "node:console";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { useApp } from "ink";
 import React, { useEffect, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +10,22 @@ import { parseArguments } from "../src/args.js";
 import type { FormulaGraphicsRuntime } from "../src/tui/graphics.js";
 import { startTui } from "../src/tui.js";
 import type { CliDependencies, CliIo } from "../src/types.js";
+
+const formulaCacheMock = vi.hoisted(() => {
+  const store = {
+    delete: vi.fn(async () => undefined),
+    get: vi.fn(async () => undefined),
+    set: vi.fn(async () => undefined),
+  };
+  return {
+    createUserFormulaRasterStore: vi.fn(() => store),
+    store,
+  };
+});
+
+vi.mock("../src/config/formula-cache.js", () => ({
+  createUserFormulaRasterStore: formulaCacheMock.createUserFormulaRasterStore,
+}));
 
 function raster() {
   return {
@@ -22,6 +38,18 @@ function raster() {
 
 vi.mock("@researk/latex-renderer", () => ({
   closeManagedLatexRenderer: vi.fn(async () => undefined),
+  latexRendererVersion: "test-latex-renderer",
+  normalizeLatexRenderStyle: (style: {
+    readonly background?: string;
+    readonly dpi?: number;
+    readonly fontScale?: number;
+    readonly foreground?: string;
+  }) => ({
+    ...(style.background === undefined ? {} : { background: style.background }),
+    dpi: style.dpi ?? 96,
+    fontScale: style.fontScale ?? 1,
+    foreground: style.foreground ?? "#f5f5f5",
+  }),
   renderTexToPng: vi.fn(async () => raster()),
 }));
 
@@ -115,5 +143,34 @@ describe("startTui graphics lifecycle", () => {
     const placements = output.match(/a=T/gu) ?? [];
     expect(placements.length).toBeGreaterThan(0);
     expect(placements.length).toBeLessThanOrEqual(2);
+  });
+
+  it("passes the per-user formula store to the retained graphics cache", async () => {
+    formulaCacheMock.createUserFormulaRasterStore.mockClear();
+    formulaCacheMock.store.set.mockClear();
+    (console as unknown as { Console: typeof Console }).Console = Console;
+    const cwd = await mkdtemp(path.join(tmpdir(), "researk-tui-graphics-cache-"));
+    cleanupPaths.push(cwd);
+
+    const stdin = new PassThrough();
+    const stdout = new TtyOutput();
+    const stderr = new PassThrough();
+    const io: CliIo = { isTTY: true, stderr, stdin, stdout };
+    const dependencies: CliDependencies = {
+      cwd,
+      harness: {
+        async *run() {},
+        async listModels() {
+          return [];
+        },
+      },
+    };
+    const env = { APPDATA: path.join(cwd, "user-data"), TERM: "xterm-256color" };
+
+    const result = await startTui(parseArguments([], env), dependencies, io, env);
+
+    expect(result).toBe(0);
+    expect(formulaCacheMock.createUserFormulaRasterStore).toHaveBeenCalledWith({ env });
+    expect(formulaCacheMock.store.set).toHaveBeenCalled();
   });
 });

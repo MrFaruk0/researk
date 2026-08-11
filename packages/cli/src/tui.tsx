@@ -1,27 +1,39 @@
 import { Buffer } from "node:buffer";
-import { type ReasoningIntent, splitCanonicalModelId } from "@researk/contracts";
+import {
+  CanonicalModelIdSchema,
+  ModelIdSchema,
+  ProviderIdSchema,
+  type ReasoningIntent,
+  ReasoningIntentSchema,
+  splitCanonicalModelId,
+} from "@researk/contracts";
 import { closeManagedLatexRenderer } from "@researk/latex-renderer";
 import { render } from "ink";
 import type { CliArguments } from "./args.js";
 import { type AppConfig, AppConfigStore } from "./config/config.js";
-import type { CredentialStore } from "./config/credentials.js";
+import { type CredentialStore, createSecureCredentialStore } from "./config/credentials.js";
+import { createUserFormulaRasterStore } from "./config/formula-cache.js";
 import { type DataDirs, ensureDataDirs } from "./config/paths.js";
-import { PersistentProviderRegistry } from "./config/providers.js";
+import {
+  PersistentProviderRegistry,
+  providerCredentialEnvironmentRef,
+} from "./config/providers.js";
 import { type Session, SessionStore } from "./config/sessions.js";
 import { FileConfigStore } from "./config/store.js";
 import { write } from "./io.js";
 import { probeTerminalCapability } from "./rendering/terminal-query.js";
-import { safeErrorMessage } from "./safety.js";
+import { redactSecrets, safeErrorMessage, safeTerminalText } from "./safety.js";
 import { isThemeName } from "./theme.js";
 import { App } from "./tui/App.js";
 import type { ClipboardTerminalContext } from "./tui/clipboard.js";
-import { TuiController } from "./tui/controller.js";
+import { TuiController, validateProviderEndpoint } from "./tui/controller.js";
 import { createFormulaGraphicsRuntime, type FormulaGraphicsRuntime } from "./tui/graphics.js";
 import { DISABLE_MOUSE_TRACKING } from "./tui/mouse.js";
 import {
   createInitialState,
   MAX_TUI_CONVERSATION_ENTRIES,
   type ProviderConnection,
+  type StatusNotice,
 } from "./tui/state.js";
 import type { CliDependencies, CliIo, ProviderConnectionKind } from "./types.js";
 import { openWorkspace } from "./workspace.js";
@@ -128,7 +140,15 @@ export async function startTui(
   // --- Persistence -----------------------------------------------------------------
   // Every store is optional and each construction is guarded: when the platform has no per-user
   // data root, or a directory cannot be created, the TUI still runs with in-memory state only.
-  const stores = await createStores();
+  const stores = await createStores(env);
+  let formulaRasterStore: ReturnType<typeof createUserFormulaRasterStore> | undefined;
+  try {
+    formulaRasterStore = createUserFormulaRasterStore({ env });
+  } catch {
+    // The raster cache is optional. A malformed or unavailable per-user path must not prevent the
+    // TUI from starting; FormulaRasterCache remains memory-only when no store is supplied.
+    formulaRasterStore = undefined;
+  }
 
   const controller = new TuiController({
     dependencies,
@@ -160,24 +180,14 @@ export async function startTui(
     }
   }
 
-  let restored: Awaited<ReturnType<typeof restoreState>>;
-  try {
-    restored = await restoreState(loadedConfig, stores.providerRegistry);
-  } catch {
-    // Non-fatal: startup continues without a restored connection.
-    restored = { credentialValues: {}, variant: "auto" };
-  }
-  const restoredTheme =
-    loadedConfig?.theme !== undefined && isThemeName(loadedConfig.theme)
-      ? loadedConfig.theme
-      : "system";
-
   // Restore the last session's conversation when it is persisted. The session metadata and
   // conversation are carried in the initial state, so the restored transcript renders immediately.
   let session: Session | null = null;
   if (loadedConfig?.lastSessionId != null && stores.sessionStore !== undefined) {
     try {
-      session = await stores.sessionStore.loadSession(loadedConfig.lastSessionId);
+      // Route startup reads through the controller so provider-scoped credentials are resolved
+      // ephemerally and known values are redacted before transcript content enters TUI state.
+      session = await controller.loadSession(loadedConfig.lastSessionId);
     } catch {
       // Non-fatal: the session is simply not restored.
     }
@@ -197,6 +207,32 @@ export async function startTui(
     }
   }
 
+  let restored: Awaited<ReturnType<typeof restoreState>>;
+  try {
+    restored = await restoreState(
+      loadedConfig,
+      stores.providerRegistry,
+      env,
+      session,
+      connection?.providerId,
+    );
+  } catch {
+    // Non-fatal: startup continues without a restored connection.
+    restored = { credentialValues: {}, variant: "auto", notices: [] };
+  }
+  const restoredTheme =
+    loadedConfig?.theme !== undefined && isThemeName(loadedConfig.theme)
+      ? loadedConfig.theme
+      : "system";
+  const initialCredentialValues = {
+    ...(dependencies.credentialValues ?? {}),
+    ...restored.credentialValues,
+  };
+  const startupSessionSecrets = controller.secretsFor(
+    connection ?? restored.connection,
+    initialCredentialValues,
+  );
+
   const initialState = createInitialState({
     workspaceRoot: workspace.root,
     themeName: restoredTheme,
@@ -211,22 +247,20 @@ export async function startTui(
       ? { model: restored.model }
       : {}),
     variant: initial.reasoning === "auto" ? restored.variant : initial.reasoning,
-    credentialValues: {
-      ...(dependencies.credentialValues ?? {}),
-      ...restored.credentialValues,
-    },
+    credentialValues: initialCredentialValues,
+    notices: restored.notices,
     ...(session === null
       ? {}
       : {
           sessionId: session.id,
-          sessionTitle: session.title,
+          sessionTitle: redactSecrets(session.title, startupSessionSecrets),
           sessionUpdatedAt: session.updatedAt,
           conversation: session.messages
             .slice(-MAX_TUI_CONVERSATION_ENTRIES)
             .map((message, index) => ({
               id: `${message.role}-${index}-${Date.now().toString(36)}`,
               role: isMessageRole(message.role) ? message.role : "user",
-              source: message.content,
+              source: redactSecrets(message.content, startupSessionSecrets),
               streaming: false,
               createdAt: Date.now(),
             })),
@@ -314,6 +348,9 @@ export async function startTui(
       columns: terminalColumns(io.stdout),
       rows: terminalRows(io.stdout),
     },
+    ...(formulaRasterStore === undefined
+      ? {}
+      : { cacheOptions: { persistentStore: formulaRasterStore } }),
   });
   try {
     instance = render(
@@ -434,7 +471,9 @@ function connectionFromArguments(initial: CliArguments): ProviderConnection | un
  * no usable per-user data root or a directory could not be created. Persistence is best-effort: its
  * absence must never prevent the TUI from running.
  */
-async function createStores(): Promise<
+async function createStores(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): Promise<
   Readonly<{
     configStore?: AppConfigStore;
     sessionStore?: SessionStore;
@@ -444,27 +483,27 @@ async function createStores(): Promise<
 > {
   let dirs: DataDirs;
   try {
-    dirs = await ensureDataDirs();
+    dirs = await ensureDataDirs(environment);
   } catch {
     return {};
   }
   const configStore = new AppConfigStore(new FileConfigStore(dirs.config, "app"));
-  // ADR 0003 requires OS-backed credential storage. No OS backend is available in this package
-  // yet, so normal TUI startup deliberately disables credential persistence rather than creating
-  // plaintext files. Provider profiles and non-secret configuration may still persist; an
-  // environment variable or an explicitly injected credential resolver supplies secrets.
-  const credentialStore = createNonPersistentCredentialStore();
+  // Interactive credentials belong in the OS keychain. The factory returns an unavailable-safe
+  // backend when the native binding or platform keychain cannot operate; it never silently falls
+  // back to the plaintext FileCredentialStore. Provider resolution then uses `environment`.
+  const credentialStore = (await createSecureCredentialStore()).store;
   const providerRegistry = new PersistentProviderRegistry(
     new FileConfigStore(dirs.config, "providers"),
     credentialStore,
+    environment,
   );
   const sessionStore = new SessionStore(dirs.sessions);
   return { configStore, sessionStore, providerRegistry, credentialStore };
 }
 
 /**
- * Safe default credential backend for normal TUI startup. It intentionally drops writes and never
- * reads a credential file; FileCredentialStore remains available only to explicit callers/tests.
+ * Explicit ephemeral backend retained for embedders/tests that opt out of persistence. Normal TUI
+ * startup uses `createSecureCredentialStore` above and never selects this backend implicitly.
  */
 class NonPersistentCredentialStore implements CredentialStore {
   async get(_ref: string): Promise<string | null> {
@@ -481,42 +520,219 @@ class NonPersistentCredentialStore implements CredentialStore {
  * the loaded app config. Returns only what the config actually holds; the caller decides precedence
  * against explicit CLI flags.
  */
-async function restoreState(
+export async function restoreState(
   config: Awaited<ReturnType<AppConfigStore["loadConfig"]>> | null,
   providerRegistry: PersistentProviderRegistry | undefined,
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+  session: Session | null = null,
+  explicitProviderId: string | undefined = undefined,
 ): Promise<
   Readonly<{
     connection?: ProviderConnection;
     credentialValues: Record<string, string>;
     model?: string;
     variant: ReasoningIntent;
+    notices: readonly StatusNotice[];
   }>
 > {
   const credentialValues: Record<string, string> = {};
-  if (config?.activeProviderId == null || providerRegistry === undefined) {
-    return { credentialValues, variant: "auto" };
+  const notices: StatusNotice[] = [];
+  if (explicitProviderId !== undefined) {
+    // Explicit CLI provider/model flags own the identity and credential reference. Do not merge a
+    // saved profile's credential map into an explicitly selected connection.
+    return { credentialValues, variant: "auto", notices };
   }
-  const profile = await providerRegistry.getProvider(config.activeProviderId);
-  if (profile === undefined) return { credentialValues, variant: "auto" };
+
+  const rawSessionProviderId = session?.providerId ?? null;
+  const sessionProviderId = validPersistedProviderId(rawSessionProviderId);
+  const sessionProviderInvalid = rawSessionProviderId !== null && sessionProviderId === undefined;
+  const sessionMetadataWithoutProvider =
+    session !== null &&
+    sessionProviderId === undefined &&
+    (session.modelId !== null || session.variantId !== null);
+  if (sessionProviderInvalid) {
+    notices.push(
+      startupNotice(
+        "warning",
+        "Saved session provider metadata was invalid; using global provider settings.",
+      ),
+    );
+  }
+  if (sessionMetadataWithoutProvider) {
+    notices.push(
+      startupNotice(
+        "warning",
+        "Saved session model and reasoning metadata lacked a provider identity; it was cleared.",
+      ),
+    );
+  }
+  const providerId =
+    sessionProviderId ??
+    (sessionProviderInvalid ? validPersistedProviderId(config?.activeProviderId) : undefined) ??
+    validPersistedProviderId(config?.activeProviderId);
+  if (providerId === undefined || providerRegistry === undefined) {
+    if (sessionProviderId !== undefined && providerRegistry === undefined) {
+      notices.push(
+        startupNotice(
+          "warning",
+          `Saved provider profile "${sessionProviderId}" is unavailable. Reconnect with /provider before sending a prompt.`,
+        ),
+      );
+    }
+    return { credentialValues, variant: "auto", notices };
+  }
+
+  let profile: Awaited<ReturnType<PersistentProviderRegistry["getProvider"]>>;
+  try {
+    profile = await providerRegistry.getProvider(providerId);
+  } catch {
+    profile = undefined;
+  }
+  if (profile === undefined || !isSafePersistedProviderProfile(profile)) {
+    if (sessionProviderId !== undefined && providerId === sessionProviderId) {
+      notices.push(
+        startupNotice(
+          "warning",
+          `Saved provider profile "${sessionProviderId}" is unavailable. Reconnect with /provider before sending a prompt.`,
+        ),
+      );
+    }
+    return { credentialValues, variant: "auto", notices };
+  }
 
   const baseUrl = providerRegistry.resolveBaseUrl(profile);
   const kind: ProviderConnectionKind =
     profile.protocol === "openrouter" ? "openrouter" : "compatible";
+  if (profile.protocol === "compatible" && baseUrl === undefined) {
+    if (sessionProviderId === providerId) {
+      notices.push(
+        startupNotice(
+          "warning",
+          `Saved provider profile "${sessionProviderId}" is incomplete. Reconnect with /provider before sending a prompt.`,
+        ),
+      );
+    }
+    return { credentialValues, variant: "auto", notices };
+  }
   const connection: ProviderConnection = {
     providerId: profile.id,
     ...(baseUrl === undefined ? {} : { baseUrl }),
-    apiKeyEnvironmentVariable: profile.credentialRef,
+    apiKeyEnvironmentVariable: providerCredentialEnvironmentRef(profile),
     kind,
   };
-  const secret = await providerRegistry.resolveCredential(profile.id);
-  if (secret !== null) credentialValues[profile.credentialRef] = secret;
+  const secret = await providerRegistry.resolveCredential(profile.id, environment);
+  const credentialRef = providerCredentialEnvironmentRef(profile);
+  if (secret !== null) credentialValues[credentialRef] = secret;
+  else if (sessionProviderId === providerId) {
+    notices.push(
+      startupNotice(
+        "warning",
+        `Saved credential for provider "${providerId}" is unavailable. Reconnect with /provider or configure its environment variable.`,
+      ),
+    );
+  }
 
-  const model = config.defaultModelByProvider[config.activeProviderId];
-  const variant: ReasoningIntent =
-    model === undefined
-      ? "auto"
-      : ((config.selectedVariantByModel[model] as ReasoningIntent | undefined) ?? "auto");
-  return { connection, credentialValues, ...(model === undefined ? {} : { model }), variant };
+  const configuredModel = config?.defaultModelByProvider?.[providerId];
+  // A session-local model id is meaningful only when that same session explicitly persisted its
+  // provider. Otherwise the global configured model may be restored, but the unqualified session
+  // value must never be prefixed with or validated against the current provider.
+  const sessionModel = sessionProviderId === undefined ? undefined : session?.modelId;
+  const rawModel = sessionModel ?? configuredModel ?? null;
+  const model = validPersistedModelId(rawModel, providerId);
+  if (rawModel !== null && model === undefined && session?.modelId != null) {
+    notices.push(
+      startupNotice(
+        "warning",
+        "Saved session model metadata was invalid; select a model before prompting.",
+      ),
+    );
+  }
+  const selectedModel =
+    model ??
+    (sessionModel === undefined ? validPersistedModelId(configuredModel, providerId) : undefined);
+  const configuredVariant =
+    selectedModel === undefined ? undefined : config?.selectedVariantByModel?.[selectedModel];
+  const sessionVariant = sessionProviderId === undefined ? undefined : session?.variantId;
+  const rawVariant = sessionVariant ?? configuredVariant ?? null;
+  const parsedVariant = validPersistedVariant(rawVariant);
+  if (rawVariant !== null && parsedVariant === undefined && session?.variantId != null) {
+    notices.push(
+      startupNotice("warning", "Saved session reasoning metadata was invalid; reset to auto."),
+    );
+  }
+  const variant: ReasoningIntent = parsedVariant ?? "auto";
+  return {
+    connection,
+    credentialValues,
+    ...(selectedModel === undefined ? {} : { model: selectedModel }),
+    variant,
+    notices,
+  };
+}
+
+function validPersistedProviderId(value: unknown): string | undefined {
+  const parsed = ProviderIdSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
+function validPersistedModelId(value: unknown, expectedProvider: string): string | undefined {
+  const parsed = CanonicalModelIdSchema.safeParse(value);
+  if (parsed.success) {
+    try {
+      return splitCanonicalModelId(parsed.data).providerId === expectedProvider
+        ? parsed.data
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return ModelIdSchema.safeParse(value).success
+    ? `${expectedProvider}:${String(value)}`
+    : undefined;
+}
+
+function validPersistedVariant(value: unknown): ReasoningIntent | undefined {
+  const parsed = ReasoningIntentSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** Checks provider metadata loaded from disk before it can become a live startup connection. */
+function isSafePersistedProviderProfile(
+  value: unknown,
+): value is NonNullable<Awaited<ReturnType<PersistentProviderRegistry["getProvider"]>>> {
+  if (value === undefined || value === null || typeof value !== "object") return false;
+  const profile = value as Record<string, unknown>;
+  if (
+    typeof profile.id !== "string" ||
+    !ProviderIdSchema.safeParse(profile.id).success ||
+    typeof profile.name !== "string" ||
+    (profile.protocol !== "openrouter" && profile.protocol !== "compatible") ||
+    typeof profile.credentialRef !== "string"
+  ) {
+    return false;
+  }
+  if (profile.protocol === "openrouter" && profile.id !== "openrouter") return false;
+  if (profile.protocol === "compatible") {
+    if (typeof profile.baseUrl !== "string") return false;
+    try {
+      validateProviderEndpoint(profile.baseUrl);
+    } catch {
+      return false;
+    }
+  }
+  const environmentVariable = providerCredentialEnvironmentRef(
+    profile as Parameters<typeof providerCredentialEnvironmentRef>[0],
+  );
+  return /^[A-Za-z_][A-Za-z0-9_]*$/u.test(environmentVariable);
+}
+
+function startupNotice(level: StatusNotice["level"], message: string): StatusNotice {
+  return {
+    id: `startup-${level}-${message.length}`,
+    level,
+    message: safeTerminalText(message, []),
+    createdAt: 0,
+  };
 }
 
 const MESSAGE_ROLES: readonly string[] = ["user", "assistant", "tool", "system"];

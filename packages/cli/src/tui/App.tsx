@@ -1,4 +1,13 @@
-import type { ChatMessage, ReasoningIntent } from "@researk/contracts";
+import { randomUUID } from "node:crypto";
+import {
+  CanonicalModelIdSchema,
+  type ChatMessage,
+  ModelIdSchema,
+  ProviderIdSchema,
+  type ReasoningIntent,
+  ReasoningIntentSchema,
+  splitCanonicalModelId,
+} from "@researk/contracts";
 import { Box, type DOMElement, useApp, useInput, useStdout, useWindowSize } from "ink";
 import {
   type ReactNode,
@@ -30,7 +39,12 @@ import { Header } from "./components/Header.js";
 import { Notices } from "./components/Notices.js";
 import { Sidebar, shouldShowSidebar, sidebarWidth } from "./components/Sidebar.js";
 import { Welcome, welcomeSuggestionBudget } from "./components/Welcome.js";
-import type { ChatOutcome, ControllerEvent, TuiController } from "./controller.js";
+import type {
+  ChatOutcome,
+  ControllerEvent,
+  ResolvedProvider,
+  TuiController,
+} from "./controller.js";
 import { OPENROUTER_DEFAULT_BASE_URL } from "./controller.js";
 import {
   type FormulaRef,
@@ -71,19 +85,22 @@ import {
   type AppState,
   availableVariants,
   type ConversationEntry,
+  DEFAULT_SESSION_TITLE,
   MAX_CHAT_MESSAGE_CHARACTERS,
   MAX_TUI_HISTORY_MESSAGES,
   type MessageRole,
   type ProviderFormState,
   selectedDescriptor,
 } from "./state.js";
-import { createTuiTheme, themeColor, tuiThemeNames } from "./theme.js";
+import { createTuiTheme, formulaRenderStyle, themeColor, tuiThemeNames } from "./theme.js";
 
 export interface AppProps {
   readonly controller: TuiController;
   readonly initialState: AppState;
   /** Injected for tests so notice identities and timings stay deterministic. */
   readonly now?: () => number;
+  /** Injectable session-id seam; production uses a UUID rather than a timestamp-only id. */
+  readonly createSessionId?: () => string;
   /** Overrides Ink's own exit so the exit path can be observed in tests. */
   readonly onExit?: () => void;
   /** Deterministic terminal dimensions for render tests. */
@@ -145,6 +162,10 @@ export function App(props: AppProps): ReactNode {
   const { stdout } = useStdout();
   const windowSize = useWindowSize();
   const now = props.now ?? Date.now;
+  const createSessionId = useCallback(
+    () => props.createSessionId?.() ?? `session-${randomUUID()}`,
+    [props.createSessionId],
+  );
 
   const activeRun = useRef<AbortController | undefined>(undefined);
   /** Set when exit/unmount begins so a late provider completion cannot update or save the TUI. */
@@ -152,7 +173,7 @@ export function App(props: AppProps): ReactNode {
   /** Increments per connection attempt so a superseded reply cannot overwrite a newer connection. */
   const connectGeneration = useRef(0);
   /** Stable identifier of the current persisted session; undefined until the first autosave. */
-  const sessionIdRef = useRef<string | undefined>(undefined);
+  const sessionIdRef = useRef<string | undefined>(props.initialState.sessionId);
   /** Invalidates an autosave that belongs to a session the user has since replaced or loaded. */
   const sessionGeneration = useRef(0);
   /** Serializes session-pointer writes so an older autosave cannot finish after `/new` wins. */
@@ -206,6 +227,22 @@ export function App(props: AppProps): ReactNode {
     () => createTuiTheme(state.themeName, { colorEnabled: state.colorEnabled }),
     [state.themeName, state.colorEnabled],
   );
+
+  useEffect(() => {
+    const runtime = props.graphicsRuntime;
+    if (runtime === undefined) return;
+    try {
+      if (runtime.disposed) return;
+      const style = formulaRenderStyle(theme, runtime.rendererId);
+      // Color-disabled/accessibility presentations intentionally keep exact source. Do not pass an
+      // undefined style to the runtime, and do not let an invalid style break the TUI shell.
+      if (style === undefined) return;
+      runtime.updateStyle(style);
+    } catch {
+      // A graphics style is optional presentation state. Invalid runtime/style input fails closed
+      // to the source-rendering path instead of crashing the retained shell.
+    }
+  }, [props.graphicsRuntime, theme]);
 
   const terminalWidth = Math.max(
     1,
@@ -355,13 +392,68 @@ export function App(props: AppProps): ReactNode {
     (sessionId: string | null, generation: number): void => {
       const write = sessionConfigWrite.current.then(async () => {
         if (generation !== sessionGeneration.current || shuttingDown.current) return;
-        await props.controller.saveConfig({ sessionId });
+        let result: Awaited<ReturnType<TuiController["saveConfig"]>>;
+        try {
+          result = await props.controller.saveConfig({ sessionId });
+        } catch {
+          if (generation === sessionGeneration.current && !shuttingDown.current) {
+            notify("warning", "Could not save configuration.");
+          }
+          return;
+        }
+        // A replacement may have happened while the config write was in flight. The queue keeps
+        // invocation order, while this check documents that a stale write never authorizes a later
+        // pointer update in this operation.
+        if (generation !== sessionGeneration.current || shuttingDown.current) return;
+        if (!result.ok) {
+          // Persistence is optional for embedders/tests without a config store. Other failures
+          // must be visible, but the notice remains generic and never carries backend details.
+          if (result.message !== "Configuration persistence is unavailable.") {
+            notify("warning", "Could not save configuration.");
+          }
+          return;
+        }
       });
       // Keep the queue alive after a best-effort config failure; a later `/new` or load must still
       // be able to write its pointer.
       sessionConfigWrite.current = write.catch(() => {});
     },
-    [props.controller],
+    [notify, props.controller],
+  );
+
+  /** Persists the empty session created by `/new` before advancing its global config pointer. */
+  const persistNewSession = useCallback(
+    (sessionId: string, timestamp: string, snapshot: AppState, generation: number): void => {
+      const session: Session = {
+        schemaVersion: SESSION_SCHEMA_VERSION,
+        id: sessionId,
+        title: DEFAULT_SESSION_TITLE,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        workspace: snapshot.workspaceRoot,
+        providerId: snapshot.connection?.providerId ?? null,
+        modelId: snapshot.model ?? null,
+        variantId: snapshot.variant,
+        messages: [],
+      };
+      void props.controller
+        .saveSession(session)
+        .then((result) => {
+          if (generation !== sessionGeneration.current || shuttingDown.current) return;
+          if (!result.ok) {
+            if (result.message !== "Session persistence is unavailable.") {
+              notify("warning", result.message ?? "Could not save the new session.");
+            }
+            return;
+          }
+          saveSessionPointer(sessionId, generation);
+        })
+        .catch(() => {
+          if (generation !== sessionGeneration.current || shuttingDown.current) return;
+          notify("warning", "Could not save the new session.");
+        });
+    },
+    [notify, props.controller, saveSessionPointer],
   );
 
   useEffect(() => {
@@ -398,10 +490,18 @@ export function App(props: AppProps): ReactNode {
         return;
       }
 
-      const credentialValues =
+      const sameProviderEndpoint =
+        state.connection?.providerId === connection.providerId &&
+        state.connection?.baseUrl === connection.baseUrl &&
+        state.connection?.kind === connection.kind;
+      const inheritedCredentialValues = sameProviderEndpoint ? state.credentialValues : {};
+      let credentialValues =
         form.apiKey.length === 0
-          ? state.credentialValues
-          : { ...state.credentialValues, [connection.apiKeyEnvironmentVariable]: form.apiKey };
+          ? inheritedCredentialValues
+          : {
+              ...inheritedCredentialValues,
+              [connection.apiKeyEnvironmentVariable]: form.apiKey,
+            };
 
       dispatch({
         type: "overlay/open",
@@ -425,18 +525,88 @@ export function App(props: AppProps): ReactNode {
       const generation = connectGeneration.current;
 
       try {
+        // A blank interactive field means "reuse this selected provider profile", not "discard the
+        // credential". Resolve through the registry so the provider-scoped secure value wins over
+        // its environment fallback. Only merge a profile whose complete identity matches the form;
+        // a credential from another provider or protocol must never cross the boundary. The
+        // submitted endpoint may intentionally edit an existing custom profile's metadata, while
+        // its provider-scoped credential remains ephemeral and is never copied into that profile.
+        let resolvedProvider: ResolvedProvider | null = null;
+        if (form.apiKey.length === 0) {
+          try {
+            resolvedProvider = await props.controller.resolveProvider(connection.providerId);
+          } catch {
+            resolvedProvider = null;
+          }
+          if (generation !== connectGeneration.current || shuttingDown.current) return;
+          const resolvedConnection = resolvedProvider?.connection;
+          if (
+            resolvedProvider !== null &&
+            resolvedConnection !== undefined &&
+            resolvedConnection.providerId === connection.providerId &&
+            resolvedConnection.kind === connection.kind
+          ) {
+            const resolvedSecret =
+              resolvedProvider.credentialValues[resolvedConnection.apiKeyEnvironmentVariable];
+            credentialValues = {
+              ...inheritedCredentialValues,
+              ...(resolvedSecret === undefined
+                ? {}
+                : { [connection.apiKeyEnvironmentVariable]: resolvedSecret }),
+            };
+          }
+        }
         const catalog = await props.controller.connect(connection, credentialValues);
-        if (generation !== connectGeneration.current) return;
+        if (generation !== connectGeneration.current || shuttingDown.current) return;
         if (blockCommandDuringRun()) return;
         dispatch({ type: "notice/clear" });
         dispatch({ type: "connection/connected", connection, catalog, credentialValues });
         dispatch({ type: "overlay/close" });
         // Persist the active provider profile and credential, then record the connection in the
-        // app config so a later session can restore it. Best-effort: failures never break the UI.
-        await props.controller.persistProvider(connection, credentialValues);
+        // app config so a later session can restore it. Best-effort: failures never break the UI,
+        // but the user gets a redacted, actionable warning instead of assuming a restart will work.
+        try {
+          // A blank key can still be a deliberate metadata edit to an existing custom profile. Keep
+          // its already-resolved secure credential ephemeral while updating endpoint/protocol,
+          // display, or environment-reference metadata that the user submitted.
+          const metadataOnlyProfileUpdate =
+            form.apiKey.length === 0 &&
+            resolvedProvider !== null &&
+            connection.kind === "compatible" &&
+            (resolvedProvider.profile.protocol !== "compatible" ||
+              resolvedProvider.profile.baseUrl !== connection.baseUrl ||
+              resolvedProvider.profile.name !== connection.providerId ||
+              resolvedProvider.connection.apiKeyEnvironmentVariable !==
+                connection.apiKeyEnvironmentVariable);
+          const persistence =
+            form.apiKey.length > 0 || resolvedProvider === null || metadataOnlyProfileUpdate
+              ? await props.controller.persistProvider(
+                  connection,
+                  form.apiKey.length > 0 ? credentialValues : {},
+                )
+              : { ok: true as const };
+          if (generation !== connectGeneration.current || shuttingDown.current) return;
+          const metadataOnlySavedWithoutCredential =
+            metadataOnlyProfileUpdate &&
+            persistence.message ===
+              "No interactive credential was supplied; provider metadata was saved only.";
+          if (!persistence.ok && !metadataOnlySavedWithoutCredential) {
+            const message = redactSecrets(
+              persistence.message ??
+                "Provider persistence failed; configure its environment variable or enable secure storage.",
+              props.controller.secretsFor(connection, credentialValues),
+            );
+            notify("warning", message);
+          }
+        } catch (error) {
+          notify(
+            "warning",
+            safeErrorMessage(error, props.controller.secretsFor(connection, credentialValues)),
+          );
+        }
         void props.controller.saveConfig({ connection }).catch(() => {});
       } catch (error) {
-        if (generation !== connectGeneration.current) return;
+        if (generation !== connectGeneration.current || shuttingDown.current) return;
         if (blockCommandDuringRun()) return;
         dispatch({ type: "notice/clear" });
         const message = safeErrorMessage(
@@ -453,7 +623,15 @@ export function App(props: AppProps): ReactNode {
         });
       }
     },
-    [blockCommandDuringRun, props.controller, state.credentialValues],
+    [
+      blockCommandDuringRun,
+      notify,
+      props.controller,
+      state.connection?.baseUrl,
+      state.connection?.kind,
+      state.connection?.providerId,
+      state.credentialValues,
+    ],
   );
 
   /**
@@ -488,14 +666,20 @@ export function App(props: AppProps): ReactNode {
         messages,
       };
       try {
-        await props.controller.saveSession(session);
+        const result = await props.controller.saveSession(session);
         // `/new` or a session load may have happened while the filesystem write was in flight. The
         // old exchange may remain persisted, but it must not reclaim the new session's pointer.
         if (generation !== sessionGeneration.current || shuttingDown.current) return;
+        if (!result.ok) {
+          if (result.message !== "Session persistence is unavailable.") {
+            notify("warning", result.message ?? "Could not save the session.");
+          }
+          return;
+        }
         saveSessionPointer(sessionId, generation);
-      } catch (error) {
+      } catch {
         if (!shuttingDown.current && generation === sessionGeneration.current) {
-          notify("warning", `Could not save the session: ${safeErrorMessage(error)}`);
+          notify("warning", "Could not save the session.");
         }
       }
     },
@@ -699,16 +883,19 @@ export function App(props: AppProps): ReactNode {
   const stageDocument = useCallback(
     async (request: string): Promise<void> => {
       if (blockCommandDuringRun()) return;
+      const generation = sessionGeneration.current;
       dispatch({ type: "notice/clear" });
       try {
         const document = await props.controller.stageDocument(
           request,
           stateRef.current.stagedDocuments,
         );
+        if (generation !== sessionGeneration.current || shuttingDown.current) return;
         if (blockCommandDuringRun()) return;
         dispatch({ type: "documents/stage", document });
         dispatch({ type: "overlay/close" });
       } catch (error) {
+        if (generation !== sessionGeneration.current || shuttingDown.current) return;
         dispatch({
           type: "overlay/open",
           overlay: { kind: "read", value: request, error: safeErrorMessage(error) },
@@ -757,8 +944,14 @@ export function App(props: AppProps): ReactNode {
   const openSessionsOverlay = useCallback(async (): Promise<void> => {
     if (blockCommandDuringRun()) return;
     dispatch({ type: "notice/clear" });
-    const sessions = await props.controller.listSessions();
+    const generation = sessionGeneration.current;
+    const loadedSessions = await props.controller.listSessions();
+    if (generation !== sessionGeneration.current || shuttingDown.current) return;
     if (blockCommandDuringRun()) return;
+    const sessions = loadedSessions.map((session) => ({
+      ...session,
+      title: redactSecrets(session.title, secretsRef.current),
+    }));
     dispatch({ type: "overlay/open", overlay: { kind: "sessions", sessions, selected: 0 } });
   }, [blockCommandDuringRun, props.controller]);
 
@@ -838,8 +1031,13 @@ export function App(props: AppProps): ReactNode {
     async (id: string): Promise<void> => {
       if (blockCommandDuringRun()) return;
       dispatch({ type: "notice/clear" });
+      // Claim the replacement before the first await. `/new` and any later load increment this
+      // same generation, so no late load can dispatch a transcript or reclaim the config pointer.
+      const generation = sessionGeneration.current + 1;
+      sessionGeneration.current = generation;
       const current = stateRef.current;
       const session: Session | null = await props.controller.loadSession(id);
+      if (generation !== sessionGeneration.current || shuttingDown.current) return;
       if (blockCommandDuringRun()) return;
       if (session === null) {
         dispatch({ type: "overlay/close" });
@@ -854,25 +1052,110 @@ export function App(props: AppProps): ReactNode {
         );
         return;
       }
+
+      // A transcript can outlive the global provider selection. Resolve its saved provider through
+      // the controller without fetching a catalog, so persisted credentials win over any current
+      // environment fallback and a missing profile cannot silently become the current provider.
+      const rawProviderId = session.providerId;
+      const sessionProviderId = validSessionProviderId(rawProviderId);
+      let resolvedProvider: ResolvedProvider | null = null;
+      if (rawProviderId !== null && sessionProviderId === null) {
+        dispatch({ type: "connection/cleared" });
+        notify("warning", "This session has invalid provider metadata; reconnect with /provider.");
+      } else if (sessionProviderId !== null) {
+        resolvedProvider = await props.controller.resolveProvider(sessionProviderId);
+        if (generation !== sessionGeneration.current || shuttingDown.current) return;
+        if (blockCommandDuringRun()) return;
+        if (resolvedProvider === null) {
+          dispatch({ type: "connection/cleared" });
+          notify(
+            "warning",
+            `Saved provider profile "${sessionProviderId}" is unavailable. Reconnect with /provider before sending a prompt.`,
+          );
+        } else {
+          dispatch({
+            type: "connection/restored",
+            connection: resolvedProvider.connection,
+            credentialValues: resolvedProvider.credentialValues,
+          });
+          if (!resolvedProvider.credentialAvailable) {
+            notify(
+              "warning",
+              `Saved credential for provider "${sessionProviderId}" is unavailable. Reconnect with /provider or configure its environment variable.`,
+            );
+          }
+        }
+      }
+
+      const providerResolutionMissing =
+        rawProviderId !== null && (sessionProviderId === null || resolvedProvider === null);
+      const rawModelId = session.modelId;
+      const rawVariantId = session.variantId;
+      const missingProviderProvenance =
+        sessionProviderId === null && (rawModelId !== null || rawVariantId !== null);
+      // A session without an explicit provider cannot borrow the current/global provider to
+      // qualify a provider-local model id. Only a stored provider identity may establish that
+      // provenance; otherwise model and reasoning metadata are cleared below.
+      const expectedProvider = sessionProviderId ?? undefined;
+      const sessionModelId = providerResolutionMissing
+        ? null
+        : validSessionModelId(rawModelId, expectedProvider);
+      const invalidModel = rawModelId !== null && sessionModelId === null;
+      if (missingProviderProvenance) {
+        notify(
+          "warning",
+          "This session has no saved provider; its model and reasoning settings were cleared.",
+        );
+      } else if (invalidModel) {
+        notify(
+          "warning",
+          "This session has invalid model metadata; select a model before prompting.",
+        );
+      }
+      const sessionVariant = missingProviderProvenance
+        ? undefined
+        : validSessionVariant(rawVariantId);
+      const invalidVariant =
+        !missingProviderProvenance && rawVariantId !== null && sessionVariant === undefined;
+      if (invalidVariant) {
+        notify("warning", "This session has invalid reasoning metadata; reset to auto.");
+      }
+
+      const sessionSecrets = [
+        ...new Set([
+          ...secretsRef.current,
+          ...(resolvedProvider === null
+            ? []
+            : props.controller.secretsFor(
+                resolvedProvider.connection,
+                resolvedProvider.credentialValues,
+              )),
+        ]),
+      ];
       const conversation: ConversationEntry[] = session.messages.map((message, index) => ({
         id: `${message.role}-${index}-${now().toString(36)}`,
         role: isMessageRole(message.role) ? message.role : "user",
-        source: message.content,
+        source: redactSecrets(message.content, sessionSecrets),
         streaming: false,
         createdAt: now(),
       }));
       dispatch({
         type: "session/load",
         sessionId: session.id,
-        title: session.title,
+        title: redactSecrets(session.title, sessionSecrets),
         updatedAt: session.updatedAt,
         conversation,
+        ...(sessionProviderId !== null
+          ? { model: sessionModelId, variant: sessionVariant ?? "auto" }
+          : missingProviderProvenance
+            ? { ...(rawModelId === null ? {} : { model: null }), variant: "auto" as const }
+            : {}),
       });
+      setFormulaView(undefined);
       dispatch({ type: "overlay/close" });
       // Subsequent autosaves continue appending to the loaded session.
       sessionIdRef.current = session.id;
-      sessionGeneration.current += 1;
-      saveSessionPointer(session.id, sessionGeneration.current);
+      saveSessionPointer(session.id, generation);
     },
     [blockCommandDuringRun, notify, now, props.controller, saveSessionPointer],
   );
@@ -912,11 +1195,18 @@ export function App(props: AppProps): ReactNode {
           return;
         case "/new":
           dispatch({ type: "notice/clear" });
-          dispatch({ type: "session/create" });
-          // The new session is untitled and unpersisted; drop the pointer to any previous one.
-          sessionIdRef.current = undefined;
-          sessionGeneration.current += 1;
-          saveSessionPointer(null, sessionGeneration.current);
+          {
+            const sessionId = createSessionId();
+            const timestamp = new Date(now()).toISOString();
+            const generation = sessionGeneration.current + 1;
+            sessionGeneration.current = generation;
+            sessionIdRef.current = sessionId;
+            dispatch({ type: "session/create", sessionId, updatedAt: timestamp });
+            // FormulaView is local React state rather than reducer state; clear it explicitly so a
+            // previous formula overlay cannot suppress the fresh session's home composer.
+            setFormulaView(undefined);
+            persistNewSession(sessionId, timestamp, current, generation);
+          }
           return;
         case "/provider":
           dispatch({ type: "overlay/open", overlay: { kind: "provider-picker", selected: 0 } });
@@ -956,10 +1246,12 @@ export function App(props: AppProps): ReactNode {
     [
       abortActiveRun,
       notify,
+      createSessionId,
       openFormulaOverlay,
       openModelOverlay,
       openSessionsOverlay,
-      saveSessionPointer,
+      now,
+      persistNewSession,
       stageDocument,
     ],
   );
@@ -1645,7 +1937,18 @@ export function App(props: AppProps): ReactNode {
     const formula = selectedFormula;
     if (view === undefined || formula === undefined) return undefined;
     const previewSource = selectedFormulaPreviewSource ?? formula.source;
-    const graphicsSupported = props.graphicsRuntime?.supportsGraphics() === true;
+    const runtime = props.graphicsRuntime;
+    let renderStyle: ReturnType<typeof formulaRenderStyle> | undefined;
+    let graphicsSupported = false;
+    if (runtime !== undefined) {
+      try {
+        renderStyle = formulaRenderStyle(theme, runtime.rendererId);
+        graphicsSupported = renderStyle !== undefined && runtime.supportsGraphics();
+      } catch {
+        renderStyle = undefined;
+        graphicsSupported = false;
+      }
+    }
     const localDraftPreview = view.appliedDraft !== undefined && !view.showSource;
     // An absent or unsupported runtime must not be represented as a fake "preview": showing the
     // source directly lets the overlay label it honestly. A supported runtime can still fail while
@@ -1653,13 +1956,14 @@ export function App(props: AppProps): ReactNode {
     const preview =
       view.showSource || !graphicsSupported ? undefined : (
         <FormulaGraphic
-          runtime={props.graphicsRuntime as FormulaGraphicsRuntime}
+          runtime={runtime as FormulaGraphicsRuntime}
           formulaKey={`formula-preview-${formula.ordinal}`}
           exactSource={previewSource}
           innerTex={selectedFormulaDraft ?? formula.tex}
           display={formula.kind === "display"}
           inline={formula.kind !== "display"}
           clipRef={formulaOverlayRef as FormulaGraphicsRefLike}
+          {...(renderStyle === undefined ? {} : { renderStyle })}
         />
       );
     const exactSource = view.showSource ? formula.source : previewSource;
@@ -1898,4 +2202,38 @@ const MESSAGE_ROLES: readonly MessageRole[] = ["user", "assistant", "tool", "sys
 /** Guards a persisted session role string before it becomes a conversation entry role. */
 function isMessageRole(value: string): value is MessageRole {
   return (MESSAGE_ROLES as readonly string[]).includes(value);
+}
+
+/** Guards a persisted provider identity before it enters a connection or notice. */
+function validSessionProviderId(value: string | null): string | null {
+  if (value === null) return null;
+  const parsed = ProviderIdSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+/** Guards a persisted canonical model and prevents cross-provider identity drift. */
+function validSessionModelId(
+  value: string | null,
+  expectedProvider: string | undefined,
+): string | null {
+  if (value === null || expectedProvider === undefined) return null;
+  const parsed = CanonicalModelIdSchema.safeParse(value);
+  if (parsed.success) {
+    try {
+      if (splitCanonicalModelId(parsed.data).providerId !== expectedProvider) return null;
+    } catch {
+      return null;
+    }
+    return parsed.data;
+  }
+  // Legacy session files stored the provider-local model id without its canonical provider prefix.
+  if (!ModelIdSchema.safeParse(value).success) return null;
+  return `${expectedProvider}:${value}`;
+}
+
+/** Guards a persisted reasoning intent; an absent/invalid value falls back to the neutral intent. */
+function validSessionVariant(value: string | null): ReasoningIntent | undefined {
+  if (value === null) return undefined;
+  const parsed = ReasoningIntentSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
 }

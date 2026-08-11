@@ -2,6 +2,7 @@ export * from "./args.js";
 export * from "./help.js";
 export * from "./io.js";
 export * from "./rendering/parser.js";
+export * from "./rendering/capabilities.js";
 export * from "./rendering/renderer.js";
 export * from "./run.js";
 export * from "./safety.js";

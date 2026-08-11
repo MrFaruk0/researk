@@ -9,6 +9,7 @@ import {
   renderTerminalMath,
 } from "../src/rendering/terminal.js";
 import { executeChat } from "../src/run.js";
+import { createTheme } from "../src/theme.js";
 
 /** A trusted iTerm2 identity. Capability is asserted explicitly so no host env can influence it. */
 const ITERM_ENV = Object.freeze({
@@ -28,6 +29,8 @@ const STUB_PNG = Uint8Array.from(
   ),
 );
 
+const DARK_THEME = createTheme("dark", { isTTY: true, env: {} });
+
 async function stubRenderImage(): Promise<{ readonly png: Uint8Array }> {
   return { png: STUB_PNG };
 }
@@ -41,6 +44,26 @@ function capture(): PassThrough & { readonly text: () => string } {
 }
 
 describe("trusted terminal math path", () => {
+  it("passes the semantic theme style to one-shot math rendering", async () => {
+    const stdout = capture();
+    Object.defineProperty(stdout, "isTTY", { value: true });
+    let receivedStyle: unknown;
+    await expect(
+      renderInteractiveEvents(parseMarkdownMath("\\[x+y\\]"), {
+        interactive: true,
+        stdout,
+        env: ITERM_ENV,
+        theme: createTheme("dark", { isTTY: true, env: {} }),
+        renderImage: async (request) => {
+          receivedStyle = request.style;
+          return { png: STUB_PNG };
+        },
+      }),
+    ).resolves.toBe("");
+    expect(receivedStyle).toMatchObject({ foreground: "#5fd7ff" });
+    expect(receivedStyle).not.toHaveProperty("background");
+  });
+
   it("emits a visible iTerm2 inline-image protocol sequence for display math", async () => {
     const stdout = capture();
     Object.defineProperty(stdout, "isTTY", { value: true });
@@ -51,6 +74,7 @@ describe("trusted terminal math path", () => {
       interactive: true,
       stdout,
       env: ITERM_ENV,
+      theme: DARK_THEME,
       renderImage: stubRenderImage,
       writeText: async (value) => {
         stdout.write(value);
@@ -80,6 +104,26 @@ describe("trusted terminal math path", () => {
     ).resolves.toBe(source);
     expect(stdout.text()).toBe("");
     expect(detectTerminalCapability(stdout, { TERM: "dumb" }).protocol).toBe("unsupported");
+  });
+
+  it("uses exact source without invoking the legacy raster path when no semantic theme is present", async () => {
+    const stdout = capture();
+    Object.defineProperty(stdout, "isTTY", { value: true });
+    const source = "\\[x+y\\]";
+    let rasterCalls = 0;
+    await expect(
+      renderInteractiveEvents(parseMarkdownMath(source), {
+        interactive: true,
+        stdout,
+        env: ITERM_ENV,
+        renderImage: async () => {
+          rasterCalls += 1;
+          return { png: STUB_PNG };
+        },
+      }),
+    ).resolves.toBe(source);
+    expect(rasterCalls).toBe(0);
+    expect(stdout.text()).toBe("");
   });
 
   it("never emits graphics in accessible mode", async () => {
@@ -133,6 +177,7 @@ describe("trusted terminal math path", () => {
       json: false,
       raw: false,
       env: { TERM_PROGRAM: "iTerm.app", TERM_PROGRAM_VERSION: "3.5.14" },
+      theme: DARK_THEME,
       apiKeyEnvironmentVariable: "TEST_KEY",
       createRunId: () => "run-terminal-source",
     });
@@ -195,6 +240,7 @@ describe("trusted terminal math path", () => {
         interactive: true,
         stdout,
         env: ITERM_ENV,
+        theme: DARK_THEME,
       }),
     ).resolves.toBe("");
     const emitted = stdout.text();
@@ -219,6 +265,7 @@ describe("trusted terminal math path", () => {
         interactive: true,
         stdout,
         env: ITERM_ENV,
+        theme: DARK_THEME,
       }),
     ).resolves.toBe("");
     expect(stdout.text()).not.toContain("E = mc^2");

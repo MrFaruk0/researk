@@ -1,4 +1,11 @@
-import type { LatexRenderBudget } from "@researk/latex-renderer";
+import {
+  type LatexRenderBudget,
+  type LatexRenderStyle,
+  latexRendererVersion,
+  normalizeLatexRenderStyle,
+  renderTexToPng,
+} from "@researk/latex-renderer";
+import type { FormulaRasterStore } from "../config/formula-cache.js";
 
 /**
  * A deliberately small raster contract. The renderer may return a richer
@@ -13,13 +20,68 @@ export interface FormulaRaster {
 
 export interface FormulaRasterRequest {
   readonly display: boolean;
+  /** Exact/canonical TeX source. It is never normalized or replaced by raster output. */
   readonly tex: string;
+  readonly style?: FormulaRenderStyle;
 }
+
+/** Every field that can affect raster pixels participates in the cache identity. */
+export interface FormulaRenderStyle {
+  readonly background?: string;
+  readonly dpi?: number;
+  readonly fontScale?: number;
+  readonly foreground?: string;
+  /** Renderer identity/version, e.g. a MathJax/resvg pipeline revision. */
+  readonly rendererVersion?: string;
+}
+
+/** A style after local validation and defaulting. */
+export interface NormalizedFormulaRenderStyle {
+  readonly background?: string;
+  readonly dpi: number;
+  readonly fontScale: number;
+  readonly foreground: string;
+  readonly rendererVersion: string;
+}
+
+export const DEFAULT_FORMULA_RENDER_STYLE: NormalizedFormulaRenderStyle = Object.freeze({
+  dpi: 96,
+  fontScale: 1,
+  foreground: "#f5f5f5",
+  rendererVersion: latexRendererVersion,
+});
 
 export interface FormulaRasterRenderOptions {
   readonly budget?: LatexRenderBudget;
   readonly signal?: AbortSignal;
+  /** Optional presentation style when callers keep request data and style separate. */
+  readonly style?: FormulaRenderStyle;
 }
+
+export type FormulaRasterCacheStore = FormulaRasterStore;
+
+/**
+ * The packaged renderer has a narrower request style than the cache seam: rendererVersion is a
+ * cache identity field and must never cross the worker boundary. Keeping this adapter here avoids
+ * an unsafe function-type cast while allowing embedders to inject a renderer with the same seam.
+ */
+export const latexFormulaRasterRenderer: FormulaRasterRenderer = async (request, options) => {
+  const style = normalizeFormulaRenderStyle(request, options, latexRendererVersion);
+  if (style === undefined) throw new Error("Invalid formula render style.");
+  const latexStyle: LatexRenderStyle = {
+    dpi: style.dpi,
+    fontScale: style.fontScale,
+    foreground: style.foreground,
+    ...(style.background === undefined ? {} : { background: style.background }),
+  };
+  return renderTexToPng(
+    { display: request.display, style: latexStyle, tex: request.tex },
+    {
+      ...(options.budget === undefined ? {} : { budget: options.budget }),
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    },
+  );
+};
 
 /** The seam keeps cache tests independent of MathJax, workers, and native image bindings. */
 export type FormulaRasterRenderer = (
@@ -62,6 +124,10 @@ export interface FormulaRasterCacheOptions {
   readonly maxEntries?: number;
   /** Maximum sum of PNG and RGBA bytes retained. Defaults to 64 MiB. */
   readonly maxBytes?: number;
+  /** Optional per-user persistence seam. Omit it to keep tests and embedders memory-only. */
+  readonly persistentStore?: FormulaRasterCacheStore | null;
+  /** Used when a request does not supply a renderer identity/version. */
+  readonly rendererVersion?: string;
 }
 
 export interface FormulaRasterCacheStats {
@@ -107,7 +173,9 @@ interface MutableStats {
 export class FormulaRasterCache {
   readonly #maxBytes: number;
   readonly #maxEntries: number;
+  readonly #persistentStore: FormulaRasterCacheStore | undefined;
   readonly #renderer: FormulaRasterRenderer;
+  readonly #rendererVersion: string;
   readonly #cache = new Map<string, CacheEntry>();
   readonly #inFlight = new Map<string, InFlight>();
   readonly #stats: MutableStats = {
@@ -121,6 +189,10 @@ export class FormulaRasterCache {
 
   public constructor(renderer: FormulaRasterRenderer, options: FormulaRasterCacheOptions = {}) {
     this.#renderer = renderer;
+    this.#persistentStore = options.persistentStore ?? undefined;
+    this.#rendererVersion = validRendererVersion(options.rendererVersion)
+      ? options.rendererVersion
+      : DEFAULT_FORMULA_RENDER_STYLE.rendererVersion;
     this.#maxEntries = boundedOption(
       options.maxEntries,
       DEFAULT_FORMULA_RASTER_CACHE_MAX_ENTRIES,
@@ -138,7 +210,8 @@ export class FormulaRasterCache {
     request: FormulaRasterRequest,
     options: FormulaRasterRenderOptions = {},
   ): Promise<FormulaRasterOutcome> {
-    if (!isFormulaRasterRequest(request)) {
+    const style = normalizeFormulaRenderStyle(request, options, this.#rendererVersion);
+    if (!isFormulaRasterRequest(request) || style === undefined) {
       this.#stats.failures += 1;
       return Promise.resolve({ ok: false, reason: "invalid_request" });
     }
@@ -147,7 +220,8 @@ export class FormulaRasterCache {
       return Promise.resolve({ ok: false, reason: "aborted" });
     }
 
-    const key = formulaRasterKey(request);
+    const effectiveRequest: FormulaRasterRequest = { ...request, style };
+    const key = formulaRasterKey(effectiveRequest);
     const cached = this.#cache.get(key);
     if (cached !== undefined) {
       this.#stats.hits += 1;
@@ -167,8 +241,9 @@ export class FormulaRasterCache {
     const rendererOptions: FormulaRasterRenderOptions = {
       ...(options.budget === undefined ? {} : { budget: options.budget }),
       signal: controller.signal,
+      style,
     };
-    const promise = this.#renderAndCache(request, key, controller, rendererOptions);
+    const promise = this.#renderAndCache(effectiveRequest, key, controller, rendererOptions);
     pending = {
       controller,
       key,
@@ -218,6 +293,27 @@ export class FormulaRasterCache {
     options: FormulaRasterRenderOptions,
   ): Promise<FormulaRasterOutcome> {
     try {
+      const persisted =
+        this.#persistentStore === undefined ? undefined : await this.#readPersistent(key);
+      if (controller.signal.aborted) return this.#failure("aborted");
+      if (persisted !== undefined) {
+        let persistedRaster: FormulaRaster | FormulaRasterFailureCode;
+        try {
+          persistedRaster = validateRaster(persisted);
+        } catch {
+          persistedRaster = "malformed_result";
+        }
+        if (typeof persistedRaster !== "string") {
+          const persistedBytes = persistedRaster.png.byteLength + persistedRaster.pixels.byteLength;
+          if (persistedBytes <= this.#maxBytes) {
+            this.#stats.hits += 1;
+            this.#insert(key, persistedRaster, persistedBytes);
+            return { ok: true, raster: cloneRaster(persistedRaster) };
+          }
+        }
+        await this.#deletePersistent(key);
+      }
+
       const result = await this.#renderer(request, options);
       if (controller.signal.aborted) return this.#failure("aborted");
 
@@ -234,6 +330,7 @@ export class FormulaRasterCache {
       if (bytes > this.#maxBytes) return this.#failure("budget_exceeded");
 
       this.#insert(key, raster, bytes);
+      await this.#writePersistent(key, raster);
       return { ok: true, raster: cloneRaster(raster) };
     } catch (error: unknown) {
       return this.#failure(classifyRendererFailure(error, controller.signal));
@@ -306,6 +403,38 @@ export class FormulaRasterCache {
     this.#stats.failures += 1;
     return { ok: false, reason };
   }
+
+  async #readPersistent(key: string): Promise<FormulaRaster | undefined> {
+    const store = this.#persistentStore;
+    if (store === undefined) return undefined;
+    try {
+      const raster = await store.get(key);
+      return raster === undefined ? undefined : cloneRaster(raster);
+    } catch {
+      // Disk cache failures are disposable; rendering remains available from the renderer.
+      return undefined;
+    }
+  }
+
+  async #writePersistent(key: string, raster: FormulaRaster): Promise<void> {
+    const store = this.#persistentStore;
+    if (store === undefined) return;
+    try {
+      await store.set(key, cloneRaster(raster));
+    } catch {
+      // A read-only or full cache must never turn a successful render into a UI failure.
+    }
+  }
+
+  async #deletePersistent(key: string): Promise<void> {
+    const store = this.#persistentStore;
+    if (store === undefined || store.delete === undefined) return;
+    try {
+      await store.delete(key);
+    } catch {
+      // Corrupt entries are ignored even when cleanup cannot remove them.
+    }
+  }
 }
 
 export function createFormulaRasterCache(
@@ -326,9 +455,89 @@ function isFormulaRasterRequest(value: unknown): value is FormulaRasterRequest {
   return typeof record.tex === "string" && typeof record.display === "boolean";
 }
 
+export function normalizeFormulaRenderStyle(
+  request: FormulaRasterRequest,
+  options: FormulaRasterRenderOptions,
+  rendererVersion: string,
+): NormalizedFormulaRenderStyle | undefined {
+  const requestStyle =
+    typeof request === "object" && request !== null && !Array.isArray(request)
+      ? request.style
+      : undefined;
+  const style = requestStyle ?? options.style;
+  const value = style === undefined ? {} : style;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  if (!Object.keys(value).every((key) => FORMULA_STYLE_KEYS.has(key))) return undefined;
+  const foreground = value.foreground ?? DEFAULT_FORMULA_RENDER_STYLE.foreground;
+  const background = value.background;
+  const fontScale = value.fontScale ?? DEFAULT_FORMULA_RENDER_STYLE.fontScale;
+  const dpi = value.dpi ?? DEFAULT_FORMULA_RENDER_STYLE.dpi;
+  const effectiveRendererVersion = value.rendererVersion ?? rendererVersion;
+  if (!validRendererVersion(effectiveRendererVersion)) return undefined;
+
+  let normalizedLatexStyle: ReturnType<typeof normalizeLatexRenderStyle>;
+  try {
+    normalizedLatexStyle = normalizeLatexRenderStyle({
+      ...(background === undefined ? {} : { background }),
+      dpi,
+      fontScale,
+      foreground,
+    });
+  } catch {
+    return undefined;
+  }
+  if (normalizedLatexStyle === undefined) return undefined;
+  return {
+    ...(normalizedLatexStyle.background === undefined
+      ? {}
+      : { background: normalizedLatexStyle.background }),
+    dpi: normalizedLatexStyle.dpi,
+    fontScale: normalizedLatexStyle.fontScale,
+    foreground: normalizedLatexStyle.foreground,
+    rendererVersion: effectiveRendererVersion,
+  };
+}
+
 function formulaRasterKey(request: FormulaRasterRequest): string {
-  // The mode prefix makes the two modes disjoint without normalizing or escaping TeX at all.
-  return `${request.display ? "\\u0001" : "\\u0000"}${request.tex}`;
+  const style = request.style ?? DEFAULT_FORMULA_RENDER_STYLE;
+  // JSON is only an in-memory key. The persistent store hashes it before creating a filename.
+  return JSON.stringify({
+    display: request.display,
+    rendererVersion: style.rendererVersion,
+    tex: request.tex,
+    style: {
+      background: style.background,
+      dpi: style.dpi,
+      fontScale: style.fontScale,
+      foreground: style.foreground,
+    },
+    version: 2,
+  });
+}
+
+function validRendererVersion(value: string | undefined): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 128 &&
+    !hasControlCharacters(value)
+  );
+}
+
+const FORMULA_STYLE_KEYS: ReadonlySet<string> = new Set([
+  "background",
+  "dpi",
+  "fontScale",
+  "foreground",
+  "rendererVersion",
+]);
+
+function hasControlCharacters(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f)) return true;
+  }
+  return false;
 }
 
 function validateRaster(value: unknown): FormulaRaster | FormulaRasterFailureCode {

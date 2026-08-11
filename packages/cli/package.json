@@ -36,6 +36,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@napi-rs/keyring": "1.3.0",
     "@researk/contracts": "0.1.0-alpha.4",
     "@researk/harness": "0.1.0-alpha.4",
     "@researk/latex-renderer": "0.1.0-alpha.4",

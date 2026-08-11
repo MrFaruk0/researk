@@ -1,12 +1,13 @@
-import { afterEach, describe, expect, it } from "vitest";
 import { Worker, type WorkerOptions } from "node:worker_threads";
+import { afterEach, describe, expect, it } from "vitest";
 import { renderTexToValidatedSvgInWorker } from "../src/core.js";
 import {
   getManagedLatexRenderer,
   LatexRenderBudget,
   latexSvgRendererLimits,
-  ManagedLatexRenderer,
   ManagedLatexRenderError,
+  ManagedLatexRenderer,
+  rendererVersion,
   renderTexToPng,
   renderTexToSvg,
 } from "../src/index.js";
@@ -148,6 +149,81 @@ describe("renderTexToSvg", () => {
       const pixel = (y * result.width + x) * 4;
       expect(Array.from(result.pixels.slice(pixel, pixel + 4))).toEqual([255, 255, 255, 255]);
     }
+  });
+
+  it("applies caller-supplied foreground colors to currentColor glyphs", async () => {
+    const tex = String.raw`\frac{-b\pm\sqrt{b^2-4ac}}{2a}`;
+    const red = await renderTexToPng({ tex, style: { foreground: "#ff0000" } });
+    const blue = await renderTexToPng({ tex, style: { foreground: "#0000ff" } });
+
+    expect(Array.from(red.pixels)).not.toEqual(Array.from(blue.pixels));
+    expect(red.pixels.some((value, index) => index % 4 === 0 && value > 180)).toBe(true);
+    expect(blue.pixels.some((value, index) => index % 4 === 2 && value > 180)).toBe(true);
+
+    const styledSvg = await renderTexToSvg({ tex, style: { foreground: "#ff0000" } });
+    expect(styledSvg.svg).toContain('color="#ff0000"');
+    expect(styledSvg.svg).toContain('data-latex="\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}"');
+    expect(styledSvg.tex).toBe(tex);
+  });
+
+  it("accepts a style in render options when request data is kept separate", async () => {
+    const result = await renderTexToPng({ tex: "x^2" }, { style: { foreground: "#00ff00" } });
+    expect(result.pixels.some((value, index) => index % 4 === 1 && value > 180)).toBe(true);
+  });
+
+  it("keeps styled rasters transparent without a background and opaque when one is supplied", async () => {
+    const transparent = await renderTexToPng({
+      tex: "x^2",
+      style: { foreground: "#5fd7ff" },
+    });
+    const transparentAlpha = Array.from(
+      { length: transparent.pixels.length / 4 },
+      (_, index) => transparent.pixels[index * 4 + 3],
+    );
+    expect(transparentAlpha.some((alpha) => alpha === 0)).toBe(true);
+    expect(transparentAlpha.some((alpha) => alpha > 0)).toBe(true);
+
+    const first = await renderTexToPng({
+      tex: "x^2",
+      style: { foreground: "#5fd7ff", background: "#101820" },
+    });
+    const second = await renderTexToPng({
+      tex: "x^2",
+      style: { foreground: "#5fd7ff", background: "#101820" },
+    });
+    expect(Array.from(first.pixels)).toEqual(Array.from(second.pixels));
+    expect(first.pixels.every((_, index) => index % 4 !== 3 || first.pixels[index] === 255)).toBe(
+      true,
+    );
+  });
+
+  it("uses bounded scale and DPI values as deterministic pixel-affecting options", async () => {
+    const smaller = await renderTexToPng({
+      tex: "x^2",
+      style: { foreground: "#ffffff", fontScale: 0.5, dpi: 72 },
+    });
+    const larger = await renderTexToPng({
+      tex: "x^2",
+      style: { foreground: "#ffffff", fontScale: 2, dpi: 192 },
+    });
+    expect(larger.width).toBeGreaterThan(smaller.width);
+    expect(larger.height).toBeGreaterThan(smaller.height);
+  });
+
+  it("rejects invalid styled requests before rasterization", async () => {
+    await expect(
+      renderTexToPng({ tex: "x", style: { foreground: "not-a-color" } }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(
+      renderTexToPng({ tex: "x", style: { foreground: "#fff", fontScale: 0.1 } }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(
+      renderTexToPng({ tex: "x", style: { foreground: "#fff", dpi: 601 } }),
+    ).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
+  it("exposes a stable source-and-raster renderer identity", () => {
+    expect(rendererVersion).toBe("mathjax-4.1.3-resvg-2.6.2");
   });
 
   it("preserves the input ceiling before entering the padded raster path", async () => {

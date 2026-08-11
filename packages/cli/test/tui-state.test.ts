@@ -467,7 +467,13 @@ describe("session metadata", () => {
     expect(renamed.conversation[0]?.source).toBe("keep me");
   });
 
-  it("creates a new session that resets metadata and clears the conversation", () => {
+  it("creates a new session while preserving global provider and UI state", () => {
+    const connection = {
+      providerId: "compatible",
+      baseUrl: "https://example.test/v1/",
+      apiKeyEnvironmentVariable: "TEST_KEY",
+      kind: "compatible" as const,
+    };
     let state = reduce(baseState(), {
       type: "session/load",
       sessionId: "session-abc",
@@ -475,12 +481,57 @@ describe("session metadata", () => {
       updatedAt: "2026-08-10T12:00:00.000Z",
       conversation: [{ id: "u1", role: "user", source: "old", streaming: false, createdAt: 0 }],
     });
-    state = reduce(state, { type: "session/create" });
-    expect(state.sessionId).toBeUndefined();
+    state = {
+      ...state,
+      connection,
+      connectionStatus: "connected",
+      credentialValues: { TEST_KEY: "synthetic-secret" },
+      catalog: [descriptor("compatible:science", ["high"])],
+      model: "compatible:science",
+      variant: "high",
+      themeName: "dracula",
+      colorEnabled: false,
+      overlay: { kind: "source", offset: 0 },
+      composer: {
+        value: "draft",
+        cursor: 5,
+        history: ["previous"],
+        historyIndex: 0,
+        draft: "draft",
+      },
+      stagedDocuments: [
+        {
+          relativePath: "paper.md",
+          content: "context",
+          byteLength: 7,
+        },
+      ],
+      scrollOffset: 4,
+      scrollMax: 8,
+    };
+    state = reduce(state, {
+      type: "session/create",
+      sessionId: "session-new",
+      updatedAt: "2026-08-10T13:00:00.000Z",
+    });
+    expect(state.sessionId).toBe("session-new");
     expect(state.sessionTitle).toBe("New session");
-    expect(state.sessionUpdatedAt).toBeUndefined();
+    expect(state.sessionUpdatedAt).toBe("2026-08-10T13:00:00.000Z");
     expect(state.conversation).toEqual([]);
     expect(state.latestAssistantSource).toBeUndefined();
+    expect(state.connection).toEqual(connection);
+    expect(state.connectionStatus).toBe("connected");
+    expect(state.credentialValues).toEqual({ TEST_KEY: "synthetic-secret" });
+    expect(state.catalog).toHaveLength(1);
+    expect(state.model).toBe("compatible:science");
+    expect(state.variant).toBe("high");
+    expect(state.themeName).toBe("dracula");
+    expect(state.colorEnabled).toBe(false);
+    expect(state.overlay).toEqual({ kind: "none" });
+    expect(state.composer).toEqual({ value: "", cursor: 0, history: ["previous"], draft: "" });
+    expect(state.stagedDocuments).toEqual([]);
+    expect(state.scrollOffset).toBe(0);
+    expect(state.scrollMax).toBe(0);
   });
 });
 
@@ -642,7 +693,11 @@ describe("composer history and rendered-row scrolling", () => {
     expect(state.scrollOffset).toBe(0);
     expect(state.scrollMax).toBe(0);
     state = reduce(state, { type: "scroll/range", maxRows: 9 });
-    state = reduce(state, { type: "session/create" });
+    state = reduce(state, {
+      type: "session/create",
+      sessionId: "session-new",
+      updatedAt: "2026-08-10T13:00:00.000Z",
+    });
     expect(state.scrollOffset).toBe(0);
     expect(state.scrollMax).toBe(0);
   });

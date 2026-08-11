@@ -1,8 +1,8 @@
 import { parentPort } from "node:worker_threads";
 import { Resvg } from "@resvg/resvg-js";
 import {
-  type LatexSvgStructure,
   LatexSvgRenderError,
+  type LatexSvgStructure,
   renderTexToValidatedSvgInWorker,
 } from "./core.js";
 import {
@@ -13,6 +13,11 @@ import {
   maximumRasterWidth,
   maximumRgbaBytes,
 } from "./protocol.js";
+import {
+  latexRenderStyleLimits,
+  type NormalizedLatexRenderStyle,
+  normalizeLatexRenderStyle,
+} from "./style.js";
 
 if (parentPort === null) throw new Error("The LaTeX renderer must run as a worker thread.");
 
@@ -23,9 +28,9 @@ if (parentPort === null) throw new Error("The LaTeX renderer must run as a worke
  * stretching every short expression to one arbitrary 1200px canvas. The protocol ceilings remain
  * authoritative for the resulting dimensions, area, and encoded payload.
  */
-const rasterScale = 2;
+const legacyRasterScale = 2;
 
-/** Fixed opaque raster margin, in final pixels, on every side of the formula canvas. */
+/** Fixed raster margin, in final pixels, on every side of the formula canvas. */
 const rasterPadding = 4;
 
 /**
@@ -63,9 +68,11 @@ const port = parentPort;
 port.on("message", (value: unknown) => {
   if (!isWorkerRenderRequest(value)) return;
   try {
+    const style = normalizeLatexRenderStyle(value.style);
     const { result, structure } = renderTexToValidatedSvgInWorker({
       tex: value.tex,
       display: value.display,
+      ...(style === undefined ? {} : { style }),
     });
     if (value.format === "png") {
       // Fail closed before rasterizing anything font-backed. Producing a PNG here would mean
@@ -82,20 +89,28 @@ port.on("message", (value: unknown) => {
       // system fonts is lossless: PNG output is byte-identical with enumeration on and off. It also
       // removes resvg's host-font enumeration, which is unbounded work charged to the per-render
       // timeout and is the platform-dependent cost that made rasterization fail on font-heavy hosts.
-      // A white background is explicit because terminal image protocols otherwise preserve
-      // transparent pixels, which makes dark formula glyphs disappear into a dark TUI.
-      const rasterizer = new Resvg(result.svg, {
-        fitTo: { mode: "zoom", value: rasterScale },
-        background: "#ffffff",
+      // Legacy requests retain the opaque-white raster established before the style contract. A
+      // styled request deliberately omits Resvg's background option unless the caller supplied
+      // one, preserving transparent padding and letting the terminal's own surface show through.
+      const rasterScale = style === undefined ? legacyRasterScale : scaleFor(style);
+      const rasterOptions = {
+        fitTo: { mode: "zoom" as const, value: rasterScale },
+        ...(style === undefined
+          ? { background: "#ffffff" }
+          : style.background === undefined
+            ? {}
+            : { background: style.background }),
+        ...(style === undefined ? {} : { dpi: style.dpi }),
         font: { loadSystemFonts: false },
-      });
+      };
+      const rasterizer = new Resvg(result.svg, rasterOptions);
       // Resvg's public width/height properties describe the unscaled SVG. Its normalized SVG
       // serialization carries the fractional natural dimensions, so derive the exact rounded
       // 2x source canvas before allocating any native pixel buffer.
       const normalizedSvg = rasterizer.toString();
       const naturalDimensions = readNormalizedDimensions(normalizedSvg);
-      const sourceWidth = scaleDimension(naturalDimensions.width);
-      const sourceHeight = scaleDimension(naturalDimensions.height);
+      const sourceWidth = scaleDimension(naturalDimensions.width, rasterScale);
+      const sourceHeight = scaleDimension(naturalDimensions.height, rasterScale);
       const paddedWidth = sourceWidth + rasterPadding * 2;
       const paddedHeight = sourceHeight + rasterPadding * 2;
       assertRasterDimensions(sourceWidth, sourceHeight);
@@ -112,7 +127,12 @@ port.on("message", (value: unknown) => {
       );
       const paddedRasterizer = new Resvg(paddedSvg, {
         fitTo: { mode: "original" },
-        background: "#ffffff",
+        ...(style === undefined
+          ? { background: "#ffffff" }
+          : style.background === undefined
+            ? {}
+            : { background: style.background }),
+        ...(style === undefined ? {} : { dpi: style.dpi }),
         font: { loadSystemFonts: false },
       });
       if (paddedRasterizer.width !== paddedWidth || paddedRasterizer.height !== paddedHeight) {
@@ -165,12 +185,24 @@ function readNormalizedDimensions(svg: string): NormalizedDimensions {
   return { height, width };
 }
 
-function scaleDimension(value: number): number {
+function scaleDimension(value: number, rasterScale: number): number {
   const scaled = Math.round(value * rasterScale);
   if (!Number.isSafeInteger(scaled) || scaled < 1) {
     throw new Error("Raster dimensions are invalid.");
   }
   return scaled;
+}
+
+/**
+ * Scales the natural MathJax SVG by both requested font scale and pixel density. Resvg's `dpi`
+ * option is retained as metadata for physical-unit SVGs, while the explicit zoom factor makes DPI
+ * affect the ex-based MathJax canvas deterministically as well.
+ */
+function scaleFor(style: NormalizedLatexRenderStyle): number {
+  const scale =
+    legacyRasterScale * style.fontScale * (style.dpi / latexRenderStyleLimits.defaultDpi);
+  if (!Number.isFinite(scale) || scale <= 0) throw new Error("Raster scale is invalid.");
+  return scale;
 }
 
 function assertRasterDimensions(width: number, height: number): void {

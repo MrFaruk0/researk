@@ -2,10 +2,11 @@
 
 ## Status and scope
 
-Researk has a pre-alpha source implementation but no installable release. The current build has a
-Harness, CLI, offline fake provider, experimental generic OpenAI-compatible adapter, and safe
-exact-source LaTeX display. This document defines security boundaries for those components and
-for planned internet research, graphical rendering, persistent state, and paper reproduction.
+Researk has a pre-alpha source implementation but no published installable release. The current
+build has a Harness, CLI, offline fake provider, experimental generic OpenAI-compatible adapter,
+capability-aware terminal math rendering, OS-keyring-backed provider credentials, and bounded local
+sessions. This document defines security boundaries for those components and for planned internet
+research and paper reproduction.
 
 The planned writing layer initially targets APA 7 and IEEE formats and is extensible to additional academic formats. Format templates and imported citation styles are untrusted inputs subject to the same parsing and provenance controls as other documents.
 
@@ -30,10 +31,25 @@ Moonshot/Kimi, OpenRouter, Ollama, and local runtimes are not implemented or tes
 
 Model catalogs must not be hardcoded as a security authority. Capability discovery validates what a configured endpoint reports and may require network access. Provider, model, and reasoning choices are stored locally and applied per request. Prompts and selected context go only to the provider chosen for that request. Unknown models are enabled only when adapter protocols and discovered capabilities permit safe operation; there is no universal-model compatibility claim.
 
-The current CLI resolves credentials only from an explicitly named environment variable. It does
-not persist them. Persistent credentials must use the operating-system credential store when that
-feature exists. Credentials must not enter prompts, session files, ordinary configuration, logs,
-crash output, or reproduction environments. Errors and HTTP metadata must be redacted.
+The interactive TUI stores provider credentials through the provider-scoped OS keyring backend
+provided by `@napi-rs/keyring`. A provider profile stores a stable credential reference and the
+explicit environment-variable name, never the key. Resolution order is persisted secure entry,
+then the explicitly configured environment variable, then missing. Keys must not enter prompts,
+session files, ordinary configuration, logs, crash output, formula caches, or reproduction
+environments. Errors and HTTP metadata must be redacted. One-shot commands may use an environment
+variable for one invocation and do not store it.
+
+When the native keyring cannot be initialized or is unavailable, the interactive persistence path
+fails closed for the secret: Researk does not silently use a plaintext file. The user can use the
+explicit environment fallback or repair/enable the OS keyring. The keyring is not a boundary
+against a compromised host, account, or OS credential store. The underlying keyring-rs v1 API
+documents macOS Keychain Services, Windows Credential Manager, and *nix Secret Service; backend
+availability depends on the host session and must be tested on every claimed release target.
+
+Provider profiles are global. `/new` replaces session state only; it must not recreate the TUI shell
+or discard the provider registry, profile, model, variant, theme, terminal capability evidence, or
+renderer selection. A resumed session uses saved provider/model/variant identities and resolves its
+credential through the global profile.
 
 ### Internet research and citations
 
@@ -49,9 +65,23 @@ Network-capable tools receive destination-scoped permission. Tool results are un
 
 ### LaTeX and terminal rendering
 
-Stored output preserves the original LaTeX source; rendering is a view. The default renderer must not invoke a shell or a full TeX engine and must treat file-reading, file-writing, process, and network commands as unsupported. Malformed math falls back to visible source rather than executing or disappearing.
+Stored output preserves the original Markdown and LaTeX source; rendering is a disposable view. The
+local graphics path is restricted bundled MathJax 4.1.3 -> validated path-only SVG ->
+`@resvg/resvg-js` 2.6.2 rasterization. It must not invoke a shell, system TeX distribution,
+`latex`/`dvipng`, helper executable, file access, or network request. Malformed or unsupported math
+falls back to exact source rather than executing, lossy Unicode substitution, or disappearing.
 
-Provider and document output must have unsafe terminal control sequences removed or escaped. Non-interactive output must contain stable source text without terminal escape codes. Any future full-document TeX compilation requires a separately approved isolated environment with shell escape disabled and strict filesystem, process, network, time, memory, and output limits.
+A central capability layer selects Kitty, Sixel, or iTerm2 only from positive protocol evidence.
+Terminal brand/process names are not sufficient. Theme semantic foreground/background values are
+validated before rendering; transparent output is used where the protocol permits and Sixel output
+is composited with the resolved background. Cache keys include source, style, scale, DPI, and
+renderer version. The per-user raster cache is bounded, atomic, private where supported, and
+recoverable after corruption; it is not session state.
+
+Provider and document output must have unsafe terminal control sequences removed or escaped. Non-
+interactive output must contain stable source text without terminal escape codes. Any future full-
+document TeX compilation requires a separately approved isolated environment with shell escape
+disabled and strict filesystem, process, network, time, memory, and output limits.
 
 ### Paper reproduction
 
@@ -63,7 +93,15 @@ The comparison report separates reproduced observations from reported claims and
 
 ### Supply chain and releases
 
-Dependencies are minimized, locked, reviewed for provenance and license compatibility, and scanned before release. Test fixtures must be synthetic, public-domain, or redistributable under documented terms. Release artifacts must be built from a reviewed tag, include checksums and an SBOM, and use provenance or signatures once the release process exists. Automation receives minimal repository permissions and pins third-party actions immutably.
+Dependencies are minimized, locked, reviewed for provenance and license compatibility, and scanned
+before release. The exact `@resvg/resvg-js@2.6.2` MPL-2.0 binding and
+`@napi-rs/keyring@1.3.0` MIT binding, including their lock-pinned native optional packages, are
+reviewed in [ADR 0011](decisions/0011-runtime-dependency-review.md) and recorded in
+[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md). Test fixtures must be synthetic, public-domain,
+or redistributable under documented terms. Release artifacts must be built from a reviewed tag,
+retain the required notices, include checksums and an SPDX SBOM covering the full bundled closure,
+and use provenance or signatures once the release process exists. Automation receives minimal
+repository permissions and pins third-party actions immutably.
 
 ## Out of scope and residual risk
 

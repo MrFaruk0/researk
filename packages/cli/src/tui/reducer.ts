@@ -37,6 +37,14 @@ export type AppAction =
       readonly catalog: readonly ModelDescriptor[];
       readonly credentialValues: Readonly<Record<string, string>>;
     }
+  /** Restores a saved provider identity without making a catalog request. */
+  | {
+      readonly type: "connection/restored";
+      readonly connection: ProviderConnection;
+      readonly credentialValues: Readonly<Record<string, string>>;
+    }
+  /** Clears an unusable saved provider while retaining the loaded transcript. */
+  | { readonly type: "connection/cleared" }
   | { readonly type: "connection/failed"; readonly message: string }
   | { readonly type: "external/set"; readonly activity: ExternalActivity }
   | { readonly type: "external/clear" }
@@ -55,9 +63,17 @@ export type AppAction =
       readonly title: string;
       readonly updatedAt: string;
       readonly conversation: ConversationEntry[];
+      /** Explicit `null` clears a saved model; omission preserves the current global selection. */
+      readonly model?: string | null;
+      readonly variant?: ReasoningIntent;
     }
   | { readonly type: "session/title"; readonly title: string }
-  | { readonly type: "session/create" }
+  | {
+      readonly type: "session/create";
+      /** The freshly persisted id is supplied by the App so the same id reaches disk and state. */
+      readonly sessionId: string;
+      readonly updatedAt: string;
+    }
   | { readonly type: "run/status"; readonly status: RunStatus }
   | { readonly type: "run/phase"; readonly phase: string | undefined }
   | { readonly type: "notice/push"; readonly notice: StatusNotice }
@@ -128,6 +144,33 @@ export function reduce(state: AppState, action: AppAction): AppState {
         variant: "auto",
         ...clearExternalActivity(state, "catalog"),
       };
+    case "connection/restored":
+      return {
+        ...state,
+        connectionStatus: "disconnected",
+        connection: action.connection,
+        credentialValues: action.credentialValues,
+        // A persisted transcript does not carry a provider catalog. Clearing it prevents a catalog
+        // from the previous provider being shown as if it belonged to this restored identity.
+        catalog: [],
+        catalogLoading: false,
+        model: undefined,
+        variant: "auto",
+        ...clearExternalActivity(state, "catalog"),
+      };
+    case "connection/cleared": {
+      const { connection: _connection, ...withoutConnection } = state;
+      return {
+        ...withoutConnection,
+        connectionStatus: "failed",
+        credentialValues: {},
+        catalog: [],
+        catalogLoading: false,
+        model: undefined,
+        variant: "auto",
+        ...clearExternalActivity(state, "catalog"),
+      };
+    }
     case "connection/failed":
       return {
         ...state,
@@ -222,6 +265,19 @@ export function reduce(state: AppState, action: AppAction): AppState {
         sessionUpdatedAt: action.updatedAt,
         conversation,
         latestAssistantSource: latestCompletedAssistantSource(conversation),
+        ...(action.model === undefined
+          ? {}
+          : { model: action.model === null ? undefined : action.model }),
+        ...(action.variant === undefined ? {} : { variant: action.variant }),
+        composer: {
+          value: "",
+          cursor: 0,
+          history: state.composer.history,
+          draft: "",
+        },
+        stagedDocuments: [],
+        runStatus: "idle",
+        phase: undefined,
         scrollOffset: 0,
         scrollMax: 0,
         externalActivity: undefined,
@@ -230,13 +286,25 @@ export function reduce(state: AppState, action: AppAction): AppState {
     case "session/title":
       return { ...state, sessionTitle: action.title };
     case "session/create": {
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const { sessionId: _sid, sessionUpdatedAt: _sup, ...rest } = state;
       return {
-        ...rest,
+        ...state,
+        sessionId: action.sessionId,
         sessionTitle: DEFAULT_SESSION_TITLE,
+        sessionUpdatedAt: action.updatedAt,
         conversation: [],
         latestAssistantSource: undefined,
+        // These are session-scoped presentation values. Keep command history so a fresh session
+        // does not erase useful global composer history, but never carry a live draft across it.
+        composer: {
+          value: "",
+          cursor: 0,
+          history: state.composer.history,
+          draft: "",
+        },
+        overlay: { kind: "none" },
+        stagedDocuments: [],
+        runStatus: "idle",
+        phase: undefined,
         scrollOffset: 0,
         scrollMax: 0,
         externalActivity: undefined,

@@ -1,9 +1,14 @@
 import type { Writable } from "node:stream";
-import { type LatexRenderBudget, renderTexToSvg } from "@researk/latex-renderer";
+import {
+  type LatexRenderBudget,
+  type LatexRenderStyle,
+  renderTexToSvg,
+} from "@researk/latex-renderer";
 import type { CliTheme } from "../theme.js";
+import { createTuiTheme, formulaRenderStyle } from "../tui/theme.js";
 import type { MarkdownRenderEvent, MathRenderEvent } from "./parser.js";
-import { detectTerminalCapability, renderTerminalMath } from "./terminal.js";
 import type { TerminalMathImageRenderer } from "./terminal.js";
+import { detectTerminalCapability, renderTerminalMath } from "./terminal.js";
 
 export interface RenderedMath {
   readonly format: "source" | "svg";
@@ -65,7 +70,11 @@ export async function renderInteractiveEvents(
     readonly renderImage?: TerminalMathImageRenderer;
   },
 ): Promise<string> {
-  if (options.accessible === true || options.interactive !== true) {
+  if (
+    options.accessible === true ||
+    options.interactive !== true ||
+    options.theme?.colorEnabled === false
+  ) {
     return events.map((event) => event.source).join("");
   }
   const capability = detectTerminalCapability(
@@ -73,11 +82,32 @@ export async function renderInteractiveEvents(
     options.env,
   );
   const output: string[] = [];
+  const resolvedStyle =
+    options.theme === undefined
+      ? undefined
+      : formulaRenderStyle(
+          createTuiTheme(options.theme.name, { colorEnabled: options.theme.colorEnabled }),
+          capability.protocol,
+        );
+  const mathStyle: LatexRenderStyle | undefined =
+    resolvedStyle?.foreground === undefined
+      ? undefined
+      : {
+          dpi: resolvedStyle.dpi ?? 96,
+          fontScale: resolvedStyle.fontScale ?? 1,
+          foreground: resolvedStyle.foreground,
+          ...(resolvedStyle.background === undefined
+            ? {}
+            : { background: resolvedStyle.background }),
+        };
   for (const event of events) {
     if (
       event.type === "math" &&
       event.kind === "display" &&
-      capability.protocol !== "unsupported"
+      capability.protocol !== "unsupported" &&
+      // A one-shot raster without a semantic theme would use the renderer's legacy default
+      // foreground/background. Preserve canonical source until a validated style is available.
+      mathStyle !== undefined
     ) {
       if (options.writeText !== undefined && output.length > 0) {
         await options.writeText(output.join(""));
@@ -91,6 +121,7 @@ export async function renderInteractiveEvents(
           options.budget,
           options.signal,
           options.renderImage,
+          mathStyle,
         )
       ) {
         continue;

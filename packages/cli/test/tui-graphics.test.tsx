@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { render } from "ink-testing-library";
 import { describe, expect, it, vi } from "vitest";
+import { createTerminalCapabilities } from "../src/rendering/capabilities.js";
 import { FormulaRasterCache, type FormulaRasterRenderer } from "../src/tui/formula-renderer.js";
 import {
   FormulaGraphic,
@@ -20,9 +21,13 @@ class FakeStdout extends EventEmitter {
 }
 
 function raster(width = 20, height = 20) {
+  const pixels = new Uint8Array(width * height * 4);
+  // Sixel P2=1 leaves zero-alpha pixels unset, so fixtures that exercise placement need at least
+  // one visible source pixel rather than relying on the former opaque background plane.
+  for (let offset = 3; offset < pixels.length; offset += 4) pixels[offset] = 255;
   return {
     height,
-    pixels: new Uint8Array(width * height * 4),
+    pixels,
     png: Uint8Array.from([0x89, 0x50, 0x4e, 0x47]),
     width,
   };
@@ -53,6 +58,80 @@ function setup(
 }
 
 describe("FormulaGraphicsRuntime", () => {
+  it("uses central capability selection and fails closed for accessible output", () => {
+    const runtime = new FormulaGraphicsRuntime({
+      capability: createTerminalCapabilities(
+        { protocol: "kitty", reason: "probe" },
+        { accessible: true, isTTY: true, interactive: true },
+      ),
+      stdout: new FakeStdout(),
+    });
+    expect(runtime.rendererId).toBe("exact-source");
+    expect(runtime.supportsGraphics()).toBe(false);
+    runtime.dispose();
+  });
+
+  it("keeps iTerm2 exact-source in the live overlay until a placement seam exists", () => {
+    const runtime = new FormulaGraphicsRuntime({
+      capability: { cellPixels: { height: 20, width: 10 }, protocol: "iterm2" },
+      stdout: new FakeStdout(),
+    });
+    expect(runtime.rendererId).toBe("iterm2");
+    expect(runtime.supportsGraphics()).toBe(false);
+    runtime.dispose();
+  });
+
+  it("updates validated style without remounting and separates cache pixels", async () => {
+    const styles: Array<unknown> = [];
+    const renderer: FormulaRasterRenderer = async (request) => {
+      styles.push(request.style);
+      return raster();
+    };
+    const runtime = new FormulaGraphicsRuntime({
+      capability: { cellPixels: { height: 20, width: 10 }, protocol: "kitty" },
+      renderer,
+      stdout: new FakeStdout(),
+    });
+
+    await expect(runtime.renderFormula({ display: true, tex: "x" })).resolves.toMatchObject({
+      ok: true,
+    });
+    const revision = runtime.styleRevision;
+    expect(runtime.setStyle({ foreground: "#ffffff", fontScale: 1, dpi: 96 })).toBe(true);
+    expect(runtime.styleRevision).toBe(revision + 1);
+    await expect(runtime.renderFormula({ display: true, tex: "x" })).resolves.toMatchObject({
+      ok: true,
+    });
+    expect(styles).toHaveLength(2);
+    expect(styles[0]).not.toEqual(styles[1]);
+    runtime.dispose();
+  });
+
+  it("rerenders a mounted formula when the runtime style changes", async () => {
+    const styles: Array<unknown> = [];
+    const runtime = new FormulaGraphicsRuntime({
+      capability: { cellPixels: { height: 20, width: 10 }, protocol: "kitty" },
+      renderer: async (request) => {
+        styles.push(request.style);
+        return raster();
+      },
+      stdout: new FakeStdout(),
+    });
+    const view = render(
+      <FormulaGraphic exactSource="$x$" formulaKey="style-change" innerTex="x" runtime={runtime} />,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(styles).toHaveLength(1);
+
+    expect(runtime.setStyle({ dpi: 144, foreground: "#ffffff" })).toBe(true);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(styles).toHaveLength(2);
+    expect(styles[0]).not.toEqual(styles[1]);
+
+    view.unmount();
+    runtime.dispose();
+  });
+
   it("keeps unsupported formula output source-only and neutralizes controls", () => {
     const stdout = new FakeStdout();
     const runtime = new FormulaGraphicsRuntime({
@@ -103,7 +182,7 @@ describe("FormulaGraphicsRuntime", () => {
     runtime.dispose();
   });
 
-  it("measures bounded Kitty slots, emits numeric metadata, and cleans old IDs first", async () => {
+  it("measures bounded Kitty slots and replaces an old ID before cleaning it", async () => {
     const { ref, runtime, stdout } = setup("kitty");
     const formula = raster();
     expect(
@@ -123,9 +202,12 @@ describe("FormulaGraphicsRuntime", () => {
 
     const writesBefore = stdout.writes.length;
     const second = runtime.beforeFrame(20, 10);
-    expect(stdout.writes.length).toBeGreaterThan(writesBefore);
-    expect(stdout.writes[writesBefore]).toContain("a=d,d=I,i=1");
+    // The confirmed image remains visible until its replacement is accepted.
+    expect(stdout.writes.length).toBe(writesBefore);
     await runtime.afterFrame(second);
+    expect(stdout.writes.length).toBe(writesBefore + 2);
+    expect(stdout.writes[writesBefore]).toContain("a=T");
+    expect(stdout.writes[writesBefore + 1]).toContain("a=d,d=I,i=1");
     runtime.dispose();
   });
 
@@ -206,13 +288,17 @@ describe("FormulaGraphicsRuntime", () => {
     expect(output).toContain("\u001b[?80l");
     expect(output).toContain("\u001b[2;2H");
     expect(output).toContain("\u001bP0;1q");
+    // An omitted semantic style leaves the Sixel background unknown; the runtime must not invent
+    // the former dark canvas or draw a white plane behind the visible raster.
+    expect(output).toContain("#0;2;2;2;2");
+    expect(output).not.toContain("#0;2;12;13;17");
     expect(output).not.toContain("\u001b[?80h");
     expect(output.indexOf("\u001b[?80l")).toBeLessThan(output.indexOf("\u001b[2;2H"));
     expect(output.lastIndexOf("\u001b[?80l")).toBeGreaterThan(output.indexOf("\u001b\\"));
     runtime.dispose();
   });
 
-  it("clears a Sixel rectangle row-by-row synchronously before the next image", async () => {
+  it("orders a Sixel clear and replacement in one write", async () => {
     const { ref, runtime, stdout } = setup(
       "sixel",
       { height: 2, width: 2, x: 1, y: 1 },
@@ -233,12 +319,12 @@ describe("FormulaGraphicsRuntime", () => {
 
     const writesBeforeCleanup = stdout.writes.length;
     const second = runtime.beforeFrame(20, 10);
-    expect(stdout.writes.length).toBe(writesBeforeCleanup + 1);
-    const cleanup = stdout.writes[writesBeforeCleanup];
-    expect(cleanup).toBe("\u001b[s\u001b[2;2H  \u001b[3;2H  \u001b[u");
+    expect(stdout.writes.length).toBe(writesBeforeCleanup);
     await runtime.afterFrame(second);
-    expect(stdout.writes.length).toBe(writesBeforeCleanup + 2);
-    expect(stdout.writes.at(-1)).toContain("\u001bP0;1q");
+    expect(stdout.writes.length).toBe(writesBeforeCleanup + 1);
+    const replacement = stdout.writes.at(-1) ?? "";
+    expect(replacement).toContain("\u001b[s\u001b[2;2H  \u001b[3;2H  \u001b[u");
+    expect(replacement.indexOf("\u001b[s")).toBeLessThan(replacement.indexOf("\u001bP0;1q"));
     runtime.dispose();
   });
 
@@ -283,7 +369,7 @@ describe("FormulaGraphicsRuntime", () => {
   });
 
   it.each(["kitty", "sixel"] as const)(
-    "tracks a blocked %s placement before drain and cleans it before resize redraw",
+    "retains a blocked %s placement until drain and then redraws safely",
     async (protocol) => {
       const extra = protocol === "sixel" ? { cellPixels: { height: 20, width: 10 } } : {};
       const { ref, runtime, stdout } = setup(protocol, { height: 1, width: 2, x: 1, y: 1 }, extra);
@@ -303,14 +389,19 @@ describe("FormulaGraphicsRuntime", () => {
       expect(stdout.writes.length).toBe(1);
 
       const second = runtime.beforeFrame(24, 10);
-      expect(stdout.writes.length).toBe(2);
-      expect(stdout.writes[1]).toContain(protocol === "kitty" ? "a=d,d=I,i=1" : "\u001b[s");
+      expect(stdout.writes.length).toBe(1);
 
       stdout.blocked = false;
       stdout.emit("drain");
       await pending;
       await runtime.afterFrame(second);
-      expect(stdout.writes.length).toBe(3);
+      expect(stdout.writes.length).toBe(protocol === "kitty" ? 3 : 2);
+      if (protocol === "kitty") {
+        expect(stdout.writes[1]).toContain("a=T");
+        expect(stdout.writes[2]).toContain("a=d,d=I,i=1");
+      } else {
+        expect(stdout.writes[1]?.indexOf("\u001bP0;1q")).toBeGreaterThan(0);
+      }
       runtime.dispose();
     },
   );
@@ -447,6 +538,50 @@ describe("FormulaGraphicsRuntime", () => {
     expect(view.lastFrame()).toContain(source);
     runtime.dispose();
     view.unmount();
+  });
+
+  it("keeps the confirmed graphic while a replacement is blocked, then drains it safely", async () => {
+    const stdout = new FakeStdout();
+    const runtime = new FormulaGraphicsRuntime({
+      capability: { cellPixels: { height: 20, width: 10 }, protocol: "kitty" },
+      measure: () => ({ height: 1, width: 2, x: 1, y: 1 }),
+      renderer: async () => raster(),
+      rows: 10,
+      stdout,
+      columns: 20,
+    });
+    const source = "$x$";
+    const view = render(
+      <FormulaGraphic
+        exactSource={source}
+        formulaKey="blocked-retained"
+        innerTex="x"
+        runtime={runtime}
+      />,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const first = runtime.beforeFrame(20, 10);
+    await runtime.afterFrame(first);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(runtime.isVisible("blocked-retained")).toBe(true);
+    expect(view.lastFrame()).not.toContain(source);
+
+    stdout.blocked = true;
+    const second = runtime.beforeFrame(24, 10);
+    const pending = runtime.afterFrame(second);
+    await Promise.resolve();
+    // The old confirmed placement remains tracked/visible while the replacement waits for drain.
+    expect(runtime.placedCount()).toBeGreaterThan(0);
+    expect(runtime.isVisible("blocked-retained")).toBe(true);
+    expect(view.lastFrame()).not.toContain(source);
+
+    stdout.blocked = false;
+    stdout.emit("drain");
+    await pending;
+    expect(runtime.isVisible("blocked-retained")).toBe(true);
+    expect(runtime.placedCount()).toBe(1);
+    view.unmount();
+    runtime.dispose();
   });
 
   it("does not unregister a formula when placement visibility rerenders the component", async () => {
